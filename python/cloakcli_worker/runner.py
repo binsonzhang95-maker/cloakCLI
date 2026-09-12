@@ -335,6 +335,13 @@ def _public_vars(variables: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_DUMPED_SELECTOR_MARKERS = ("api_key", "apikey", "authorization", "cookie")
+_DUMPED_VALUE_RE = re.compile(
+    r"(?i)(authorization\s*[:=]|bearer\s+[A-Za-z0-9._\-+/=]{8,}|"
+    r"\bsk-(?:proj-)?[A-Za-z0-9]{8,}\b|(?:set-)?cookie\s*[:=])"
+)
+
+
 def _stall_payload(index: int, action: str, step: dict[str, Any], exc: BaseException) -> dict[str, Any]:
     sel = step.get("selector") or step.get("css")
     payload: dict[str, Any] = {
@@ -346,23 +353,24 @@ def _stall_payload(index: int, action: str, step: dict[str, Any], exc: BaseExcep
     if sel:
         payload["selector"] = sel
     intended = step.get("text", step.get("value"))
-    if intended is not None and not looks_secret_key(str(sel or "")) and not looks_secret_key(action):
-        # Do not auto-inject secrets into the model prompt
-        if looks_secret_key("text") or _value_looks_secret(intended, step):
-            payload["intended_text"] = "(redacted)"
-        else:
-            payload["intended_text"] = str(intended)[:80]
+    if intended is not None:
+        # Username/password form values may be needed so recover can finish login.
+        # Never pass API keys, Authorization headers, or cookie dumps.
+        payload["intended_text"] = _intended_text_for_stall(str(intended), str(sel or ""), step)
     return payload
 
 
-def _value_looks_secret(value: Any, step: dict[str, Any]) -> bool:
+def _intended_text_for_stall(text: str, sel: str, step: dict[str, Any]) -> str:
+    haystacks = [sel.lower()]
     for key in ("name", "as", "var"):
         v = step.get(key)
-        if isinstance(v, str) and looks_secret_key(v):
-            return True
-    if isinstance(value, str) and looks_secret_key(value):
-        return True
-    return False
+        if isinstance(v, str):
+            haystacks.append(v.lower())
+    if any(any(m in h for m in _DUMPED_SELECTOR_MARKERS) for h in haystacks):
+        return "(redacted)"
+    if _DUMPED_VALUE_RE.search(text):
+        return "(redacted)"
+    return redact_text(text)[:80]
 
 
 def _run_step(

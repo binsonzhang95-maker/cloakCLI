@@ -17,3 +17,9 @@ cloakcli skill run recover-demo --profile demo --headless
 ```
 
 Recover budget defaults to 300 seconds. Trajectory: `data/artifacts/recover-demo/recover/<run_id>/`.
+
+Notes (Astra re-approval):
+
+- Coordinate clicks must send `screenshot_id` matching the current observation; stale coords after navigation are rejected.
+- `fill` is allowed (Playwright `page.fill` on the existing page) alongside `type`.
+- Recover may type into username/password fields. API keys, Authorization headers, cookie values, and `llm.json` secrets are never logged.

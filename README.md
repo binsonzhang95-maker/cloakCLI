@@ -184,7 +184,19 @@ Optional stall-recovery fields (inherit skill → step; default `on_stall` is `f
 }
 ```
 
-On timeout / selector / assertion failure with `on_stall: recover`, the Python worker keeps the **existing** Playwright page, takes a screenshot + compact DOM summary, and asks one OpenAI-compatible vision model (`chat/completions` + `image_url`) for JSON actions: `click` `type`/`fill` `scroll` `wait` `goto` `done` `fail` `ask_human`. Default recover wall-clock budget is **300 seconds** (`recover_timeout_sec`). No host filesystem read, no shell/code exec. `goto` stays on the task start origin unless `allow_hosts` lists extra hosts; `file:` / `javascript:` / `data:` are rejected.
+On timeout / selector / assertion failure with `on_stall: recover`, the Python worker keeps the **existing** Playwright page, takes a screenshot + compact DOM summary, and asks one OpenAI-compatible vision model (`chat/completions` + `image_url`) for JSON actions on that page. Default recover wall-clock budget is **300 seconds** (`recover_timeout_sec`). No host filesystem read, no shell/code exec. `goto` stays on the task start origin unless `allow_hosts` lists extra hosts; `file:` / `javascript:` / `data:` are rejected.
+
+Recover action whitelist (in-browser only):
+
+| Action | Notes |
+|--------|--------|
+| `click` | CSS selector, **or** `x`/`y` **plus** `screenshot_id` equal to the current observation. Coordinate clicks without an id, with a stale id, or after navigation/viewport change are rejected. |
+| `type` | Click the field then `keyboard.type`. |
+| `fill` | Playwright `page.fill` (replace the input value). **Kept on purpose** — full in-browser control, not host I/O. |
+| `scroll` `wait` `goto` | Policy-limited `goto` (same origin / `allow_hosts`). |
+| `done` `fail` `ask_human` | Terminal; `ask_human` pauses the skill (`status=paused`). |
+
+Recover **may** type into username/password form fields when the skill needs login. Trajectories and logs still never persist API keys, Authorization headers, raw `llm.json` secrets, or cookie **values**. Config keys stay env-var-only (`api_key_env`). See [`python/cloakcli_worker/recover/NOTES.md`](python/cloakcli_worker/recover/NOTES.md).
 
 ```bash
 cloakcli llm set --base-url https://api.openai.com/v1 --model gpt-4o --api-key-env OPENAI_API_KEY --recover-timeout-sec 300

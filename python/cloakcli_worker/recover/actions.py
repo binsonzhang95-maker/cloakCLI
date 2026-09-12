@@ -7,6 +7,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+# fill is Playwright page.fill on the existing page (in-browser replace).
+# Kept alongside type: see recover/NOTES.md. Not host-side I/O.
 ALLOWED_ACTIONS = {
     "click",
     "type",
@@ -170,7 +172,7 @@ def validate_action(item: Any) -> RecoverAction:
     y = _opt_int("y")
     sid = item.get("screenshot_id") or item.get("screenshotId")
     if sid is not None:
-        sid = str(sid)[:80]
+        sid = str(sid).strip()[:80] or None
     else:
         sid = None
 
@@ -206,8 +208,14 @@ def validate_action(item: Any) -> RecoverAction:
     reason = reason[:MAX_REASON_LEN]
 
     if atype == "click":
-        if not css and (x is None or y is None):
+        if css:
+            pass
+        elif x is None or y is None:
             raise ActionError("click requires css or x/y")
+        elif not sid:
+            raise ActionError(
+                "coordinate click requires screenshot_id matching current observation"
+            )
     elif atype in ("type", "fill"):
         if text is None:
             raise ActionError(f"{atype} requires text")

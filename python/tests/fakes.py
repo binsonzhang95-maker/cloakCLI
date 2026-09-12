@@ -146,12 +146,15 @@ class FakePage:
 
 
 class ScriptedProvider:
-    def __init__(self, replies: list[str]):
+    def __init__(self, replies: list[str], before_complete=None):
         self.replies = list(replies)
         self.calls = 0
+        self.before_complete = before_complete
 
     def complete(self, cfg, messages, *, image_b64=None, timeout_sec=60):
         self.calls += 1
+        if self.before_complete:
+            self.before_complete(self.calls)
         if not self.replies:
             return '{"schema_version":1,"action":"fail","reason":"no more scripted replies"}', 10
         return self.replies.pop(0), 10

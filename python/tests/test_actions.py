@@ -16,6 +16,21 @@ class ActionSchemaTests(unittest.TestCase):
     def test_click_coords_ok(self):
         a = validate_action({"action": "click", "x": 10, "y": 20, "screenshot_id": "obs-001"})
         self.assertEqual((a.x, a.y), (10, 20))
+        self.assertEqual(a.screenshot_id, "obs-001")
+
+    def test_click_coords_require_screenshot_id(self):
+        with self.assertRaises(ActionError) as ctx:
+            validate_action({"action": "click", "x": 10, "y": 20})
+        self.assertIn("screenshot_id", str(ctx.exception))
+
+    def test_click_coords_blank_screenshot_id_rejected(self):
+        with self.assertRaises(ActionError):
+            validate_action({"action": "click", "x": 10, "y": 20, "screenshot_id": "  "})
+
+    def test_fill_kept_on_whitelist(self):
+        a = validate_action({"action": "fill", "css": "#user", "text": "alice"})
+        self.assertEqual(a.type, "fill")
+        self.assertEqual(a.text, "alice")
 
     def test_unknown_action_rejected(self):
         with self.assertRaises(ActionError):

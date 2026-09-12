@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 from cloakcli_worker.llm_config import LlmConfig
-from cloakcli_worker.recover.loop import run_recover
+from cloakcli_worker.recover.loop import SYSTEM_PROMPT, run_recover
+from cloakcli_worker.recover.observe import CoordBinding, binding_still_valid
 from cloakcli_worker.runner import SkillRunError, execute_skill, resolve_on_stall, step_goal
 
 from fakes import FakePage, ScriptedProvider
@@ -96,7 +97,7 @@ class RecoverLoopTests(unittest.TestCase):
                 '{"schema_version":1,"action":"read_file","path":"/etc/passwd"}',
                 '{"schema_version":1,"action":"goto","url":"file:///etc/passwd"}',
                 '{"schema_version":1,"action":"goto","url":"https://evil.test/"}',
-                '{"schema_version":1,"action":"click","x":99999,"y":10}',
+                '{"schema_version":1,"action":"click","x":99999,"y":10,"screenshot_id":"obs-001"}',
                 '{"schema_version":1,"action":"done","reason":"gave up illegal"}',
             ]
         )
@@ -234,14 +235,235 @@ class RecoverLoopTests(unittest.TestCase):
         self.assertEqual(resolve_on_stall({}, {}), "fail")
         self.assertIn("Click", step_goal({"goal": "Click the link"}, {}, "click"))
 
-    def test_type_does_not_put_secret_in_stall_prompt(self):
+    def test_stall_payload_allows_password_redacts_api_key(self):
         from cloakcli_worker.runner import _stall_payload
 
         stall = _stall_payload(
             0,
             "fill",
-            {"selector": "#password", "text": "hunter2-secret"},
+            {"selector": "#password", "text": "hunter2-login"},
             TimeoutError("waiting for #password"),
         )
         dumped = json.dumps(stall)
-        self.assertNotIn("hunter2-secret", dumped)
+        self.assertIn("hunter2-login", dumped)
+
+        stall_key = _stall_payload(
+            0,
+            "fill",
+            {"selector": "#api_key", "text": "sk-supersecret-abc12345"},
+            TimeoutError("waiting for #api_key"),
+        )
+        dumped_key = json.dumps(stall_key)
+        self.assertNotIn("sk-supersecret-abc12345", dumped_key)
+        self.assertIn("(redacted)", dumped_key)
+
+        stall_auth = _stall_payload(
+            0,
+            "type",
+            {"selector": "input", "text": "Authorization: Bearer sk-abc12345zzzz"},
+            TimeoutError("x"),
+        )
+        self.assertNotIn("sk-abc12345zzzz", json.dumps(stall_auth))
+
+    def test_coord_click_rejected_without_screenshot_id(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        provider = ScriptedProvider(
+            [
+                '{"schema_version":1,"action":"click","x":10,"y":10}',
+                '{"schema_version":1,"action":"done","reason":"ok"}',
+            ]
+        )
+        out = run_recover(
+            page=page,
+            goal="g",
+            stall={"error": "x"},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "done")
+        self.assertEqual(page.coord_clicks, [])
+        traj = json.loads(Path(out.trajectory_path).read_text(encoding="utf-8"))
+        errors = []
+        for e in traj["events"]:
+            errors.extend(e.get("errors") or [])
+        self.assertTrue(any("screenshot_id" in err for err in errors), errors)
+
+    def test_coord_click_rejected_mismatched_screenshot_id(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        provider = ScriptedProvider(
+            [
+                '{"schema_version":1,"action":"click","x":10,"y":10,"screenshot_id":"obs-999"}',
+                '{"schema_version":1,"action":"done","reason":"ok"}',
+            ]
+        )
+        out = run_recover(
+            page=page,
+            goal="g",
+            stall={"error": "x"},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "done")
+        self.assertEqual(page.coord_clicks, [])
+        traj = json.loads(Path(out.trajectory_path).read_text(encoding="utf-8"))
+        rejects = [e for e in traj["events"] if e.get("event") == "action_reject"]
+        self.assertTrue(any(e.get("reason") == "screenshot_id mismatch" for e in rejects), rejects)
+
+    def test_coord_click_matching_screenshot_id_ok(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        provider = ScriptedProvider(
+            [
+                '{"schema_version":1,"action":"click","x":10,"y":10,"screenshot_id":"obs-001"}',
+                '{"schema_version":1,"action":"done","reason":"clicked"}',
+            ]
+        )
+        out = run_recover(
+            page=page,
+            goal="g",
+            stall={"error": "x"},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "done")
+        self.assertEqual(page.coord_clicks, [(10, 10)])
+
+    def test_coords_invalidated_same_turn_after_navigation(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        page.nav_on_click["a"] = "https://example.com/next"
+        provider = ScriptedProvider(
+            [
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "actions": [
+                            {"action": "click", "css": "a"},
+                            {
+                                "action": "click",
+                                "x": 10,
+                                "y": 10,
+                                "screenshot_id": "obs-001",
+                            },
+                        ],
+                    }
+                ),
+                '{"schema_version":1,"action":"done","reason":"ok"}',
+            ]
+        )
+        out = run_recover(
+            page=page,
+            goal="g",
+            stall={"error": "x"},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "done")
+        self.assertEqual(page.coord_clicks, [])
+        traj = json.loads(Path(out.trajectory_path).read_text(encoding="utf-8"))
+        rejects = [e for e in traj["events"] if e.get("event") == "action_reject"]
+        self.assertTrue(
+            any(e.get("reason") == "coords invalidated" for e in rejects), rejects
+        )
+
+    def test_coords_invalidated_after_viewport_change(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+
+        def shrink(_calls):
+            page.viewport_size = {"width": 800, "height": 600}
+
+        provider = ScriptedProvider(
+            [
+                '{"schema_version":1,"action":"click","x":10,"y":10,"screenshot_id":"obs-001"}',
+                '{"schema_version":1,"action":"done","reason":"ok"}',
+            ],
+            before_complete=shrink,
+        )
+        out = run_recover(
+            page=page,
+            goal="g",
+            stall={"error": "x"},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "done")
+        self.assertEqual(page.coord_clicks, [])
+        traj = json.loads(Path(out.trajectory_path).read_text(encoding="utf-8"))
+        rejects = [e for e in traj["events"] if e.get("event") == "action_reject"]
+        self.assertTrue(
+            any(e.get("reason") == "coords invalidated" for e in rejects), rejects
+        )
+
+    def test_fill_password_field_allowed(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        page.elements["#password"] = {"text": "", "type": "password"}
+        page.elements["#user"] = {"text": "", "type": "text"}
+        provider = ScriptedProvider(
+            [
+                '{"schema_version":1,"action":"fill","css":"#user","text":"alice"}',
+                '{"schema_version":1,"action":"fill","css":"#password","text":"hunter2-login"}',
+                '{"schema_version":1,"action":"done","reason":"logged in"}',
+            ]
+        )
+        out = run_recover(
+            page=page,
+            goal="log in",
+            stall={"error": "x"},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "done")
+        self.assertEqual(page.filled, [("#user", "alice"), ("#password", "hunter2-login")])
+        self.assertIn("fill", SYSTEM_PROMPT)
+        self.assertIn("screenshot_id", SYSTEM_PROMPT)
+
+    def test_binding_invalid_on_url_or_viewport(self):
+        page = FakePage()
+        b = CoordBinding(
+            screenshot_id="obs-001", width=1280, height=720, url=page.url
+        )
+        self.assertTrue(binding_still_valid(page, b))
+        page.url = "https://example.com/next"
+        self.assertFalse(binding_still_valid(page, b))
+        page.url = "https://example.com/"
+        page.viewport_size = {"width": 800, "height": 600}
+        self.assertFalse(binding_still_valid(page, b))
+        page.viewport_size = {"width": 1280, "height": 720}
+        dead = CoordBinding(
+            screenshot_id="obs-001", width=1280, height=720, url=page.url, valid=False
+        )
+        self.assertFalse(binding_still_valid(page, dead))

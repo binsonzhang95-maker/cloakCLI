@@ -23,8 +23,14 @@ You may click, type/fill, scroll, wait, or goto (policy-limited). Observation sc
 You CANNOT read local files, run shell/host code, or execute arbitrary JavaScript.
 Return a JSON object only, schema_version 1, one action:
 {"schema_version":1,"action":"click|type|fill|scroll|wait|goto|done|fail|ask_human"}
-click: {"css":"..."} OR {"x":int,"y":int,"screenshot_id":"obs-NNN"} (coords are CSS pixels of the CURRENT screenshot)
-type/fill: {"css":"...","text":"..."}  (do not invent passwords/API keys)
+click: {"css":"..."} OR {"x":int,"y":int,"screenshot_id":"<current screenshot_id>"}
+  Coordinate clicks REQUIRE screenshot_id equal to this observation's screenshot_id.
+  Omitting it, or using a previous id after navigation/viewport change, is rejected.
+  Coords are CSS pixels of the CURRENT screenshot.
+type: {"css":"...","text":"..."}  click the field then keyboard.type
+fill: {"css":"...","text":"..."}  Playwright page.fill (replace the input value)
+  You MAY type into username/password form fields when the goal requires login.
+  Do not invent API keys or paste Authorization headers / cookie values.
 scroll: {"delta_y":int} optional delta_x or css
 wait: {"ms":int}
 goto: {"url":"..."} same origin unless allow_hosts; never file:/javascript:/data:
@@ -372,14 +378,22 @@ def _execute_action(
                 audit("action_execute", action=action.public_dict())
                 st.last_feedback = f"ok click css={action.css}"
                 return "ok"
-            # coordinate click bound to current screenshot
+            # Coordinate click MUST bind to the current observation screenshot.
+            if not action.screenshot_id:
+                st.last_feedback = "rejected click: coordinate click requires screenshot_id"
+                audit("action_reject", action="click", reason="screenshot_id required")
+                return "rejected"
+            if action.screenshot_id != obs.screenshot_id:
+                st.last_feedback = "rejected click: screenshot_id does not match current observation"
+                audit("action_reject", action="click", reason="screenshot_id mismatch")
+                return "rejected"
+            if st.binding and action.screenshot_id != st.binding.screenshot_id:
+                st.last_feedback = "rejected click: screenshot_id does not match current binding"
+                audit("action_reject", action="click", reason="screenshot_id mismatch")
+                return "rejected"
             if not binding_still_valid(page, st.binding):
                 st.last_feedback = "rejected click: coordinates invalidated (navigation/viewport/screenshot)"
                 audit("action_reject", action="click", reason="coords invalidated")
-                return "rejected"
-            if action.screenshot_id and action.screenshot_id != obs.screenshot_id:
-                st.last_feedback = "rejected click: screenshot_id does not match current observation"
-                audit("action_reject", action="click", reason="screenshot_id mismatch")
                 return "rejected"
             x, y = action.x, action.y
             w, h = obs.viewport
