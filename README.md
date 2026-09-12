@@ -27,6 +27,10 @@ cloakcli master serve (optional)          ▼
 
 本仓库在 box 上：`/workspace/CloakCLI`（Mac 稍后同步到 `~/Documents/CloakCLI`）。
 
+## Desktop shell (Tauri 2)
+
+Optional GUI that embeds `cloakcli tui` in a PTY (xterm.js). It does not reimplement CLI/TUI/worker logic. See [`desktop/README.md`](desktop/README.md).
+
 ## Per-node browser daemon
 
 Sessions must survive across CLI invocations:

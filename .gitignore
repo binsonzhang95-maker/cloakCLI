@@ -49,11 +49,21 @@ cookies-export.json
 
 # Screenshots / skill artifacts
 *.png
+!desktop/src-tauri/icons/*.png
 
 # verify script export artifact
 cookie-export-verify.json
 
 # Local Astra prompts / scratch (keep review markdown if useful — ignore ask-*)
 ask-astra*.txt
+ask-grok*.md
 astra-review-run.log
+grok-*-run.log
+*.bak
 screenshots/
+
+# Desktop (Tauri) — keep source; ignore build artifacts
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CloakCLI</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="titlebar">
+        <div class="titlebar-drag" data-tauri-drag-region>
+          <span class="titlebar-mark" data-tauri-drag-region>C</span>
+          <span class="titlebar-title" data-tauri-drag-region>CloakCLI</span>
+          <span id="session-label" class="titlebar-session" data-tauri-drag-region
+            >starting…</span
+          >
+        </div>
+        <div class="titlebar-controls">
+          <button type="button" id="titlebar-minimize" title="Minimize" aria-label="Minimize">
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12">
+              <rect x="1" y="5.25" width="10" height="1.5" fill="currentColor" />
+            </svg>
+          </button>
+          <button type="button" id="titlebar-maximize" title="Maximize" aria-label="Maximize">
+            <svg id="icon-maximize" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12">
+              <rect x="1.75" y="1.75" width="8.5" height="8.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+            <svg id="icon-restore" class="hidden" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12">
+              <rect x="3.2" y="1.6" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.3" />
+              <rect x="1.6" y="3.4" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.3" />
+            </svg>
+          </button>
+          <button type="button" id="titlebar-close" class="close" title="Close" aria-label="Close">
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12">
+              <path
+                d="M2.2 2.2 L9.8 9.8 M9.8 2.2 L2.2 9.8"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <div id="setup" class="setup hidden">
+        <div class="setup-card">
+          <h1>Project root required</h1>
+          <p>
+            Set an absolute existing directory for <code>CLOAKCLI_HOME</code>. Relative paths,
+            empty values, and <code>..</code> segments are rejected.
+          </p>
+          <label for="home-input">CLOAKCLI_HOME</label>
+          <input id="home-input" type="text" spellcheck="false" placeholder="/absolute/path/to/CloakCLI" />
+          <p id="setup-error" class="setup-error"></p>
+          <button type="button" id="home-save">Use this directory</button>
+        </div>
+      </div>
+
+      <div id="terminal" class="terminal"></div>
+
+      <footer class="statusbar">
+        <span id="status-bin">bin: …</span>
+        <span id="status-home">home: …</span>
+        <span id="status-pty">pty: stopped</span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

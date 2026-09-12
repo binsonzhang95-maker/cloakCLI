@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-home"
+description = "Enables the set_home command without any pre-configured scope."
+commands.allow = ["set_home"]
+
+[[permission]]
+identifier = "deny-set-home"
+description = "Denies the set_home command without any pre-configured scope."
+commands.deny = ["set_home"]
