@@ -1,0 +1,26 @@
+{
+  "name": "taught-login",
+  "goal": "Sign in and open the dashboard",
+  "events": [
+    {
+      "kind": "navigation",
+      "url": "https://example.com/login?token=leakme&next=/app"
+    },
+    {
+      "kind": "input",
+      "selector": "#user",
+      "value": "alice",
+      "field": { "type": "text", "name": "username", "id": "user" }
+    },
+    {
+      "kind": "input",
+      "selector": "#pass",
+      "value": "hunter2",
+      "field": { "type": "password", "name": "password", "id": "pass" }
+    },
+    {
+      "kind": "click",
+      "selector": "button.submit"
+    }
+  ]
+}

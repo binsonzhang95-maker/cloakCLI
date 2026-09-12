@@ -14,7 +14,8 @@ from .redact import looks_secret_key, redact_any, redact_text
 from .recover.loop import AskHumanError, RecoverFailed, RecoverResult, run_recover
 from .recover.origin import origin_of
 
-_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+# {{NAME}} and {{vars.NAME}} (teach export uses the vars. prefix).
+_VAR_RE = re.compile(r"\{\{\s*(?:vars\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 
 
 class UndefinedVarError(ValueError):

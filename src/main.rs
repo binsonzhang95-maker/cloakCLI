@@ -13,6 +13,7 @@ mod profiles;
 mod protocol;
 mod skills;
 mod state;
+mod teach;
 mod tui;
 mod util;
 mod worker;
@@ -40,6 +41,7 @@ async fn main() -> Result<()> {
         Some(Commands::Client { action }) => cli::handle_client(&root, action).await,
         Some(Commands::Fleet { action }) => cli::handle_fleet(&root, action),
         Some(Commands::Llm { action }) => cli::handle_llm(&root, action).await,
+        Some(Commands::Teach { action }) => cli::handle_teach(&root, action).await,
         Some(Commands::Doctor) => cli::handle_doctor(&root).await,
     }
 }

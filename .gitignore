@@ -35,6 +35,11 @@ profiles/*
 data/*
 !data/.gitkeep
 
+# Teach export secrets (password vars sidecar)
+skills/**/secrets.json
+skills/**/*.secret
+skills/**/.env
+
 # Cookie secrets — never commit (defense in depth; also under profiles/)
 **/cookie.json
 **/cookies-export*.json

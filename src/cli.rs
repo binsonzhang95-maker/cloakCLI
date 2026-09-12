@@ -72,6 +72,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: LlmCmd,
     },
+    /// Record a skill in a headed CloakBrowser (MV3 teach extension)
+    Teach {
+        #[command(subcommand)]
+        action: TeachCmd,
+    },
     /// Check Rust binary, Python worker, cloakbrowser, daemon
     Doctor,
 }
@@ -189,6 +194,20 @@ pub enum FleetCmd {
         headed: bool,
         #[arg(long, group = "mode")]
         headless: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TeachCmd {
+    /// Headed CloakBrowser + bundled teach extension (not a user-supplied path)
+    Start {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        url: Option<String>,
+        /// Export password/token/secret fields as plaintext (default: {{vars.NAME}})
+        #[arg(long)]
+        allow_secrets: bool,
     },
 }
 
@@ -854,6 +873,12 @@ pub async fn handle_doctor(root: &Path) -> Result<()> {
     println!("  cloakcli worker stop    # close all browsers, stop daemon");
     println!("\nNote: full browser launch may fail in headless CI/boxes without display/deps;");
     println!("      code path uses cloakbrowser.launch_persistent_context via Python worker.");
+
+    match crate::teach::resolve_extension_dir(root) {
+        Ok(p) => println!("teach_extension: {}", p.display()),
+        Err(e) => println!("teach_extension: MISSING ({e})"),
+    }
+    println!("teach:          cloakcli teach start --profile NAME [--url URL]  (headed only)");
     Ok(())
 }
 
@@ -1072,6 +1097,26 @@ pub fn handle_fleet(root: &Path, action: FleetCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub async fn handle_teach(root: &Path, action: TeachCmd) -> Result<()> {
+    match action {
+        TeachCmd::Start {
+            profile,
+            url,
+            allow_secrets,
+        } => {
+            crate::teach::start(
+                root,
+                crate::teach::TeachStartOpts {
+                    profile,
+                    url,
+                    allow_secrets,
+                },
+            )
+            .await
+        }
+    }
 }
 
 pub async fn handle_llm(root: &Path, action: LlmCmd) -> Result<()> {

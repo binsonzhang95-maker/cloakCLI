@@ -101,6 +101,7 @@ Ops-console layout: **header** (shimmering `CloakCLI` / version / DEV STUB / hea
 
 | Key | Action |
 |-----|--------|
+| `T` | Teach on selected profile (headed CloakBrowser + bundled extension; same as `cloakcli teach start`) |
 | `q` / Esc | Quit TUI (daemon/hub keep running) |
 | `Tab` / `Shift-Tab` / `1`–`6` | Switch panes: Profiles · Skills · Sessions · Clients · Config · Logs |
 | `j`/`k` or ↑↓ | Navigate list |
@@ -146,6 +147,25 @@ cloakcli skill run hello --profile noproxy --headless
 Legacy flat `profiles/<name>.json` is still readable; cookie ops (`import`/`export`/`clear`/`status`), profile update/create, and open migrate to `profiles/<name>/profile.json`.
 
 TUI Profiles pane shows cookie status; keys `i` / `E` / `C` = import path / export path / clear.
+
+## Teach (record a skill)
+
+Independent MV3 extension at `extensions/teach/`. Master/fleet **do not teach** — they only consume exported `skills/<name>/skill.json`.
+
+```bash
+cloakcli teach start --profile demo --url https://example.com
+# in the browser: extension popup → Record → click/type/navigate → Mark goal → Stop → Export
+cloakcli skill run <exported-name> --profile demo --var PASSWORD=...
+```
+
+- Headed CloakBrowser only (headless is a hard error). The extension path is resolved from the install/repo; there is **no** `--extension` / `--load-extension` CLI inject.
+- TUI key `T` calls the same `teach start` path (no second launcher).
+- Export mapping: navigation → `goto`, click → `click` (selector), input → `fill`. Skill-level `goal` is the last marked goal; empty steps are rejected; missing goal is allowed (runner fallbacks).
+- Password / token / secret fields export as `{{vars.NAME}}` by default (listed in the generated README). Explicit `--allow-secrets` keeps plaintext and still writes a `.gitignore`.
+- Content script is origin-allowlisted (`http`/`https` added while recording). Manifest has no `<all_urls>`.
+- Takes the profile lock for the whole session; conflict with a batch worker prints a clear error.
+
+Fixture round-trip: `fixtures/teach/recorded-events.json` → `fixtures/teach/expected-skill.json`.
 
 ## Skill format
 

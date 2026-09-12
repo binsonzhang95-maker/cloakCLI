@@ -1,0 +1,1211 @@
+//! Headed CloakCLI Teach launcher and skill export.
+//!
+//! Records via the MV3 extension at `extensions/teach/`. This module is a
+//! launcher + exporter only — it does not implement a teaching state machine.
+//! Master/fleet never teach; they consume exported `skills/<name>/skill.json`.
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashMap};
+use std::fs;
+use std::net::TcpListener as StdTcpListener;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::process::Command;
+
+use crate::locks::ProfileLock;
+use crate::profiles;
+use crate::state;
+use crate::util;
+
+const SECRET_QUERY_KEYS: &[&str] = &[
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "api_key",
+    "apikey",
+    "api-key",
+    "auth",
+    "authorization",
+    "password",
+    "passwd",
+    "secret",
+    "session",
+    "sessionid",
+    "jwt",
+    "cookie",
+    "client_secret",
+    "code",
+];
+
+const SECRET_FIELD_MARKERS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "credential",
+];
+
+/// CLI / TUI options for `teach start`. Extension path is never a user argument.
+pub struct TeachStartOpts {
+    pub profile: String,
+    pub url: Option<String>,
+    pub allow_secrets: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExtConfig {
+    #[serde(rename = "exportOrigin")]
+    export_origin: String,
+    token: String,
+    #[serde(rename = "allowOrigins")]
+    allow_origins: Vec<String>,
+    #[serde(rename = "allowSecrets")]
+    allow_secrets: bool,
+    profile: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportBody {
+    name: String,
+    #[serde(default)]
+    goal: Option<String>,
+    #[serde(default)]
+    events: Vec<RecordedEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordedEvent {
+    pub kind: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub selector: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub field: Option<FieldHint>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FieldHint {
+    #[serde(default, rename = "type")]
+    pub input_type: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub autocomplete: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MappedSkill {
+    pub name: String,
+    pub goal: Option<String>,
+    pub description: String,
+    pub params: Vec<Value>,
+    pub steps: Vec<Value>,
+    pub vars: Vec<String>,
+    pub allow_secrets: bool,
+}
+
+struct ExportState {
+    root: PathBuf,
+    token: String,
+    allow_secrets: bool,
+    last: Mutex<Option<PathBuf>>,
+}
+
+/// Headed is a hard requirement. Headless teach is rejected before launch.
+pub fn require_headed(headed: bool) -> Result<()> {
+    if !headed {
+        bail!("teach start requires a headed CloakBrowser; headless is not supported");
+    }
+    Ok(())
+}
+
+/// Resolve the bundled teach extension. Not a CLI-injectable path.
+pub fn resolve_extension_dir(root: &Path) -> Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(root.join("extensions").join("teach"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for ancestor in parent.ancestors().take(6) {
+                candidates.push(ancestor.join("extensions").join("teach"));
+                candidates.push(ancestor.join("share").join("cloakcli").join("extensions").join("teach"));
+            }
+        }
+    }
+    candidates.push(PathBuf::from("/usr/local/share/cloakcli/extensions/teach"));
+    candidates.push(PathBuf::from("/usr/share/cloakcli/extensions/teach"));
+
+    let mut seen = BTreeSet::new();
+    for c in candidates {
+        let Ok(canon) = c.canonicalize() else {
+            continue;
+        };
+        if !seen.insert(canon.clone()) {
+            continue;
+        }
+        if is_teach_extension(&canon) {
+            return Ok(canon);
+        }
+    }
+    bail!(
+        "CloakCLI Teach extension not found (looked under {}/extensions/teach). \
+         Install/build the repo; the path is not a CLI argument.",
+        root.display()
+    );
+}
+
+pub fn is_teach_extension(dir: &Path) -> bool {
+    let man = dir.join("manifest.json");
+    let Ok(text) = fs::read_to_string(&man) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    v.get("name").and_then(|x| x.as_str()) == Some("CloakCLI Teach")
+        && v.get("manifest_version").and_then(|x| x.as_u64()) == Some(3)
+}
+
+/// True when the packaged manifest would default-inject everywhere (forbidden).
+pub fn manifest_has_all_urls(dir: &Path) -> Result<bool> {
+    let text = fs::read_to_string(dir.join("manifest.json"))?;
+    Ok(text.contains("<all_urls>"))
+}
+
+pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
+    require_headed(true)?;
+    util::validate_name(&opts.profile, "profile")?;
+    let prof = profiles::get(root, &opts.profile)?;
+    let ext_src = resolve_extension_dir(root)?;
+    if manifest_has_all_urls(&ext_src)? {
+        bail!("teach extension manifest must not use <all_urls>");
+    }
+    if !ext_src.join("background.js").is_file() || !ext_src.join("content.js").is_file() {
+        bail!("teach extension at {} is incomplete", ext_src.display());
+    }
+
+    let udir = PathBuf::from(&prof.user_data_dir);
+    let _ = util::ensure_under_root(root, &udir)?;
+    fs::create_dir_all(&udir)?;
+
+    if opts.allow_secrets {
+        eprintln!(
+            "warning: --allow-secrets exports password/token/secret values in skill.json. \
+             A .gitignore is written; do not commit secrets."
+        );
+    }
+
+    let _lock = acquire_teach_lock(root, &prof.name).await?;
+
+    let std_listener = StdTcpListener::bind("127.0.0.1:0")
+        .context("bind teach export server on 127.0.0.1")?;
+    std_listener.set_nonblocking(true)?;
+    let port = std_listener.local_addr()?.port();
+    let listener = TcpListener::from_std(std_listener)?;
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let export_origin = format!("http://127.0.0.1:{port}");
+
+    let mut allow_origins = Vec::new();
+    if let Some(ref u) = opts.url {
+        if let Some(o) = http_origin(u) {
+            allow_origins.push(o);
+        }
+    }
+
+    let staged = stage_extension(
+        root,
+        &ext_src,
+        &ExtConfig {
+            export_origin: export_origin.clone(),
+            token: token.clone(),
+            allow_origins,
+            allow_secrets: opts.allow_secrets,
+            profile: prof.name.clone(),
+        },
+    )?;
+
+    let state = Arc::new(ExportState {
+        root: root.to_path_buf(),
+        token,
+        allow_secrets: opts.allow_secrets,
+        last: Mutex::new(None),
+    });
+    let server_state = state.clone();
+    let server = tokio::spawn(async move {
+        run_export_server(listener, server_state).await;
+    });
+
+    println!("teach: headed CloakBrowser + CloakCLI Teach extension");
+    println!("  profile:   {}", prof.name);
+    println!("  extension: {}", staged.display());
+    println!("  export:    {export_origin}/export");
+    println!("Record with the extension popup: record → mark goal → stop → export.");
+    println!("Close the browser window when finished (Ctrl-C also stops and releases the profile lock).");
+
+    let result = run_browser(
+        root,
+        &prof.user_data_dir,
+        &staged,
+        opts.url.as_deref(),
+        prof.proxy.as_deref(),
+    )
+    .await;
+
+    server.abort();
+    let _ = fs::remove_dir_all(&staged);
+
+    if let Some(path) = state.last.lock().ok().and_then(|g| g.clone()) {
+        println!("last export: {}", path.display());
+    }
+
+    result
+}
+
+async fn acquire_teach_lock(root: &Path, profile: &str) -> Result<ProfileLock> {
+    match ProfileLock::acquire(root, profile, Duration::from_secs(2)).await {
+        Ok(lock) => Ok(lock),
+        Err(_) => {
+            let path = state::profile_lock_dir(root, profile);
+            bail!(
+                "profile '{profile}' is already in use (batch worker or another browser/teach job). \
+                 Wait for that job to finish. Lock: {}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn stage_extension(root: &Path, src: &Path, cfg: &ExtConfig) -> Result<PathBuf> {
+    let dest = state::data_dir(root)
+        .join("teach")
+        .join(format!("{}-{}", cfg.profile, uuid::Uuid::new_v4().simple()));
+    let dest = util::ensure_under_root(root, &dest)?;
+    if dest.exists() {
+        bail!("teach staging path already exists: {}", dest.display());
+    }
+    copy_ext_dir(src, &dest)?;
+    let dest = util::ensure_under_root(root, &dest)?;
+    let session = dest.join("session.json");
+    fs::write(&session, format!("{}\n", serde_json::to_string_pretty(cfg)?))?;
+    let _ = util::ensure_under_root(root, &session)?;
+    Ok(dest)
+}
+
+fn copy_ext_dir(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)?;
+    for e in fs::read_dir(src)? {
+        let e = e?;
+        let name = e.file_name();
+        let name_s = name.to_string_lossy();
+        if name_s.starts_with('.') || name_s == "session.json" {
+            continue;
+        }
+        let from = e.path();
+        let to = dest.join(&name);
+        if from.is_dir() {
+            copy_ext_dir(&from, &to)?;
+        } else if from.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_browser(
+    root: &Path,
+    user_data_dir: &str,
+    extension: &Path,
+    url: Option<&str>,
+    proxy: Option<&str>,
+) -> Result<()> {
+    let py = python_bin()?;
+    let mut cmd = Command::new(&py);
+    cmd.arg("-m")
+        .arg("cloakcli_worker.teach")
+        .arg("--root")
+        .arg(root)
+        .arg("--user-data-dir")
+        .arg(user_data_dir)
+        .arg("--extension")
+        .arg(extension)
+        .arg("--headed");
+    if let Some(u) = url {
+        cmd.arg("--url").arg(u);
+    }
+    if let Some(p) = proxy {
+        cmd.arg("--proxy").arg(p);
+    }
+    if let Ok(secs) = std::env::var("CLOAKCLI_TEACH_SMOKE_SECONDS") {
+        if !secs.is_empty() {
+            cmd.env("CLOAKCLI_TEACH_SMOKE_SECONDS", secs);
+        }
+    }
+    let worker_parent = root.join("python");
+    let mut pp = worker_parent.to_string_lossy().to_string();
+    if let Ok(existing) = std::env::var("PYTHONPATH") {
+        if !existing.is_empty() {
+            pp = format!("{pp}:{existing}");
+        }
+    }
+    cmd.env("PYTHONPATH", pp);
+    cmd.env("CLOAKCLI_ROOT", root);
+    cmd.env("PYTHONUNBUFFERED", "1");
+    cmd.current_dir(root);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {py} -m cloakcli_worker.teach"))?;
+
+    tokio::select! {
+        status = child.wait() => {
+            let status = status.context("wait teach browser")?;
+            if !status.success() {
+                bail!("teach browser exited {}", status);
+            }
+            Ok(())
+        }
+        _ = tokio::signal::ctrl_c() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            bail!("teach interrupted");
+        }
+    }
+}
+
+fn python_bin() -> Result<String> {
+    if let Ok(bin) = std::env::var("CLOAKCLI_PYTHON") {
+        return Ok(bin);
+    }
+    for name in ["python3", "python"] {
+        if which::which(name).is_ok() {
+            return Ok(name.to_string());
+        }
+    }
+    bail!("python3 not found; set CLOAKCLI_PYTHON");
+}
+
+async fn run_export_server(listener: TcpListener, state: Arc<ExportState>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_http(stream, state).await {
+                        eprintln!("teach export server: {e}");
+                    }
+                });
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+async fn handle_http(mut stream: TcpStream, state: Arc<ExportState>) -> Result<()> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 2048];
+    let header_end;
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > 64 * 1024 {
+            write_http(&mut stream, 413, "{\"ok\":false,\"error\":\"headers too large\"}").await?;
+            return Ok(());
+        }
+        if let Some(pos) = find_header_end(&buf) {
+            header_end = pos;
+            break;
+        }
+    }
+    let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let mut lines = header_text.split("\r\n");
+    let req_line = lines.next().unwrap_or("");
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_ascii_uppercase();
+    let path = parts.next().unwrap_or("/");
+
+    let mut content_length: usize = 0;
+    let mut token_hdr: Option<String> = None;
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let k = k.trim().to_ascii_lowercase();
+        let v = v.trim();
+        if k == "content-length" {
+            content_length = v.parse().unwrap_or(0);
+        }
+        if k == "x-cloakcli-token" {
+            token_hdr = Some(v.to_string());
+        }
+    }
+
+    if method == "OPTIONS" {
+        write_http(&mut stream, 204, "").await?;
+        return Ok(());
+    }
+
+    if method == "GET" && (path == "/health" || path.starts_with("/health?")) {
+        write_http(&mut stream, 200, "{\"ok\":true}").await?;
+        return Ok(());
+    }
+
+    if method != "POST" || path != "/export" {
+        write_http(
+            &mut stream,
+            404,
+            "{\"ok\":false,\"error\":\"not found\"}",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if content_length == 0 || content_length > 1_000_000 {
+        write_http(
+            &mut stream,
+            400,
+            "{\"ok\":false,\"error\":\"invalid content-length\"}",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    while buf.len() < header_end + content_length {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > header_end + 1_000_000 {
+            write_http(&mut stream, 413, "{\"ok\":false,\"error\":\"body too large\"}").await?;
+            return Ok(());
+        }
+    }
+    let body = &buf[header_end..header_end + content_length.min(buf.len() - header_end)];
+
+    if token_hdr.as_deref() != Some(state.token.as_str()) {
+        write_http(&mut stream, 401, "{\"ok\":false,\"error\":\"unauthorized\"}").await?;
+        return Ok(());
+    }
+
+    let parsed: ExportBody = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = json!({"ok": false, "error": format!("invalid json: {e}")});
+            write_http(&mut stream, 400, &msg.to_string()).await?;
+            return Ok(());
+        }
+    };
+
+    match export_recorded(
+        &state.root,
+        &parsed.name,
+        parsed.goal.as_deref(),
+        &parsed.events,
+        state.allow_secrets,
+    ) {
+        Ok(path) => {
+            if let Ok(mut g) = state.last.lock() {
+                *g = Some(path.clone());
+            }
+            let msg = json!({
+                "ok": true,
+                "path": path.display().to_string(),
+            });
+            println!("teach export: {}", path.display());
+            write_http(&mut stream, 200, &msg.to_string()).await?;
+        }
+        Err(e) => {
+            let msg = json!({"ok": false, "error": e.to_string()});
+            eprintln!("teach export rejected: {e}");
+            write_http(&mut stream, 400, &msg.to_string()).await?;
+        }
+    }
+    Ok(())
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+async fn write_http(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
+    let reason = match status {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        413 => "Payload Too Large",
+        _ => "Error",
+    };
+    let resp = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Headers: Content-Type, X-CloakCLI-Token\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Map recorded events → existing skill.json schema and write under `skills/<name>/`.
+pub fn export_recorded(
+    root: &Path,
+    name: &str,
+    goal: Option<&str>,
+    events: &[RecordedEvent],
+    allow_secrets: bool,
+) -> Result<PathBuf> {
+    let mapped = map_events_to_skill(name, goal, events, allow_secrets)?;
+    write_skill_dir(root, &mapped)
+}
+
+pub fn map_events_to_skill(
+    name: &str,
+    goal: Option<&str>,
+    events: &[RecordedEvent],
+    allow_secrets: bool,
+) -> Result<MappedSkill> {
+    util::validate_name(name, "skill")?;
+    let goal = normalize_goal(goal, events);
+    let mut steps: Vec<Value> = Vec::new();
+    let mut vars: Vec<String> = Vec::new();
+    let mut var_counts: HashMap<String, usize> = HashMap::new();
+    let mut last_nav: Option<String> = None;
+
+    // Coalesce consecutive inputs on the same selector (keep last value).
+    let coalesced = coalesce_events(events);
+
+    for (i, ev) in coalesced.iter().enumerate() {
+        let kind = ev.kind.trim().to_ascii_lowercase();
+        match kind.as_str() {
+            "goal" => continue,
+            "navigation" | "nav" | "goto" => {
+                let Some(url) = ev.url.as_deref() else {
+                    continue;
+                };
+                let Ok(url) = sanitize_url(url) else {
+                    continue;
+                };
+                if last_nav.as_deref() == Some(url.as_str()) {
+                    continue;
+                }
+                last_nav = Some(url.clone());
+                steps.push(json!({"action": "goto", "url": url}));
+            }
+            "click" => {
+                let Some(sel) = ev.selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                // Skip click when the next coalesced event fills the same control.
+                if let Some(next) = coalesced.get(i + 1) {
+                    let nk = next.kind.trim().to_ascii_lowercase();
+                    if matches!(nk.as_str(), "input" | "fill" | "type")
+                        && next.selector.as_deref() == Some(sel)
+                    {
+                        continue;
+                    }
+                }
+                steps.push(json!({"action": "click", "selector": sel}));
+            }
+            "input" | "fill" | "type" => {
+                let Some(sel) = ev.selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let raw_val = ev.value.clone().unwrap_or_default();
+                let text = if looks_secret_field(ev.field.as_ref()) {
+                    if allow_secrets {
+                        raw_val
+                    } else {
+                        let base = var_name_for_field(ev.field.as_ref()).unwrap_or_else(|| "SECRET".into());
+                        let n = var_counts.entry(base.clone()).or_insert(0);
+                        *n += 1;
+                        let name = if *n == 1 {
+                            base
+                        } else {
+                            format!("{base}_{n}")
+                        };
+                        if !vars.iter().any(|v| v == &name) {
+                            vars.push(name.clone());
+                        }
+                        format!("{{{{vars.{name}}}}}")
+                    }
+                } else {
+                    strip_secretish_value(&raw_val)
+                };
+                steps.push(json!({"action": "fill", "selector": sel, "text": text}));
+            }
+            _ => continue,
+        }
+    }
+
+    if steps.is_empty() {
+        bail!("empty steps: record at least one click, input, or navigation before export");
+    }
+
+    let description = match &goal {
+        Some(g) => format!("Taught skill: {g}"),
+        None => "Taught skill".into(),
+    };
+    let params: Vec<Value> = vars
+        .iter()
+        .map(|n| json!({"name": n, "required": true}))
+        .collect();
+
+    Ok(MappedSkill {
+        name: name.to_string(),
+        goal,
+        description,
+        params,
+        steps,
+        vars,
+        allow_secrets,
+    })
+}
+
+fn coalesce_events(events: &[RecordedEvent]) -> Vec<RecordedEvent> {
+    let mut out: Vec<RecordedEvent> = Vec::new();
+    for ev in events {
+        let kind = ev.kind.trim().to_ascii_lowercase();
+        if matches!(kind.as_str(), "input" | "fill" | "type") {
+            if let Some(last) = out.last_mut() {
+                let lk = last.kind.trim().to_ascii_lowercase();
+                if matches!(lk.as_str(), "input" | "fill" | "type")
+                    && last.selector == ev.selector
+                {
+                    *last = ev.clone();
+                    continue;
+                }
+            }
+        }
+        out.push(ev.clone());
+    }
+    out
+}
+
+fn normalize_goal(goal: Option<&str>, events: &[RecordedEvent]) -> Option<String> {
+    let mut g = goal.map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string());
+    for ev in events {
+        if ev.kind.trim().eq_ignore_ascii_case("goal") {
+            if let Some(t) = ev
+                .text
+                .as_deref()
+                .or(ev.value.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                g = Some(t.to_string());
+            }
+        }
+    }
+    g
+}
+
+pub fn write_skill_dir(root: &Path, mapped: &MappedSkill) -> Result<PathBuf> {
+    util::validate_name(&mapped.name, "skill")?;
+    let skills = state::skills_dir(root);
+    fs::create_dir_all(&skills)?;
+    let skills_canon = util::ensure_under_root(root, &skills)?;
+    let dest = skills.join(&mapped.name);
+    // Reject `..` / absolute / symlink escape before create.
+    if mapped.name.contains("..") || mapped.name.contains('/') || mapped.name.contains('\\') {
+        bail!("invalid skill name '{}'", mapped.name);
+    }
+    let dest_check = util::ensure_under_root(root, &dest)?;
+    if !dest_check.starts_with(&skills_canon) {
+        bail!("export destination escapes skills/");
+    }
+    if dest.exists() {
+        let dest_canon = dest
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", dest.display()))?;
+        if !dest_canon.starts_with(&skills_canon) {
+            bail!("export destination escapes skills/ (symlink)");
+        }
+    }
+    fs::create_dir_all(&dest)?;
+    let dest_canon = dest
+        .canonicalize()
+        .with_context(|| format!("canonicalize created {}", dest.display()))?;
+    if !dest_canon.starts_with(&skills_canon) {
+        let _ = fs::remove_dir_all(&dest);
+        bail!("export destination escaped skills/; refused");
+    }
+
+    let mut skill = json!({
+        "schema_version": 1,
+        "name": mapped.name,
+        "description": mapped.description,
+        "params": mapped.params,
+        "steps": mapped.steps,
+    });
+    if let Some(g) = &mapped.goal {
+        skill["goal"] = json!(g);
+    }
+
+    let sj = dest_canon.join("skill.json");
+    let _ = util::ensure_under_root(root, &sj)?;
+    fs::write(&sj, format!("{}\n", serde_json::to_string_pretty(&skill)?))?;
+
+    let readme = dest_canon.join("README.md");
+    let _ = util::ensure_under_root(root, &readme)?;
+    fs::write(&readme, render_readme(mapped))?;
+
+    let gi = dest_canon.join(".gitignore");
+    let _ = util::ensure_under_root(root, &gi)?;
+    fs::write(&gi, "secrets.json\n.env\n*.secret\n")?;
+
+    Ok(sj)
+}
+
+fn render_readme(mapped: &MappedSkill) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("# {}\n\n", mapped.name));
+    if let Some(g) = &mapped.goal {
+        s.push_str(&format!("Goal: {g}\n\n"));
+    } else {
+        s.push_str("Goal: (not marked — runner will use per-step fallbacks)\n\n");
+    }
+    s.push_str("Taught via `cloakcli teach start`. Compatible with existing skill.json (`goto` / `click` / `fill`).\n\n");
+    s.push_str("## Run\n\n```bash\n");
+    s.push_str(&format!("cloakcli skill run {} --profile <profile>", mapped.name));
+    for v in &mapped.vars {
+        s.push_str(&format!(" --var {v}=..."));
+    }
+    s.push_str("\n```\n\n");
+    if mapped.vars.is_empty() {
+        s.push_str("## Variables\n\nNone. Password/token/secret fields were not recorded");
+        if mapped.allow_secrets {
+            s.push_str(", or were exported in plaintext because `--allow-secrets` was set");
+        }
+        s.push_str(".\n");
+    } else {
+        s.push_str("## Variables\n\nPassword/token/secret fields were exported as `{{vars.NAME}}` (not plaintext).\n\n");
+        for v in &mapped.vars {
+            s.push_str(&format!("- `{v}` — required (`--var {v}=...`)\n"));
+        }
+        s.push('\n');
+    }
+    s.push_str("Do not commit secrets. This directory has a `.gitignore` for `secrets.json`, `.env`, and `*.secret`.\n");
+    if mapped.allow_secrets {
+        s.push_str("\n**`--allow-secrets` was used:** skill.json may contain plaintext secrets. Do not git-add it.\n");
+    }
+    s
+}
+
+pub fn sanitize_url(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("empty url");
+    }
+    let mut u = url::Url::parse(raw).map_err(|_| anyhow::anyhow!("invalid url"))?;
+    if u.scheme() != "http" && u.scheme() != "https" {
+        bail!("refusing non-http(s) URL");
+    }
+    if u.cannot_be_a_base() {
+        bail!("refusing non-base URL");
+    }
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    let filtered: Vec<(String, String)> = u
+        .query_pairs()
+        .filter(|(k, _)| !is_secret_query_key(k))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    u.set_query(None);
+    u.set_fragment(None);
+    if !filtered.is_empty() {
+        let q = filtered
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&");
+        u.set_query(Some(&q));
+    }
+    Ok(u.to_string())
+}
+
+fn is_secret_query_key(k: &str) -> bool {
+    let k = k.trim().to_ascii_lowercase();
+    SECRET_QUERY_KEYS.iter().any(|s| k == *s || k.contains(s))
+}
+
+pub fn looks_secret_field(field: Option<&FieldHint>) -> bool {
+    let Some(f) = field else {
+        return false;
+    };
+    let ty = f.input_type.as_deref().unwrap_or("").to_ascii_lowercase();
+    if ty == "password" {
+        return true;
+    }
+    let hay = [
+        f.input_type.as_deref().unwrap_or(""),
+        f.name.as_deref().unwrap_or(""),
+        f.id.as_deref().unwrap_or(""),
+        f.autocomplete.as_deref().unwrap_or(""),
+        f.tag.as_deref().unwrap_or(""),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+    SECRET_FIELD_MARKERS.iter().any(|m| hay.contains(m))
+}
+
+fn var_name_for_field(field: Option<&FieldHint>) -> Option<String> {
+    let f = field?;
+    let candidates = [
+        f.name.as_deref(),
+        f.id.as_deref(),
+        f.autocomplete.as_deref(),
+        f.input_type.as_deref(),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if let Some(n) = sanitize_var_ident(c) {
+            return Some(n);
+        }
+    }
+    Some("SECRET".into())
+}
+
+fn sanitize_var_ident(raw: &str) -> Option<String> {
+    let mut s: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    while s.contains("__") {
+        s = s.replace("__", "_");
+    }
+    s = s.trim_matches('_').to_string();
+    if s.is_empty() {
+        return None;
+    }
+    if s.chars().next()?.is_ascii_digit() {
+        s.insert(0, 'V');
+    }
+    if s.len() > 32 {
+        s.truncate(32);
+    }
+    Some(s)
+}
+
+fn strip_secretish_value(v: &str) -> String {
+    // Non-secret fields still must not carry Authorization / cookie dumps.
+    let lower = v.to_ascii_lowercase();
+    if lower.contains("bearer ")
+        || lower.contains("authorization")
+        || lower.contains("cookie=")
+        || v.contains("sk-")
+    {
+        return "{{vars.REDACTED}}".into();
+    }
+    v.to_string()
+}
+
+fn http_origin(url: &str) -> Option<String> {
+    let u = url::Url::parse(url).ok()?;
+    if u.scheme() != "http" && u.scheme() != "https" {
+        return None;
+    }
+    let origin = u.origin().ascii_serialization();
+    if origin == "null" {
+        None
+    } else {
+        Some(origin)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_root() -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("cloakcli_teach_{n}"));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(p.join("skills")).unwrap();
+        fs::create_dir_all(p.join("extensions").join("teach")).unwrap();
+        fs::write(
+            p.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.0.0\"\n",
+        )
+        .unwrap();
+        p
+    }
+
+    fn ev_nav(url: &str) -> RecordedEvent {
+        RecordedEvent {
+            kind: "navigation".into(),
+            url: Some(url.into()),
+            selector: None,
+            value: None,
+            text: None,
+            field: None,
+        }
+    }
+    fn ev_click(sel: &str) -> RecordedEvent {
+        RecordedEvent {
+            kind: "click".into(),
+            url: None,
+            selector: Some(sel.into()),
+            value: None,
+            text: None,
+            field: None,
+        }
+    }
+    fn ev_input(sel: &str, value: &str, field: FieldHint) -> RecordedEvent {
+        RecordedEvent {
+            kind: "input".into(),
+            url: None,
+            selector: Some(sel.into()),
+            value: Some(value.into()),
+            text: None,
+            field: Some(field),
+        }
+    }
+
+    #[test]
+    fn headed_is_hard_error() {
+        let err = require_headed(false).unwrap_err().to_string();
+        assert!(err.contains("headed"), "{err}");
+        assert!(err.contains("headless"), "{err}");
+        assert!(require_headed(true).is_ok());
+    }
+
+    #[test]
+    fn maps_click_input_nav_goal_fixture() {
+        let events = vec![
+            ev_nav("https://example.com/login?token=leakme&next=/app"),
+            ev_input(
+                "#user",
+                "alice",
+                FieldHint {
+                    input_type: Some("text".into()),
+                    name: Some("username".into()),
+                    id: Some("user".into()),
+                    ..Default::default()
+                },
+            ),
+            ev_input(
+                "#pass",
+                "hunter2",
+                FieldHint {
+                    input_type: Some("password".into()),
+                    name: Some("password".into()),
+                    id: Some("pass".into()),
+                    ..Default::default()
+                },
+            ),
+            ev_click("button.submit"),
+            RecordedEvent {
+                kind: "goal".into(),
+                url: None,
+                selector: None,
+                value: None,
+                text: Some("Sign in and open the dashboard".into()),
+                field: None,
+            },
+        ];
+        let m = map_events_to_skill("taught-login", None, &events, false).unwrap();
+        assert_eq!(m.goal.as_deref(), Some("Sign in and open the dashboard"));
+        assert_eq!(m.steps.len(), 4);
+        assert_eq!(m.steps[0]["action"], "goto");
+        assert_eq!(m.steps[0]["url"], "https://example.com/login?next=/app");
+        assert_eq!(m.steps[1]["action"], "fill");
+        assert_eq!(m.steps[1]["selector"], "#user");
+        assert_eq!(m.steps[1]["text"], "alice");
+        assert_eq!(m.steps[2]["action"], "fill");
+        assert_eq!(m.steps[2]["selector"], "#pass");
+        assert_eq!(m.steps[2]["text"], "{{vars.PASSWORD}}");
+        assert_eq!(m.steps[3]["action"], "click");
+        assert_eq!(m.steps[3]["selector"], "button.submit");
+        assert!(m.vars.iter().any(|v| v == "PASSWORD"));
+        assert!(!serde_json::to_string(&m.steps).unwrap().contains("hunter2"));
+        assert!(!serde_json::to_string(&m.steps).unwrap().contains("leakme"));
+    }
+
+    #[test]
+    fn password_allow_secrets_keeps_plaintext() {
+        let events = vec![ev_input(
+            "#pass",
+            "hunter2",
+            FieldHint {
+                input_type: Some("password".into()),
+                name: Some("password".into()),
+                ..Default::default()
+            },
+        )];
+        let m = map_events_to_skill("s", None, &events, true).unwrap();
+        assert_eq!(m.steps[0]["text"], "hunter2");
+    }
+
+    #[test]
+    fn empty_steps_rejected() {
+        let err = map_events_to_skill("s", Some("g"), &[], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty steps"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_goal_last_wins() {
+        let events = vec![
+            ev_nav("https://example.com/"),
+            RecordedEvent {
+                kind: "goal".into(),
+                text: Some("first".into()),
+                url: None,
+                selector: None,
+                value: None,
+                field: None,
+            },
+            RecordedEvent {
+                kind: "goal".into(),
+                text: Some("second".into()),
+                url: None,
+                selector: None,
+                value: None,
+                field: None,
+            },
+        ];
+        let m = map_events_to_skill("g", None, &events, false).unwrap();
+        assert_eq!(m.goal.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn missing_goal_ok() {
+        let m = map_events_to_skill("g", None, &[ev_nav("https://example.com/")], false).unwrap();
+        assert!(m.goal.is_none());
+    }
+
+    #[test]
+    fn malicious_names_rejected() {
+        for name in ["../etc", "foo/bar", "foo\\bar", "", "/etc/passwd", "a..b"] {
+            let err = map_events_to_skill(name, None, &[ev_nav("https://example.com/")], false);
+            assert!(err.is_err(), "accepted {name}");
+        }
+        assert!(util::validate_name("hello", "skill").is_ok());
+    }
+
+    #[test]
+    fn write_rejects_symlink_escape() {
+        let root = tmp_root();
+        let outside = std::env::temp_dir().join(format!(
+            "cloakcli_teach_outside_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        let link = state::skills_dir(&root).join("evil");
+        symlink(&outside, &link).unwrap();
+        let mapped = map_events_to_skill(
+            "evil",
+            Some("x"),
+            &[ev_nav("https://example.com/")],
+            false,
+        )
+        .unwrap();
+        let err = write_skill_dir(&root, &mapped).unwrap_err().to_string();
+        assert!(
+            err.contains("escape") || err.contains("symlink") || err.contains("root"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn write_happy_path_under_skills() {
+        let root = tmp_root();
+        let events = vec![
+            ev_nav("https://example.com/login"),
+            ev_click("#go"),
+        ];
+        let mapped = map_events_to_skill("okskill", Some("do it"), &events, false).unwrap();
+        let path = write_skill_dir(&root, &mapped).unwrap();
+        assert!(path.ends_with("skill.json"));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"action\": \"goto\""));
+        assert!(text.contains("\"action\": \"click\""));
+        assert!(text.contains("do it"));
+        let gi = path.parent().unwrap().join(".gitignore");
+        let gi_text = fs::read_to_string(gi).unwrap();
+        assert!(gi_text.contains("secrets.json"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sanitize_strips_userinfo_and_token() {
+        let u = sanitize_url("https://user:secret@example.com/p?token=abc&q=1#frag").unwrap();
+        assert!(!u.contains("secret"));
+        assert!(!u.contains("user:"));
+        assert!(!u.contains("token=abc"));
+        assert!(u.contains("q=1"));
+        assert!(!u.contains("#frag"));
+        assert!(sanitize_url("file:///etc/passwd").is_err());
+        assert!(sanitize_url("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn fixture_file_round_trip_if_present() {
+        let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let events_path = here.join("fixtures/teach/recorded-events.json");
+        if !events_path.is_file() {
+            return;
+        }
+        let body: Value = serde_json::from_str(&fs::read_to_string(&events_path).unwrap()).unwrap();
+        let events: Vec<RecordedEvent> =
+            serde_json::from_value(body.get("events").cloned().unwrap()).unwrap();
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap();
+        let goal = body.get("goal").and_then(|v| v.as_str());
+        let mapped = map_events_to_skill(name, goal, &events, false).unwrap();
+        let expected_path = here.join("fixtures/teach/expected-skill.json");
+        let expected: Value =
+            serde_json::from_str(&fs::read_to_string(expected_path).unwrap()).unwrap();
+        assert_eq!(mapped.steps, expected["steps"].as_array().unwrap().clone());
+        assert_eq!(mapped.goal.as_deref(), expected["goal"].as_str());
+        assert_eq!(mapped.name, expected["name"]);
+    }
+}

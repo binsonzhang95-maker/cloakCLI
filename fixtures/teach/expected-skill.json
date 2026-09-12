@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "name": "taught-login",
+  "description": "Taught skill: Sign in and open the dashboard",
+  "goal": "Sign in and open the dashboard",
+  "params": [
+    { "name": "PASSWORD", "required": true }
+  ],
+  "steps": [
+    { "action": "goto", "url": "https://example.com/login?next=/app" },
+    { "action": "fill", "selector": "#user", "text": "alice" },
+    { "action": "fill", "selector": "#pass", "text": "{{vars.PASSWORD}}" },
+    { "action": "click", "selector": "button.submit" }
+  ]
+}

@@ -991,9 +991,13 @@ fn context_help(tab: Tab) -> Vec<Span<'static>> {
             ("e", "proxy"),
             ("i/E/C", "cookies"),
             ("o", "open"),
+            ("T", "teach"),
             ("Enter", "run skill"),
         ]),
-        Tab::Skills => help_bits(&[("Enter", "run on selected profile (local)")]),
+        Tab::Skills => help_bits(&[
+            ("Enter", "run on selected profile (local)"),
+            ("T", "teach on selected profile"),
+        ]),
         Tab::Sessions => help_bits(&[("x", "close session"), ("o", "open from Profiles")]),
         Tab::Clients => help_bits(&[("J", "submit remote job (skill@profile)")]),
         Tab::Config => help_bits(&[

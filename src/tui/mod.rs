@@ -101,6 +101,7 @@ enum BusyKind {
     HubConnect,
     SessionsLoad,
     LlmFetch,
+    TeachStart,
 }
 
 impl BusyKind {
@@ -112,6 +113,7 @@ impl BusyKind {
             BusyKind::HubConnect => "connecting hub",
             BusyKind::SessionsLoad => "loading sessions",
             BusyKind::LlmFetch => "fetching models",
+            BusyKind::TeachStart => "teaching (headed)",
         }
     }
 }
@@ -132,6 +134,10 @@ enum PendingDone {
         result: Result<crate::llm_client::ModelsList, String>,
         saved_model: String,
         requested_base: String,
+    },
+    Teach {
+        log: String,
+        status: String,
     },
 }
 
@@ -410,6 +416,12 @@ impl App {
                     }
                 }
             }
+            PendingDone::Teach { log, status } => {
+                self.log(log);
+                let _ = self.reload_static();
+                self.clear_busy();
+                self.status = status;
+            }
         }
     }
 
@@ -679,6 +691,40 @@ impl App {
                 log,
                 status,
                 sessions,
+            }
+        }));
+        Ok(())
+    }
+
+    fn begin_teach(&mut self) -> Result<()> {
+        let Some(profile_name) = self.selected_profile_name() else {
+            self.status = "select a profile first".into();
+            self.log("teach: select a profile first");
+            return Ok(());
+        };
+        let root = self.root.clone();
+        self.log(format!("teach start profile={profile_name} (headed)"));
+        self.set_busy(BusyKind::TeachStart);
+        self.status = format!("teach {profile_name} (headed)");
+        self.pending = Some(tokio::spawn(async move {
+            let outcome = crate::teach::start(
+                &root,
+                crate::teach::TeachStartOpts {
+                    profile: profile_name.clone(),
+                    url: None,
+                    allow_secrets: false,
+                },
+            )
+            .await;
+            match outcome {
+                Ok(()) => PendingDone::Teach {
+                    log: format!("teach ended profile={profile_name}"),
+                    status: "teach done".into(),
+                },
+                Err(e) => PendingDone::Teach {
+                    log: format!("teach: {e}"),
+                    status: format!("teach: {e}"),
+                },
             }
         }));
         Ok(())
@@ -1407,6 +1453,14 @@ async fn event_loop(
                             }
                         }
                     }
+                    KeyCode::Char('T') => {
+                        if app.tab != Tab::Config {
+                            if let Err(e) = app.begin_teach() {
+                                app.log(format!("teach error: {e}"));
+                                app.status = format!("err: {e}");
+                            }
+                        }
+                    }
                     KeyCode::Char('o') => {
                         if let Err(e) = app.open_browser().await {
                             app.log(format!("open error: {e}"));
@@ -1521,6 +1575,7 @@ mod tests {
         assert_eq!(BusyKind::HubConnect.label(), "connecting hub");
         assert_eq!(BusyKind::SessionsLoad.label(), "loading sessions");
         assert_eq!(BusyKind::LlmFetch.label(), "fetching models");
+        assert_eq!(BusyKind::TeachStart.label(), "teaching (headed)");
     }
 
     #[test]

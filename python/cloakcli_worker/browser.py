@@ -26,6 +26,7 @@ def launch_context(
     headed: bool = False,
     proxy: str | None = None,
     user_agent: str | None = None,
+    extension_paths: list[str] | None = None,
 ) -> Any:
     """Launch persistent stealth Chromium via cloakbrowser."""
     from cloakbrowser import launch_persistent_context
@@ -38,6 +39,8 @@ def launch_context(
         kwargs["proxy"] = proxy
     if user_agent:
         kwargs["user_agent"] = user_agent
+    if extension_paths:
+        kwargs["extension_paths"] = list(extension_paths)
     return launch_persistent_context(**kwargs)
 
 
