@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from .paths import get_root
 
@@ -119,49 +119,116 @@ def parse_llm_config(data: dict[str, Any], *, path: str = "") -> LlmConfig:
     )
 
 
-def normalize_base_url(url: str) -> str:
-    """http(s) only, strip trailing slash, drop endpoint suffixes, collapse /v1/v1."""
+def _parse_http_url(url: str, *, allow_query: bool = False):
+    """http(s) URL parser. Base URLs reject credentials, query, and fragment."""
     s = (url or "").strip()
     if not s:
-        return ""
+        return None
     lower = s.lower()
     if lower.startswith(("file:", "javascript:", "data:")):
-        return ""
-    parsed = urlparse(s)
+        return None
+    if any(c.isspace() or ord(c) < 32 for c in s):
+        return None
+    try:
+        parsed = urlparse(s)
+    except Exception:
+        return None
     if parsed.scheme not in ("http", "https"):
+        return None
+    if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
+        return None
+    if not parsed.hostname:
+        return None
+    if parsed.query and not allow_query:
+        return None
+    if parsed.fragment:
+        return None
+    return parsed
+
+
+def _path_segments(path: str) -> list[str]:
+    return [s for s in (path or "").split("/") if s]
+
+
+def _drop_endpoint_suffixes(segs: list[str]) -> list[str]:
+    segs = list(segs)
+    while segs:
+        last = segs[-1].lower()
+        if len(segs) >= 2 and segs[-2].lower() == "chat" and last == "completions":
+            segs.pop()
+            segs.pop()
+            continue
+        if last in ("models", "completions"):
+            segs.pop()
+            continue
+        break
+    return segs
+
+
+def _collapse_duplicate_v1(segs: list[str]) -> list[str]:
+    """Collapse consecutive `/v1` path segments only (`/v1/v1` → `/v1`, not `/v1/v10`)."""
+    out: list[str] = []
+    for s in segs:
+        if s.lower() == "v1" and out and out[-1].lower() == "v1":
+            continue
+        out.append(s)
+    return out
+
+
+def _netloc_no_userinfo(parsed) -> str:
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed.port:
+        return f"{host}:{parsed.port}"
+    return host
+
+
+def _rebuild(parsed, segs: list[str], *, query: str = "") -> str:
+    path = "/" + "/".join(segs) if segs else ""
+    out = urlunparse((parsed.scheme, _netloc_no_userinfo(parsed), path, "", query, ""))
+    return out.rstrip("/")
+
+
+def normalize_base_url(url: str) -> str:
+    """http(s) only, strip trailing slash, drop endpoint suffixes, collapse /v1/v1."""
+    parsed = _parse_http_url(url, allow_query=False)
+    if parsed is None:
         return ""
-    if any(c.isspace() for c in s):
-        return ""
-    s = s.rstrip("/")
-    changed = True
-    while changed:
-        changed = False
-        low = s.lower()
-        for suffix in ("/chat/completions", "/completions", "/models"):
-            if low.endswith(suffix):
-                s = s[: -len(suffix)].rstrip("/")
-                changed = True
-                break
-    while "/v1/v1" in s.lower():
-        idx = s.lower().rfind("/v1/v1")
-        s = s[:idx] + "/v1" + s[idx + 6 :]
-    return s
+    segs = _collapse_duplicate_v1(_drop_endpoint_suffixes(_path_segments(parsed.path)))
+    return _rebuild(parsed, segs)
 
 
 def join_openai_path(base: str, path: str) -> str:
-    """Build `{base}/{path}` without duplicating a trailing `/v1`."""
+    """Build `{base}/{path}` without duplicating a trailing `/v1` path segment."""
     base = normalize_base_url(base)
     if not base:
         return ""
     path = (path or "").strip().lstrip("/")
     if not path:
         return base
-    if base.lower().endswith("/v1") and (
-        path.lower() == "v1" or path.lower().startswith("v1/")
-    ):
-        rest = path[3:] if path.lower().startswith("v1/") else ""
-        return f"{base}/{rest}" if rest else base
-    return f"{base}/{path}"
+    parsed = _parse_http_url(base, allow_query=False)
+    if parsed is None:
+        return ""
+    segs = _path_segments(parsed.path)
+    add = _path_segments(path)
+    if segs and segs[-1].lower() == "v1" and add and add[0].lower() == "v1":
+        add = add[1:]
+    return _rebuild(parsed, segs + add)
+
+
+def accept_model_id(mid: str, api_key: str | None = None) -> str | None:
+    """Return a usable model id, or None. Never keeps ids that contain the API key."""
+    mid = (mid or "").strip()
+    if not mid:
+        return None
+    if any(ord(c) < 32 for c in mid):
+        return None
+    if len(mid) > MAX_MODEL_ID_LEN:
+        return None
+    if api_key and len(api_key) >= 4 and api_key in mid:
+        return None
+    return mid
 
 
 def models_url(base: str) -> str:

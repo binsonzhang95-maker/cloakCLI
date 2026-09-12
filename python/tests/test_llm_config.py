@@ -8,6 +8,8 @@ from unittest import mock
 from cloakcli_worker.llm_config import (
     DEFAULT_API_KEY_ENV,
     MAX_MODELS,
+    MAX_MODELS_BODY,
+    accept_model_id,
     join_openai_path,
     load_llm_config,
     normalize_base_url,
@@ -150,6 +152,32 @@ class LlmConfigTests(unittest.TestCase):
         self.assertEqual(normalize_base_url("data:text/plain,hi"), "")
         self.assertEqual(normalize_base_url("file:///etc/passwd"), "")
 
+    def test_normalize_rejects_query_fragment_credentials_keeps_v10(self):
+        self.assertEqual(normalize_base_url("https://api.openai.com/v1?x=1"), "")
+        self.assertEqual(normalize_base_url("https://api.openai.com/v1#frag"), "")
+        self.assertEqual(normalize_base_url("https://user:pass@api.openai.com/v1"), "")
+        self.assertEqual(normalize_base_url("https://user@api.openai.com/v1"), "")
+        self.assertEqual(normalize_base_url("https:///v1"), "")
+        self.assertEqual(
+            normalize_base_url("https://api.openai.com/v1/v10"),
+            "https://api.openai.com/v1/v10",
+        )
+        self.assertEqual(
+            join_openai_path("https://api.openai.com/v1/v10", "models"),
+            "https://api.openai.com/v1/v10/models",
+        )
+        self.assertEqual(
+            join_openai_path("https://api.openai.com/v1", "models"),
+            "https://api.openai.com/v1/models",
+        )
+
+    def test_accept_model_id_rejects_key_and_control_chars(self):
+        key = "sk-live-secret-abc"
+        self.assertIsNone(accept_model_id(key, key))
+        self.assertIsNone(accept_model_id(f"pre-{key}", key))
+        self.assertIsNone(accept_model_id("gpt-4o\x07bell", key))
+        self.assertEqual(accept_model_id("gpt-4o", key), "gpt-4o")
+
 
 class ModelsFetchTests(unittest.TestCase):
     def _serve(self, handler):
@@ -273,6 +301,104 @@ class ModelsFetchTests(unittest.TestCase):
             self.assertNotIn("sk-http-secret", blob)
             self.assertNotIn("invalid_api_key", blob)
             self.assertIn("401", out["error"])
+        finally:
+            httpd.shutdown()
+            os.environ.pop("CLOAKCLI_TMP_KEY", None)
+
+    def test_list_models_http_error_body_size_capped(self):
+        huge = b"E" * (MAX_MODELS_BODY * 2)
+        read_sizes: list[int] = []
+
+        class SpyFP:
+            def read(self, n=-1):
+                read_sizes.append(n)
+                if n is None or n < 0:
+                    return huge
+                return huge[:n]
+
+            def close(self):
+                return None
+
+            def readline(self, *a, **k):
+                return b""
+
+        import urllib.error
+
+        spy = SpyFP()
+
+        def boom(*a, **k):
+            raise urllib.error.HTTPError(
+                url="http://127.0.0.1/v1/models",
+                code=500,
+                msg="ERR",
+                hdrs=None,
+                fp=spy,
+            )
+
+        cfg = parse_llm_config(
+            {
+                "enabled": True,
+                "base_url": "http://127.0.0.1/v1",
+                "model": "m",
+                "api_key_env": "CLOAKCLI_TMP_KEY",
+            }
+        )
+        os.environ["CLOAKCLI_TMP_KEY"] = "k"
+        try:
+            with mock.patch("urllib.request.urlopen", boom):
+                out = list_models(cfg)
+            self.assertFalse(out["ok"])
+            blob = json.dumps(out)
+            self.assertNotIn("E" * 50, blob)
+            self.assertLess(len(blob), 10_000)
+            for n in read_sizes:
+                self.assertIsInstance(n, int)
+                self.assertGreaterEqual(n, 0)
+            self.assertTrue(
+                not read_sizes or all(n >= 0 for n in read_sizes),
+                f"unbounded read: {read_sizes}",
+            )
+        finally:
+            os.environ.pop("CLOAKCLI_TMP_KEY", None)
+
+    def test_list_models_http_error_huge_body_not_kept(self):
+        os.environ["CLOAKCLI_TMP_KEY"] = "k"
+        huge = "x" * (MAX_MODELS_BODY + 2048)
+        httpd, cfg, _ = self._serve(lambda path: (500, huge))
+        try:
+            out = list_models(cfg)
+            self.assertFalse(out["ok"])
+            blob = json.dumps(out)
+            self.assertNotIn("x" * 50, blob)
+            self.assertLess(len(out.get("error") or ""), 500)
+        finally:
+            httpd.shutdown()
+            os.environ.pop("CLOAKCLI_TMP_KEY", None)
+
+    def test_list_models_rejects_key_and_control_char_ids(self):
+        os.environ["CLOAKCLI_TMP_KEY"] = "sk-id-secret-xyz"
+        httpd, cfg, _ = self._serve(
+            lambda path: (
+                200,
+                json.dumps(
+                    {
+                        "data": [
+                            {"id": "sk-id-secret-xyz"},
+                            {"id": "pre-sk-id-secret-xyz"},
+                            {"id": "ok-model"},
+                            {"id": "bad\x07id"},
+                        ]
+                    }
+                ),
+            )
+        )
+        try:
+            out = list_models(cfg)
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["ids"], ["ok-model"])
+            blob = json.dumps(out)
+            self.assertNotIn("sk-id-secret-xyz", blob)
+            self.assertNotIn("\x07", blob)
         finally:
             httpd.shutdown()
             os.environ.pop("CLOAKCLI_TMP_KEY", None)

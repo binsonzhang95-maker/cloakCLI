@@ -131,6 +131,7 @@ enum PendingDone {
     LlmModels {
         result: Result<crate::llm_client::ModelsList, String>,
         saved_model: String,
+        requested_base: String,
     },
 }
 
@@ -163,6 +164,7 @@ struct App {
     llm_draft_base_url: String,
     llm_session_key_set: bool,
     llm_models: Vec<String>,
+    llm_models_base_url: String,
     llm_models_truncated: bool,
     llm_model_state: ListState,
     llm_fetch_err: Option<String>,
@@ -210,6 +212,7 @@ impl App {
             llm_draft_base_url: String::new(),
             llm_session_key_set: false,
             llm_models: Vec::new(),
+            llm_models_base_url: String::new(),
             llm_models_truncated: false,
             llm_model_state: ListState::default(),
             llm_fetch_err: None,
@@ -349,13 +352,23 @@ impl App {
             PendingDone::LlmModels {
                 result,
                 saved_model,
+                requested_base,
             } => {
                 self.clear_busy();
                 match result {
                     Ok(list) => {
                         self.llm_fetch_err = None;
+                        let current = self.current_llm_base();
+                        if !llm::models_bound_to_request_base(&requested_base, &current) {
+                            self.clear_llm_models_list();
+                            self.status = "llm fetch completed for a previous base_url (discarded); fetch again".into();
+                            self.log("llm fetch discarded: base_url changed during request");
+                            self.llm = llm::view(&self.root);
+                            return;
+                        }
                         self.llm_models = list.ids;
                         self.llm_models_truncated = list.truncated;
+                        self.llm_models_base_url = requested_base.clone();
                         if let Some(pos) = self
                             .llm_models
                             .iter()
@@ -368,7 +381,7 @@ impl App {
                         let _ = llm::save_models_cache(
                             &self.root,
                             &llm::ModelsCache {
-                                base_url: self.llm_draft_base_url.clone(),
+                                base_url: requested_base,
                                 ids: self.llm_models.clone(),
                                 truncated: self.llm_models_truncated,
                             },
@@ -441,12 +454,11 @@ impl App {
         }
         if self.llm_models.is_empty() {
             if let Some(cache) = llm::load_models_cache(&self.root) {
-                if cache.base_url.is_empty()
-                    || cache.base_url == self.llm_draft_base_url
-                    || cache.base_url == self.llm.base_url
-                {
+                let draft = self.current_llm_base();
+                if llm::models_bound_to_request_base(&cache.base_url, &draft) {
                     self.llm_models = cache.ids;
                     self.llm_models_truncated = cache.truncated;
+                    self.llm_models_base_url = cache.base_url;
                     if let Some(pos) = self
                         .llm_models
                         .iter()
@@ -850,16 +862,31 @@ impl App {
         self.status = "llm recover_timeout_sec (5..=3600)".into();
     }
 
-    fn begin_llm_fetch(&mut self) {
-        let base = if self.llm_draft_base_url.is_empty() {
-            self.llm.base_url.clone()
-        } else {
+    fn current_llm_base(&self) -> String {
+        if !self.llm_draft_base_url.is_empty() {
             self.llm_draft_base_url.clone()
-        };
+        } else {
+            self.llm.base_url.clone()
+        }
+    }
+
+    fn clear_llm_models_list(&mut self) {
+        self.llm_models.clear();
+        self.llm_models_truncated = false;
+        self.llm_models_base_url.clear();
+        self.llm_model_state.select(None);
+    }
+
+    fn begin_llm_fetch(&mut self) {
+        let base = self.current_llm_base();
         if base.is_empty() {
             self.status = "llm: set base_url first (b)".into();
             return;
         }
+        let Ok(base) = llm::normalize_base_url(&base) else {
+            self.status = "llm: set a valid http(s) base_url first (b)".into();
+            return;
+        };
         let env_name = if self.llm.api_key_env.is_empty() {
             llm::DEFAULT_API_KEY_ENV.to_string()
         } else {
@@ -871,6 +898,7 @@ impl App {
             return;
         };
         let saved_model = self.llm.model.clone();
+        let requested_base = base.clone();
         self.llm_fetch_err = None;
         self.set_busy(BusyKind::LlmFetch);
         self.pending = Some(tokio::spawn(async move {
@@ -886,11 +914,19 @@ impl App {
                     Err(e) => Err(format!("fetch join: {e}")),
                 },
                 saved_model,
+                requested_base,
             }
         }));
     }
 
     fn save_selected_llm_model(&mut self) -> Result<()> {
+        let base = self.current_llm_base();
+        if self.llm_models.is_empty()
+            || !llm::models_bound_to_request_base(&self.llm_models_base_url, &base)
+        {
+            self.status = "llm: fetch models (f) for this base_url before saving".into();
+            return Ok(());
+        }
         let Some(i) = self.llm_model_state.selected() else {
             self.status = "llm: fetch models (f) then select one".into();
             return Ok(());
@@ -900,11 +936,6 @@ impl App {
             return Ok(());
         };
         let prev = self.llm.model.clone();
-        let base = if self.llm_draft_base_url.is_empty() {
-            self.llm.base_url.clone()
-        } else {
-            self.llm_draft_base_url.clone()
-        };
         let env_name = if self.llm.api_key_env.is_empty() {
             llm::DEFAULT_API_KEY_ENV.to_string()
         } else {
@@ -1022,25 +1053,12 @@ impl App {
                 }
                 match llm::normalize_base_url(raw) {
                     Ok(u) => {
-                        self.llm_draft_base_url = u.clone();
-                        if self.llm.configured && !self.llm.model.is_empty() {
-                            match llm::apply_set(
-                                &self.root,
-                                llm::LlmSetArgs {
-                                    base_url: Some(u.clone()),
-                                    ..Default::default()
-                                },
-                            ) {
-                                Ok(_) => {
-                                    self.llm = llm::view(&self.root);
-                                    self.log(format!("llm base_url saved: {u}"));
-                                }
-                                Err(e) => {
-                                    self.log(format!("llm base_url draft only: {e}"));
-                                }
-                            }
+                        if !llm::models_bound_to_request_base(&self.llm_models_base_url, &u) {
+                            self.clear_llm_models_list();
                         }
-                        self.status = format!("llm base_url={u}");
+                        self.llm_draft_base_url = u.clone();
+                        // Draft only until a successful refetch + Enter save for this base.
+                        self.status = format!("llm base_url={u} (fetch models before save)");
                     }
                     Err(e) => {
                         self.status = format!("llm base_url: {e}");
@@ -1479,6 +1497,17 @@ mod tests {
         assert_eq!(BusyKind::HubConnect.label(), "connecting hub");
         assert_eq!(BusyKind::SessionsLoad.label(), "loading sessions");
         assert_eq!(BusyKind::LlmFetch.label(), "fetching models");
+    }
+
+    #[test]
+    fn changing_base_unbinds_stale_model_list() {
+        let old = "https://api.example.com/v1";
+        let new = "https://other.example.com/v1";
+        let ids = ["stale-model"];
+        let can_save = !ids.is_empty() && llm::models_bound_to_request_base(old, new);
+        assert!(!can_save);
+        assert!(llm::models_bound_to_request_base(old, old));
+        assert!(!llm::models_bound_to_request_base("", new));
     }
 }
 

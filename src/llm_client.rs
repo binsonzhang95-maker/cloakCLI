@@ -72,6 +72,9 @@ pub fn fetch_models(base_url: &str, api_key: &str) -> Result<ModelsList> {
             truncated = true;
         }
         for id in page_ids {
+            let Ok(id) = crate::llm::accept_model_id(&id, Some(api_key)) else {
+                continue;
+            };
             if ids.len() >= MAX_MODELS {
                 truncated = true;
                 break;
@@ -189,6 +192,9 @@ pub fn parse_models_page(v: &Value) -> Result<(Vec<String>, bool, bool, Option<S
         if id.is_empty() {
             continue;
         }
+        if id.chars().any(|c| c.is_control()) {
+            continue;
+        }
         if id.len() > MAX_MODEL_ID_LEN {
             truncated = true;
             continue;
@@ -232,32 +238,33 @@ pub fn public_http_error(status: u16, extra_key: Option<&str>) -> String {
 }
 
 fn origin_of(url: &str) -> Result<String> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("GET /models URL missing scheme"))?;
-    let hostport = rest.split('/').next().unwrap_or(rest);
-    if hostport.is_empty() {
-        bail!("GET /models URL missing host");
-    }
-    Ok(format!("{scheme}://{hostport}").to_ascii_lowercase())
+    let u = crate::llm::parse_http_url(url, true)?;
+    let host = u
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("GET /models URL missing host"))?;
+    let hostport = match u.port() {
+        Some(p) if host.contains(':') => format!("[{host}]:{p}"),
+        Some(p) => format!("{host}:{p}"),
+        None if host.contains(':') => format!("[{host}]"),
+        None => host.to_string(),
+    };
+    Ok(format!("{}://{hostport}", u.scheme()).to_ascii_lowercase())
 }
 
 fn resolve_next(current: &str, next: &str, origin: &str) -> Result<String> {
-    let candidate = if next.starts_with("http://") || next.starts_with("https://") {
-        next.to_string()
-    } else if next.starts_with('/') {
-        format!("{}{next}", origin.trim_end_matches('/'))
+    let cur = crate::llm::parse_http_url(current, true)?;
+    let joined = if next.starts_with("http://") || next.starts_with("https://") {
+        crate::llm::parse_http_url(next, true)?
     } else {
-        // relative to current path
-        let base = current.rsplit_once('/').map(|p| p.0).unwrap_or(current);
-        format!("{base}/{next}")
+        cur.join(next)
+            .map_err(|_| anyhow::anyhow!("GET /models pagination next URL invalid"))?
     };
-    crate::llm::validate_base_url(&candidate)?;
-    let cand_origin = origin_of(&candidate)?;
+    let candidate = crate::llm::parse_http_url(joined.as_str(), true)?;
+    let cand_origin = origin_of(candidate.as_str())?;
     if cand_origin != *origin {
         bail!("GET /models pagination next URL is off-origin (rejected)");
     }
-    Ok(candidate)
+    Ok(candidate.as_str().to_string())
 }
 
 fn append_query(url: &str, key: &str, value: &str) -> String {
@@ -520,6 +527,43 @@ mod tests {
         );
         assert!(!err.contains("sk-body-secret"), "{err}");
         assert!(!err.contains(&"A".repeat(50)), "{err}");
+    }
+
+    #[test]
+    fn fetch_rejects_ids_equal_to_api_key_or_control_chars() {
+        let key = "sk-id-secret-xyz";
+        let (base, _a, join) = spawn_n(1, move |_i, _p, _h| {
+            (
+                200,
+                json!({
+                    "data": [
+                        {"id": key},
+                        {"id": format!("pre-{key}")},
+                        {"id": "ok-model"},
+                        {"id": "bad\u{0007}id"}
+                    ]
+                })
+                .to_string(),
+            )
+        });
+        let list = fetch_models(&base, key).unwrap();
+        let _ = join.join();
+        assert_eq!(list.ids, vec!["ok-model"]);
+        let shown = crate::llm::format_models_list(&list);
+        assert!(!shown.contains(key), "{shown}");
+        assert!(!shown.contains('\u{0007}'));
+    }
+
+    #[test]
+    fn fetch_empty_after_rejecting_key_ids_does_not_echo() {
+        let key = "sk-only-secret-xyz";
+        let (base, _a, join) = spawn_n(1, move |_i, _p, _h| {
+            (200, json!({"data":[{"id": key}]}).to_string())
+        });
+        let err = fetch_models(&base, key).unwrap_err().to_string();
+        let _ = join.join();
+        assert!(err.contains("no model ids") || err.contains("empty"), "{err}");
+        assert!(!err.contains(key), "{err}");
     }
 
 }

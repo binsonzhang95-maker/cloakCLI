@@ -15,6 +15,7 @@ from ..llm_config import (
     MAX_MODELS_PAGES,
     MODELS_CONNECT_TIMEOUT_SEC,
     MODELS_READ_TIMEOUT_SEC,
+    accept_model_id,
     chat_completions_url,
     models_url,
     resolve_api_key,
@@ -89,9 +90,14 @@ class OpenAICompatProvider:
         except urllib.error.HTTPError as e:
             err_body = ""
             try:
-                err_body = e.read().decode("utf-8", errors="replace")[:400]
+                raw, _trunc = _read_limited(e, 400)
+                err_body = raw.decode("utf-8", errors="replace")[:400]
             except Exception:
                 err_body = ""
+            try:
+                e.close()
+            except Exception:
+                pass
             msg = redact_text(
                 f"HTTP {e.code} {e.reason} {err_body}", extra=[key]
             )
@@ -184,7 +190,11 @@ def list_models(cfg: LlmConfig, *, api_key: str | None = None) -> dict[str, Any]
                     raw, body_trunc = _read_limited(resp, MAX_MODELS_BODY)
             except urllib.error.HTTPError as e:
                 try:
-                    e.read()
+                    _read_limited(e, MAX_MODELS_BODY)
+                except Exception:
+                    pass
+                try:
+                    e.close()
                 except Exception:
                     pass
                 out["error"] = redact_text(
@@ -218,17 +228,16 @@ def list_models(cfg: LlmConfig, *, api_key: str | None = None) -> dict[str, Any]
                 mid = item.get("id")
                 if not isinstance(mid, str):
                     continue
-                mid = mid.strip()
-                if not mid:
-                    continue
-                if len(mid) > MAX_MODEL_ID_LEN:
-                    truncated = True
+                accepted = accept_model_id(mid, key)
+                if accepted is None:
+                    if isinstance(mid, str) and len(mid.strip()) > MAX_MODEL_ID_LEN:
+                        truncated = True
                     continue
                 if len(ids) >= MAX_MODELS:
                     truncated = True
                     break
-                if mid not in ids:
-                    ids.append(mid)
+                if accepted not in ids:
+                    ids.append(accepted)
             if len(ids) >= MAX_MODELS:
                 truncated = True
                 break
@@ -267,17 +276,28 @@ def list_models(cfg: LlmConfig, *, api_key: str | None = None) -> dict[str, Any]
 
 
 def _read_limited(resp: Any, cap: int) -> tuple[bytes, bool]:
-    data = resp.read(cap + 1)
-    if len(data) > cap:
-        return data[:cap], True
-    return data, False
+    """Bounded read. Never call read() without a size (unbounded)."""
+    try:
+        data = resp.read(cap + 1)
+    except Exception:
+        data = b""
+    truncated = len(data) > cap
+    if truncated:
+        data = data[:cap]
+    return data, truncated
 
 
 def _origin(url: str) -> str:
     from urllib.parse import urlparse
 
     p = urlparse(url)
-    return f"{p.scheme}://{p.netloc}".lower()
+    host = p.hostname or ""
+    if not host:
+        return ""
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{p.port}" if p.port else host
+    return f"{p.scheme}://{netloc}".lower()
 
 
 def _resolve_next(current: str, nxt: str, origin: str) -> str:
@@ -290,7 +310,14 @@ def _resolve_next(current: str, nxt: str, origin: str) -> str:
     p = urlparse(cand)
     if p.scheme not in ("http", "https"):
         return ""
-    if f"{p.scheme}://{p.netloc}".lower() != origin:
+    if p.username or p.password or "@" in (p.netloc or ""):
+        return ""
+    if not p.hostname:
+        return ""
+    if p.fragment:
+        return ""
+    cand_origin = _origin(cand)
+    if not cand_origin or cand_origin != origin:
         return ""
     return cand
 

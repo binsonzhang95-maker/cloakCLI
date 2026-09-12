@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::state;
 use crate::util;
+use url::Url;
 
 pub const DEFAULT_RECOVER_TIMEOUT_SEC: u64 = 300;
 pub const DEFAULT_MAX_ACTIONS: u32 = 120;
@@ -151,6 +152,13 @@ fn sanitize_loaded(cfg: &mut LlmConfig) -> Result<()> {
         cfg.api_key_env = DEFAULT_API_KEY_ENV.into();
     }
     validate_env_name(&cfg.api_key_env)?;
+    if !cfg.model.is_empty() {
+        let key = resolve_api_key_from_env(&cfg.api_key_env);
+        match accept_model_id(&cfg.model, key.as_deref()) {
+            Ok(m) => cfg.model = m,
+            Err(_) => cfg.model.clear(),
+        }
+    }
     if !cfg.base_url.is_empty() {
         cfg.base_url = normalize_base_url(&cfg.base_url)?;
     }
@@ -184,103 +192,224 @@ fn sanitize_loaded(cfg: &mut LlmConfig) -> Result<()> {
 }
 
 pub fn validate_env_name(name: &str) -> Result<()> {
+    // Never interpolate `name` into the error: a pasted API key must not be echoed.
     let ok = !name.is_empty()
         && name.len() <= 128
-        && name
-            .chars()
-            .enumerate()
-            .all(|(i, c)| {
-                if i == 0 {
-                    c.is_ascii_alphabetic() || c == '_'
-                } else {
-                    c.is_ascii_alphanumeric() || c == '_'
-                }
-            });
+        && name.chars().enumerate().all(|(i, c)| {
+            if i == 0 {
+                c.is_ascii_alphabetic() || c == '_'
+            } else {
+                c.is_ascii_alphanumeric() || c == '_'
+            }
+        });
     if !ok {
-        bail!("invalid api_key_env '{name}': use an environment variable name, not a raw key");
+        bail!("invalid api_key_env: use an environment variable name, not a raw key");
     }
     // Reject values that look like keys (sk-..., Bearer, long secrets)
     if name.contains('-') || name.len() > 64 {
-        bail!("invalid api_key_env '{name}': looks like a secret, not an env var name");
+        bail!("invalid api_key_env: looks like a secret, not an env var name");
     }
     Ok(())
 }
 
-pub fn validate_base_url(url: &str) -> Result<()> {
-    let trimmed = url.trim();
+/// Parse an http(s) URL.
+///
+/// Base URLs (`allow_query = false`) reject credentials, query, and fragment.
+/// Endpoint / pagination URLs (`allow_query = true`) still reject credentials
+/// and fragment, but may carry a query string.
+pub fn parse_http_url(raw: &str, allow_query: bool) -> Result<Url> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("base_url must be http(s):// (got scheme-less or blocked URL)");
+    }
     let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("file:") || lower.starts_with("javascript:") || lower.starts_with("data:")
     {
         bail!("base_url rejects file:/javascript:/data:");
     }
-    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
-        bail!("base_url must be http(s):// (got scheme-less or blocked URL)");
-    }
-    // Disallow control chars / whitespace in the URL itself.
     if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
         bail!("base_url must not contain whitespace");
     }
+    // `https:///v1` has an empty authority; do not let the parser promote `v1` to host.
+    if trimmed
+        .splitn(2, "://")
+        .nth(1)
+        .map(|rest| rest.starts_with('/'))
+        .unwrap_or(false)
+    {
+        bail!("base_url missing host");
+    }
+    let parsed = Url::parse(trimmed).map_err(|_| {
+        anyhow::anyhow!("base_url must be http(s):// (got scheme-less or blocked URL)")
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        bail!("base_url must be http(s):// (got scheme-less or blocked URL)");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("base_url must not contain credentials");
+    }
+    if parsed.host_str().map(|h| h.is_empty()).unwrap_or(true) {
+        bail!("base_url missing host");
+    }
+    if parsed.query().is_some() && !allow_query {
+        bail!("base_url must not contain a query string");
+    }
+    if parsed.fragment().is_some() {
+        bail!("base_url must not contain a fragment");
+    }
+    Ok(parsed)
+}
+
+pub fn validate_base_url(url: &str) -> Result<()> {
+    let _ = parse_http_url(url, false)?;
     Ok(())
 }
 
-/// Strip trailing slashes, drop accidental `/models` or `/chat/completions`
-/// suffixes, collapse `/v1/v1`. http(s) only.
-pub fn normalize_base_url(raw: &str) -> Result<String> {
-    validate_base_url(raw)?;
-    let mut s = raw.trim().trim_end_matches('/').to_string();
-    let suffixes = ["/chat/completions", "/completions", "/models"];
+fn path_segments_of(url: &Url) -> Vec<String> {
+    url.path_segments()
+        .map(|s| {
+            s.filter(|p| !p.is_empty())
+                .map(|p| p.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn drop_endpoint_suffixes(mut segs: Vec<String>) -> Vec<String> {
     loop {
-        let lower = s.to_ascii_lowercase();
-        let mut hit = false;
-        for suffix in suffixes {
-            if lower.ends_with(suffix) {
-                s.truncate(s.len() - suffix.len());
-                s = s.trim_end_matches('/').to_string();
-                hit = true;
-                break;
+        let n = segs.len();
+        if n >= 2
+            && segs[n - 2].eq_ignore_ascii_case("chat")
+            && segs[n - 1].eq_ignore_ascii_case("completions")
+        {
+            segs.pop();
+            segs.pop();
+            continue;
+        }
+        if n >= 1 {
+            let last = segs[n - 1].to_ascii_lowercase();
+            if last == "models" || last == "completions" {
+                segs.pop();
+                continue;
             }
         }
-        if !hit {
-            break;
+        break;
+    }
+    segs
+}
+
+/// Collapse consecutive `/v1` path *segments* only (`/v1/v1` → `/v1`).
+/// `/v1/v10` is a different last segment and must be left intact.
+fn collapse_duplicate_v1(segs: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(segs.len());
+    for s in segs {
+        if s.eq_ignore_ascii_case("v1")
+            && out
+                .last()
+                .map(|p: &String| p.eq_ignore_ascii_case("v1"))
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        out.push(s);
+    }
+    out
+}
+
+fn url_with_segments(mut url: Url, segs: &[String]) -> Result<Url> {
+    {
+        let mut p = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("base_url missing host"))?;
+        p.clear();
+        for s in segs {
+            p.push(s);
         }
     }
-    // Collapse duplicated /v1 path segments.
-    loop {
-        let lower = s.to_ascii_lowercase();
-        if let Some(i) = lower.find("/v1/v1") {
-            s.replace_range(i..i + 6, "/v1");
-        } else {
-            break;
-        }
-    }
-    validate_base_url(&s)?;
-    if s.ends_with("://") {
-        bail!("base_url missing host");
-    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn serialize_url(url: &Url) -> String {
+    url.as_str().trim_end_matches('/').to_string()
+}
+
+/// Strip trailing slashes, drop accidental `/models` or `/chat/completions`
+/// suffixes, collapse consecutive `/v1` path segments. http(s) only.
+pub fn normalize_base_url(raw: &str) -> Result<String> {
+    validate_base_url(raw)?;
+    let parsed = parse_http_url(raw, false)?;
+    let segs = collapse_duplicate_v1(drop_endpoint_suffixes(path_segments_of(&parsed)));
+    let url = url_with_segments(parsed, &segs)?;
+    let s = serialize_url(&url);
+    let _ = parse_http_url(&s, false)?;
     Ok(s)
 }
 
-/// Join `{base}/{path}` without duplicating a trailing `/v1`.
+/// Join `{base}/{path}` without duplicating a trailing `/v1` path segment.
 pub fn join_openai_path(base: &str, path: &str) -> Result<String> {
     let base = normalize_base_url(base)?;
     let path = path.trim().trim_start_matches('/');
     if path.is_empty() {
         return Ok(base);
     }
-    let base_l = base.to_ascii_lowercase();
-    let path_l = path.to_ascii_lowercase();
-    if base_l.ends_with("/v1") && (path_l == "v1" || path_l.starts_with("v1/")) {
-        let rest = if path_l.starts_with("v1/") {
-            &path[3..]
-        } else {
-            ""
-        };
-        if rest.is_empty() {
-            return Ok(base);
-        }
-        return Ok(format!("{base}/{rest}"));
+    let parsed = parse_http_url(&base, false)?;
+    let mut segs = path_segments_of(&parsed);
+    let mut add: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    if segs
+        .last()
+        .map(|s| s.eq_ignore_ascii_case("v1"))
+        .unwrap_or(false)
+        && add
+            .first()
+            .map(|s| s.eq_ignore_ascii_case("v1"))
+            .unwrap_or(false)
+    {
+        add.remove(0);
     }
-    Ok(format!("{base}/{path}"))
+    segs.extend(add);
+    let url = url_with_segments(parsed, &segs)?;
+    Ok(serialize_url(&url))
+}
+
+/// Reject empty / control-character / overlong ids, and ids that contain the
+/// current API key. Errors never include the raw id (it may be the secret).
+pub fn accept_model_id(id: &str, api_key: Option<&str>) -> Result<String> {
+    let id = id.trim();
+    if id.is_empty() {
+        bail!("model must not be empty");
+    }
+    if id.chars().any(|c| c.is_control()) {
+        bail!("model id contains control characters");
+    }
+    if id.len() > MAX_MODEL_ID_LEN {
+        bail!("model id exceeds {MAX_MODEL_ID_LEN} characters");
+    }
+    if let Some(k) = api_key {
+        if k.len() >= 4 && id.contains(k) {
+            bail!("model id rejected");
+        }
+    }
+    Ok(id.to_string())
+}
+
+/// A fetched/cached model list may be saved only for the base it was requested with.
+pub fn models_bound_to_request_base(list_base: &str, request_base: &str) -> bool {
+    if list_base.is_empty() || request_base.is_empty() {
+        return false;
+    }
+    match (
+        normalize_base_url(list_base),
+        normalize_base_url(request_base),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 pub fn models_url(base: &str) -> Result<String> {
@@ -343,25 +472,20 @@ pub fn apply_set(root: &Path, args: LlmSetArgs) -> Result<LlmConfig> {
         && cfg.base_url.is_empty()
         && cfg.model.is_empty();
 
-    if let Some(u) = args.base_url {
-        cfg.base_url = normalize_base_url(&u)?;
-    }
-    if let Some(m) = args.model {
-        let m = m.trim().to_string();
-        if m.is_empty() {
-            bail!("model must not be empty");
-        }
-        if m.len() > MAX_MODEL_ID_LEN {
-            bail!("model id exceeds {MAX_MODEL_ID_LEN} characters");
-        }
-        validate_model_against_cache(root, &cfg.base_url, &m)?;
-        cfg.model = m;
-    }
     if let Some(e) = args.api_key_env {
         validate_env_name(&e)?;
         cfg.api_key_env = e;
     } else if cfg.api_key_env.is_empty() {
         cfg.api_key_env = DEFAULT_API_KEY_ENV.into();
+    }
+    if let Some(u) = args.base_url {
+        cfg.base_url = normalize_base_url(&u)?;
+    }
+    if let Some(m) = args.model {
+        let key = resolve_api_key_from_env(&cfg.api_key_env);
+        let m = accept_model_id(&m, key.as_deref())?;
+        validate_model_against_cache(root, &cfg.base_url, &m)?;
+        cfg.model = m;
     }
     if let Some(en) = args.enabled {
         cfg.enabled = en;
@@ -587,15 +711,42 @@ pub fn models_cache_path(root: &Path) -> PathBuf {
     state::config_dir(root).join("llm_models_cache.json")
 }
 
+fn peek_resolved_api_key(root: &Path) -> Option<String> {
+    let env_name = fs::read_to_string(config_path(root))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("api_key_env")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| validate_env_name(s).is_ok())
+        .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string());
+    resolve_api_key_from_env(&env_name)
+}
+
+fn filter_model_ids(ids: &mut Vec<String>, api_key: Option<&str>) {
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids.drain(..) {
+        if let Ok(id) = accept_model_id(&id, api_key) {
+            if !out.iter().any(|x| x == &id) {
+                out.push(id);
+            }
+        }
+    }
+    if out.len() > MAX_MODELS {
+        out.truncate(MAX_MODELS);
+    }
+    *ids = out;
+}
+
 pub fn load_models_cache(root: &Path) -> Option<ModelsCache> {
     let path = models_cache_path(root);
     let text = fs::read_to_string(path).ok()?;
     let mut cache: ModelsCache = serde_json::from_str(&text).ok()?;
     cache.base_url = normalize_base_url(&cache.base_url).ok()?;
-    cache.ids.retain(|id| {
-        let t = id.trim();
-        !t.is_empty() && t.len() <= MAX_MODEL_ID_LEN
-    });
+    let key = peek_resolved_api_key(root);
+    filter_model_ids(&mut cache.ids, key.as_deref());
     if cache.ids.len() > MAX_MODELS {
         cache.ids.truncate(MAX_MODELS);
         cache.truncated = true;
@@ -604,8 +755,16 @@ pub fn load_models_cache(root: &Path) -> Option<ModelsCache> {
 }
 
 pub fn save_models_cache(root: &Path, cache: &ModelsCache) -> Result<()> {
+    let mut cache = cache.clone();
+    cache.base_url = normalize_base_url(&cache.base_url)?;
+    let key = peek_resolved_api_key(root);
+    filter_model_ids(&mut cache.ids, key.as_deref());
+    if cache.ids.len() > MAX_MODELS {
+        cache.ids.truncate(MAX_MODELS);
+        cache.truncated = true;
+    }
     let path = models_cache_path(root);
-    let json = serde_json::to_string_pretty(cache)?;
+    let json = serde_json::to_string_pretty(&cache)?;
     // Cache is ids only — never raw /models JSON or keys.
     util::write_mode_0600(&path, format!("{json}\n").as_bytes())?;
     Ok(())
@@ -613,22 +772,26 @@ pub fn save_models_cache(root: &Path, cache: &ModelsCache) -> Result<()> {
 
 pub fn validate_model_against_cache(root: &Path, base_url: &str, model: &str) -> Result<()> {
     let Some(cache) = load_models_cache(root) else {
-        // No last fetch: allow (legacy `llm set`) and document re-fetch.
-        return Ok(());
+        bail!(
+            "no fetched model list for this base_url; run: cloakcli llm models  or  cloakcli llm configure"
+        );
     };
-    let base = if base_url.is_empty() {
-        cache.base_url.clone()
-    } else {
-        normalize_base_url(base_url).unwrap_or_else(|_| base_url.to_string())
-    };
-    if !cache.base_url.is_empty() && cache.base_url != base {
-        return Ok(());
+    if cache.ids.is_empty() || cache.base_url.is_empty() {
+        bail!("fetched model list is missing or corrupt; re-run: cloakcli llm models");
+    }
+    if base_url.is_empty() {
+        bail!("base_url required to validate model against fetched list");
+    }
+    let base = normalize_base_url(base_url)?;
+    if !models_bound_to_request_base(&cache.base_url, &base) {
+        bail!("model list is bound to a different base_url; refetch models for the current base");
     }
     if cache.ids.iter().any(|id| id == model) {
         return Ok(());
     }
+    // Do not interpolate `model` — it may be a pasted secret.
     bail!(
-        "model '{model}' is not in the last fetched list ({} ids{}). \
+        "model is not in the last fetched list for this base_url ({} ids{}). \
          Re-run: cloakcli llm models   or   cloakcli llm configure",
         cache.ids.len(),
         if cache.truncated { ", truncated" } else { "" }
@@ -644,6 +807,9 @@ pub fn format_models_list(list: &crate::llm_client::ModelsList) -> String {
         list.url
     );
     for (i, id) in list.ids.iter().enumerate() {
+        if accept_model_id(id, None).is_err() {
+            continue;
+        }
         out.push_str(&format!("  {:>3}. {id}\n", i + 1));
     }
     if list.truncated {
@@ -686,7 +852,7 @@ fn pick_from_list(
             return Ok(m);
         }
         bail!(
-            "model '{m}' is not in the fetched list ({} ids). Pass an id from `cloakcli llm models` or --pick N.",
+            "model is not in the fetched list ({} ids). Pass an id from `cloakcli llm models` or --pick N.",
             ids.len()
         );
     }
@@ -717,7 +883,7 @@ fn pick_from_list(
         if ids.iter().any(|id| id == t) {
             return Ok(t.to_string());
         }
-        bail!("'{t}' is not in the fetched model list");
+        bail!("input is not in the fetched model list");
     }
     bail!("non-interactive configure requires --model ID or --pick N (1-based)");
 }
@@ -1066,9 +1232,22 @@ mod tests {
         p
     }
 
+    fn seed_cache(root: &std::path::Path, base: &str, ids: &[&str]) {
+        save_models_cache(
+            root,
+            &ModelsCache {
+                base_url: normalize_base_url(base).unwrap(),
+                ids: ids.iter().map(|s| (*s).to_string()).collect(),
+                truncated: false,
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn save_mode_0600_and_no_raw_key() {
         let root = tmp_root();
+        seed_cache(&root, "https://api.openai.com/v1", &["gpt-4o"]);
         let cfg = apply_set(
             &root,
             LlmSetArgs {
@@ -1100,17 +1279,20 @@ mod tests {
     #[test]
     fn rejects_raw_key_as_env_name() {
         let root = tmp_root();
+        let secret = "sk-thisisarealsecretkeyvalue";
         let err = apply_set(
             &root,
             LlmSetArgs {
                 base_url: Some("https://api.openai.com/v1".into()),
                 model: Some("gpt-4o".into()),
-                api_key_env: Some("sk-thisisarealsecretkeyvalue".into()),
+                api_key_env: Some(secret.into()),
                 ..Default::default()
             },
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("env"));
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("env"), "{err}");
+        assert!(!err.contains(secret), "echoed pasted key: {err}");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1155,6 +1337,7 @@ mod tests {
     #[test]
     fn ipc_timeout_extends_when_recover_enabled() {
         let root = tmp_root();
+        seed_cache(&root, "https://example.com/v1", &["m"]);
         apply_set(
             &root,
             LlmSetArgs {
@@ -1177,6 +1360,7 @@ mod tests {
     #[test]
     fn view_never_includes_env_value() {
         let root = tmp_root();
+        seed_cache(&root, "https://api.example.com/v1", &["vision"]);
         apply_set(
             &root,
             LlmSetArgs {
@@ -1292,6 +1476,11 @@ mod tests {
     #[test]
     fn set_model_validates_against_last_fetch() {
         let root = tmp_root();
+        seed_cache(
+            &root,
+            "https://api.example.com/v1",
+            &["vision", "other"],
+        );
         apply_set(
             &root,
             LlmSetArgs {
@@ -1300,15 +1489,6 @@ mod tests {
                 api_key_env: Some("CLOAKCLI_LLM_API_KEY".into()),
                 enabled: Some(true),
                 ..Default::default()
-            },
-        )
-        .unwrap();
-        save_models_cache(
-            &root,
-            &ModelsCache {
-                base_url: "https://api.example.com/v1".into(),
-                ids: vec!["vision".into(), "other".into()],
-                truncated: false,
             },
         )
         .unwrap();
@@ -1330,6 +1510,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("last fetched"), "{err}");
+        assert!(!err.contains("not-in-list"), "must not echo rejected id: {err}");
         assert!(!err.contains("sk-"));
         let cache_text = fs::read_to_string(models_cache_path(&root)).unwrap();
         assert!(!cache_text.contains("api_key"));
@@ -1338,8 +1519,61 @@ mod tests {
     }
 
     #[test]
+    fn set_model_rejects_cache_miss_corrupt_and_base_mismatch() {
+        let root = tmp_root();
+        let miss = apply_set(
+            &root,
+            LlmSetArgs {
+                base_url: Some("https://api.example.com/v1".into()),
+                model: Some("vision".into()),
+                api_key_env: Some("CLOAKCLI_LLM_API_KEY".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(miss.contains("no fetched model list"), "{miss}");
+        assert!(!miss.contains("vision"), "{miss}");
+
+        fs::create_dir_all(state::config_dir(&root)).unwrap();
+        fs::write(models_cache_path(&root), "{not-json").unwrap();
+        let corrupt = apply_set(
+            &root,
+            LlmSetArgs {
+                base_url: Some("https://api.example.com/v1".into()),
+                model: Some("vision".into()),
+                api_key_env: Some("CLOAKCLI_LLM_API_KEY".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            corrupt.contains("no fetched") || corrupt.contains("corrupt"),
+            "{corrupt}"
+        );
+
+        seed_cache(&root, "https://api.example.com/v1", &["vision"]);
+        let mismatch = apply_set(
+            &root,
+            LlmSetArgs {
+                base_url: Some("https://other.example.com/v1".into()),
+                model: Some("vision".into()),
+                api_key_env: Some("CLOAKCLI_LLM_API_KEY".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mismatch.contains("different base_url"), "{mismatch}");
+        assert!(!mismatch.contains("vision"), "{mismatch}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn show_never_prints_env_value_or_raw_key_field() {
         let root = tmp_root();
+        seed_cache(&root, "https://api.example.com/v1", &["vision"]);
         apply_set(
             &root,
             LlmSetArgs {
@@ -1366,5 +1600,93 @@ mod tests {
         let v = resolve_api_key_from_env(DEFAULT_API_KEY_ENV).unwrap();
         assert_eq!(v, "sk-compat-only");
         env::remove_var(COMPAT_API_KEY_ENV);
+    }
+
+    #[test]
+    fn normalize_rejects_query_fragment_credentials_and_keeps_v10() {
+        for u in [
+            "https://api.openai.com/v1?x=1",
+            "https://api.openai.com/v1#frag",
+            "https://user:pass@api.openai.com/v1",
+            "https://user@api.openai.com/v1",
+        ] {
+            let err = normalize_base_url(u).unwrap_err().to_string();
+            assert!(
+                err.contains("query")
+                    || err.contains("fragment")
+                    || err.contains("credentials"),
+                "{u}: {err}"
+            );
+            assert!(!err.contains("user:pass"), "{err}");
+            assert!(!err.contains("pass@"), "{err}");
+        }
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1/v10").unwrap(),
+            "https://api.openai.com/v1/v10"
+        );
+        assert_eq!(
+            join_openai_path("https://api.openai.com/v1/v10", "models").unwrap(),
+            "https://api.openai.com/v1/v10/models"
+        );
+        let miss = normalize_base_url("https:///v1").unwrap_err().to_string();
+        assert!(miss.contains("host") || miss.contains("http"), "{miss}");
+    }
+
+    #[test]
+    fn accept_model_id_rejects_key_and_control_chars_without_echo() {
+        let key = "sk-live-secret-abc";
+        let err = accept_model_id(key, Some(key)).unwrap_err().to_string();
+        assert!(err.contains("rejected"), "{err}");
+        assert!(!err.contains(key), "{err}");
+        let embedded = format!("model-{key}-id");
+        let err2 = accept_model_id(&embedded, Some(key))
+            .unwrap_err()
+            .to_string();
+        assert!(!err2.contains(key), "{err2}");
+        let ctrl = "gpt-4o\u{0007}bell";
+        let err3 = accept_model_id(ctrl, None).unwrap_err().to_string();
+        assert!(err3.contains("control"), "{err3}");
+        assert!(!err3.contains("gpt-4o"), "{err3}");
+        assert_eq!(accept_model_id("gpt-4o", Some(key)).unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn models_list_is_bound_to_request_base() {
+        assert!(models_bound_to_request_base(
+            "https://api.example.com/v1",
+            "https://api.example.com/v1/"
+        ));
+        assert!(!models_bound_to_request_base(
+            "https://api.example.com/v1",
+            "https://other.example.com/v1"
+        ));
+        assert!(!models_bound_to_request_base(
+            "",
+            "https://api.example.com/v1"
+        ));
+        assert!(!models_bound_to_request_base(
+            "https://api.example.com/v1?x=1",
+            "https://api.example.com/v1"
+        ));
+    }
+
+    #[test]
+    fn cache_drops_ids_that_contain_the_api_key() {
+        let root = tmp_root();
+        let key = "sk-cache-secret-xyz";
+        env::set_var(DEFAULT_API_KEY_ENV, key);
+        fs::create_dir_all(state::config_dir(&root)).unwrap();
+        fs::write(
+            models_cache_path(&root),
+            format!(
+                "{{\"base_url\":\"https://api.example.com/v1\",\"ids\":[\"ok\",\"{key}\"],\"truncated\":false}}\n"
+            ),
+        )
+        .unwrap();
+        let cache = load_models_cache(&root).expect("cache");
+        assert_eq!(cache.ids, vec!["ok"]);
+        assert!(!cache.ids.iter().any(|id| id.contains(key)));
+        env::remove_var(DEFAULT_API_KEY_ENV);
+        let _ = fs::remove_dir_all(&root);
     }
 }

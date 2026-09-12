@@ -234,7 +234,7 @@ pub enum LlmCmd {
         stdin_key: bool,
     },
     /// Create or update config/llm.json (mode 0600). Pass --api-key-env NAME, never a raw key.
-    /// `--model` is checked against the last `llm models`/`configure` fetch when that cache exists.
+    /// `--model` must be in the last successful `llm models`/`configure` fetch for this base_url.
     Set {
         #[arg(long)]
         base_url: Option<String>,
