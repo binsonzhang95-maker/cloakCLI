@@ -1,0 +1,187 @@
+# CloakCLI
+
+基于 [CloakBrowser](https://github.com/CloakHQ/CloakBrowser) 的 **Rust master TUI/CLI + Rust client daemon + 薄 Python worker**。
+
+> **Stealth ≠ anonymity / anti-detect guarantee.** CloakBrowser reduces automation fingerprints; it does not promise anonymity or bypassing all detection.
+
+## Architecture (master → N clients)
+
+```
+Mac (master TUI)                      Cloud box / client node
+─────────────────                     ───────────────────────
+cloakcli (TUI)                        cloakcli client connect
+  · profiles / skills / config           (outbound TCP JSONL)
+  · Clients pane / job submit     ←──► master hub :7750
+  · observe job_state / logs              │
+cloakcli master serve (optional)          ▼
+                                     python cloakcli_worker (unix socket)
+                                          ▼
+                                     CloakBrowser persistent context
+```
+
+- **Master**: configure, schedule, observe (TUI primary; CLI for scripting).
+- **Client**: execute; dials **out** to master (NAT-friendly). Local multi-browser is client-internal via `worker serve`.
+- **Protocol (DEV STUB)**: versioned JSONL over **plaintext TCP** (`hello`, `heartbeat`, `job_submit` / `job_state` / `job_cancel`, `config_update` / `config_ack`, `log_chunk`, …). See `astra-fleet-advice.md`.
+- **Security honesty**: shared `CLOAKCLI_MASTER_TOKEN` in cleartext is **dev-only**. **Not production.**
+- **TODO before production**: TLS/WebSocket, per-client identity (pair/rotate/revoke), `skill_sync` content hashes, HA/relay/RBAC.
+
+本仓库在 box 上：`/workspace/CloakCLI`（Mac 稍后同步到 `~/Documents/CloakCLI`）。
+
+## Per-node browser daemon
+
+Sessions must survive across CLI invocations:
+
+```bash
+cloakcli worker serve          # data/worker.sock + data/worker.pid
+cloakcli browser open demo --url https://example.com
+cloakcli browser list          # other process — same sessions
+cloakcli browser close all
+cloakcli worker status
+cloakcli worker stop           # close browsers, exit daemon
+```
+
+`doctor` prints daemon status. IPC requests time out (`CLOAKCLI_IPC_TIMEOUT`, default 120s).
+
+## Install
+
+```bash
+cd ~/Documents/CloakCLI   # or /workspace/CloakCLI
+cargo build --release
+python3 -m pip install -e python/   # or --user --break-system-packages on PEP 668
+cloakcli doctor
+```
+
+| Env | Meaning |
+|-----|---------|
+| `CLOAKCLI_HOME` | Project root override |
+| `CLOAKCLI_HEADED=1` | Default headed |
+| `CLOAKCLI_PYTHON` | Python binary |
+| `CLOAKCLI_IPC_TIMEOUT` | Worker/daemon IPC timeout (seconds) |
+| `CLOAKCLI_MASTER_BIND` | Master listen addr (default `127.0.0.1:7750`) |
+| `CLOAKCLI_MASTER_TOKEN` | **Dev stub** shared token (plaintext). NOT production auth |
+
+## Quick start
+
+```bash
+# Master TUI (embeds hub on :7750; Clients pane)
+cloakcli
+cloakcli tui
+
+# Profiles / skills (local)
+cloakcli profile create demo --proxy http://user:pass@127.0.0.1:7890
+cloakcli profile list                    # proxy credentials redacted
+cloakcli profile edit demo --proxy http://127.0.0.1:7890
+cloakcli skill list
+cloakcli skill run hello --profile demo --headless
+
+# Batch (unique temp files; per-profile locks)
+cloakcli batch run --skill hello --profiles demo,demo2 --concurrency 2 --headless
+
+# Fleet DEV STUB (plaintext shared token ≠ production)
+cloakcli master serve --bind 127.0.0.1:7750 --token dev-token
+# on each client box:
+cloakcli client connect --master 127.0.0.1:7750 --id box1 --token dev-token
+# from master side:
+cloakcli master clients
+cloakcli master config --concurrency 3 --headless   # persists data/hub_desired.json + push
+cloakcli master submit --client box1 --skill hello --profile noproxy --headless
+cloakcli master job-state --job-id <id>
+# smoke: scripts/e2e-fleet-stub.sh
+```
+
+### TUI keys
+
+Ops-console layout: **header** (version / DEV STUB / headed / concurrency / hub) → **tabs** → **list+detail** → **context help** → **status**. Forms open as a centered modal.
+
+| Key | Action |
+|-----|--------|
+| `q` / Esc | Quit TUI (daemon/hub keep running) |
+| `Tab` / `Shift-Tab` / `1`–`6` | Switch panes: Profiles · Skills · Sessions · Clients · Config · Logs |
+| `j`/`k` or ↑↓ | Navigate list |
+| `Enter` | Run selected skill on selected profile **locally** |
+| `J` | Submit job to **selected remote client** |
+| `o` / `x` | Open / close **local** browser session |
+| `n` / `e` | New profile / edit proxy (modal) |
+| `i` / `E` / `C` | Import / export / clear **cookies** (Profiles pane; modal for paths) |
+| `h` | Toggle headed default |
+| `c` or `[` `]` | Concurrency + / − / + |
+| `r` | Reload profiles/skills |
+| (idle) | Sessions + clients auto-refresh ~2s |
+
+Cookie **values** and full proxy credentials never appear in the TUI (status chips / `redact_proxy` only).
+
+
+## Cookies + proxy (core)
+
+Cookie files and proxy settings are **first-class profile config**, separate from Chromium `user_data_dir`:
+
+| Path | Purpose |
+|------|---------|
+| `profiles/<name>/profile.json` | Metadata (name, proxy, notes, user_data_dir) — syncable |
+| `profiles/<name>/cookie.json` | Playwright `storage_state` (`cookies` + optional `origins`) — **secret**, mode `0600` |
+| `data/profiles/<name>/` | Browser persistent context (runtime) |
+
+**Do not commit `cookie.json` or cookie exports** (see `.gitignore`). Never paste cookie values into logs, screenshots, or job output.
+
+```bash
+# Import (auto-detects storage_state or cookies array)
+cloakcli profile cookie import noproxy ./fixtures/sample-cookies.json --format auto
+cloakcli profile cookie status noproxy          # counts/domains only
+cloakcli profile cookie export noproxy --out /tmp/noproxy-cookies.json  # not data/; mode 0600
+cloakcli profile cookie clear noproxy --close-sessions
+
+# Cookies apply on *new* open / skill run (not hot-updated into existing sessions)
+cloakcli browser open noproxy --url https://example.com --headless
+cloakcli skill run hello --profile noproxy --headless
+```
+
+Legacy flat `profiles/<name>.json` is still readable; cookie ops (`import`/`export`/`clear`/`status`), profile update/create, and open migrate to `profiles/<name>/profile.json`.
+
+TUI Profiles pane shows cookie status; keys `i` / `E` / `C` = import path / export path / clear.
+
+## Skill format
+
+```json
+{
+  "schema_version": 1,
+  "name": "hello",
+  "description": "open example.com",
+  "params": [],
+  "steps": [
+    {"action": "goto", "url": "https://example.com"},
+    {"action": "wait", "ms": 500},
+    {"action": "extract_text", "css": "h1", "as": "title"},
+    {"action": "screenshot", "path": "artifacts/hello.png"}
+  ]
+}
+```
+
+Actions: `goto` `click` `type`/`fill` `wait` `screenshot` `extract_text`.  
+`{{var}}` substitution errors if undefined; required `params` are validated.
+
+## Security notes
+
+- Profile/skill names: strict charset; import `--name` cannot escape `skills/`.
+- Worker only accepts paths under project root set at daemon start.
+- Proxy URLs redacted in list/show/TUI.
+- Cookie **values** never appear in CLI status, TUI, or worker JSONL responses (counts/domains only).
+- Worker re-validates cookie schema on apply; origins/localStorage injection is **off by default** (`CLOAKCLI_APPLY_ORIGINS=1` for strict http(s) allowlist).
+- `export --out` refuses project `data/` + `artifacts/` and directory targets; always `0600`.
+- `**/cookie.json` and cookie export patterns are gitignored — do not sync secrets into git/artifacts.
+- **Fleet is a DEV STUB**: plaintext TCP + shared token. TLS/WS, per-client identity, and skill_sync hashes remain **TODO** before any production use.
+
+## Dev
+
+Box uses **rustc 1.85** — keep `ratatui=0.28.1` / pinned `instability`/`darling` in lockfile.
+
+```bash
+cargo build
+cloakcli doctor
+PYTHONPATH=python python3 -m cloakcli_worker serve --root "$PWD" --socket data/worker.sock
+```
+
+See `FIXES-FOR-ASTRA.md` for review mapping.
+
+## License
+
+MIT（业务代码；CloakBrowser 二进制另有其许可）

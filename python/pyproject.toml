@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloakcli-worker"
+version = "0.1.0"
+description = "Thin CloakBrowser worker for CloakCLI (JSONL over stdin/stdout)"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "cloakbrowser>=0.5",
+]
+
+[project.scripts]
+cloakcli-worker = "cloakcli_worker.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cloakcli_worker*"]

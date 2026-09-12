@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "hello",
+  "description": "open example.com",
+  "params": [],
+  "steps": [
+    {"action": "goto", "url": "https://example.com"},
+    {"action": "wait", "ms": 500},
+    {"action": "extract_text", "css": "h1", "as": "title"},
+    {"action": "screenshot", "path": "artifacts/hello.png"}
+  ]
+}

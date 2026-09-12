@@ -1,0 +1,6 @@
+{
+  "name": "demo",
+  "proxy": "http://127.0.0.1:7890",
+  "user_data_dir": "/workspace/CloakCLI/data/profiles/demo",
+  "created_at": "2026-09-12T11:06:46.058313059+00:00"
+}

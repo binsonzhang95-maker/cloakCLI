@@ -1,0 +1,25 @@
+[package]
+name = "cloakcli"
+version = "0.1.0"
+edition = "2021"
+description = "CloakCLI — multi-profile stealth browser + skill runner (Rust CLI + Python worker). Stealth ≠ anonymity guarantee."
+license = "MIT"
+authors = ["CloakCLI Contributors"]
+rust-version = "1.85"
+
+[[bin]]
+name = "cloakcli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.28"
+ratatui = "=0.28.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "net"] }
+uuid = { version = "1", features = ["v4"] }
+which = "=6.0.3"
+home = "=0.5.9"

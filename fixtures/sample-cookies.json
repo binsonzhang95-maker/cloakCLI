@@ -1,0 +1,25 @@
+{
+  "cookies": [
+    {
+      "name": "sessionid",
+      "value": "TEST_SECRET_VALUE_DO_NOT_LOG",
+      "domain": ".example.com",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "theme",
+      "value": "dark",
+      "domain": "www.example.com",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": []
+}

@@ -1,0 +1,59 @@
+# Rust
+/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime / local state
+data/profiles/
+data/sessions*
+data/user-data/
+data/artifacts/
+artifacts/
+# Profiles: allow profile.json metadata; deny cookie secrets + other local files
+profiles/*
+!profiles/.gitkeep
+!profiles/*/
+!profiles/*/profile.json
+data/*
+!data/.gitkeep
+
+# Cookie secrets — never commit (defense in depth; also under profiles/)
+**/cookie.json
+**/cookies-export*.json
+**/storage_state*.json
+!fixtures/**
+*.cookies.json
+cookies-export.json
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Screenshots / skill artifacts
+*.png
+
+# verify script export artifact
+cookie-export-verify.json
+
+# Local Astra prompts / scratch (keep review markdown if useful — ignore ask-*)
+ask-astra*.txt
+astra-review-run.log
+screenshots/
