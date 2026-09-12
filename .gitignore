@@ -18,6 +18,8 @@ venv/
 .env.*
 !.env.example
 config/llm.json
+config/llm_models_cache.json
+config/llm.secret
 
 # Runtime / local state
 data/profiles/

@@ -236,7 +236,7 @@ def _cmd_llm_test(req_id: str) -> dict[str, Any]:
     if not cfg:
         return protocol.err(
             req_id,
-            "no config/llm.json — run: cloakcli llm set --base-url URL --model MODEL --api-key-env VAR",
+            "no config/llm.json — run: cloakcli llm configure",
         )
     data = test_llm(cfg)
     data = redact_any(data)

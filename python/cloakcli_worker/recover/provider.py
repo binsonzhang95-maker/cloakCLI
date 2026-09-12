@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 from typing import Any
 
-from ..llm_config import LlmConfig
+from ..llm_config import (
+    LlmConfig,
+    MAX_MODEL_ID_LEN,
+    MAX_MODELS,
+    MAX_MODELS_BODY,
+    MAX_MODELS_PAGES,
+    MODELS_CONNECT_TIMEOUT_SEC,
+    MODELS_READ_TIMEOUT_SEC,
+    chat_completions_url,
+    models_url,
+    resolve_api_key,
+)
 from ..redact import redact_text
 
 # 1x1 transparent PNG for connectivity tests
@@ -33,13 +43,12 @@ class OpenAICompatProvider:
         """Return (assistant_text, total_tokens). Never logs Authorization."""
         if not cfg.base_url or not cfg.model:
             raise ProviderError("llm config missing base_url or model")
-        key = os.environ.get(cfg.api_key_env, "")
+        key = resolve_api_key(cfg)
         if not key:
             raise ProviderError(f"env {cfg.api_key_env} is not set")
 
-        url = cfg.base_url.rstrip("/") + "/chat/completions"
-        parsed_scheme = url.split(":", 1)[0].lower()
-        if parsed_scheme not in ("http", "https"):
+        url = chat_completions_url(cfg.base_url)
+        if not url:
             raise ProviderError("base_url must be http(s)")
 
         body_messages = list(messages)
@@ -131,9 +140,172 @@ class OpenAICompatProvider:
         return text, tokens
 
 
+def list_models(cfg: LlmConfig, *, api_key: str | None = None) -> dict[str, Any]:
+    """GET {base}/models — ids only. Never returns the key or raw JSON."""
+    key = api_key if api_key is not None else resolve_api_key(cfg)
+    url = models_url(cfg.base_url)
+    out: dict[str, Any] = {
+        "ok": False,
+        "ids": [],
+        "truncated": False,
+        "pages": 0,
+        "url": url,
+    }
+    if not url:
+        out["error"] = "base_url must be http(s)"
+        return out
+    if not key:
+        out["error"] = f"env {cfg.api_key_env} is not set"
+        return out
+
+    ids: list[str] = []
+    truncated = False
+    pages = 0
+    current = url
+    origin = _origin(url)
+    seen_after: list[str] = []
+    has_more = False
+    timeout = max(MODELS_CONNECT_TIMEOUT_SEC, MODELS_READ_TIMEOUT_SEC)
+
+    try:
+        while pages < MAX_MODELS_PAGES:
+            pages += 1
+            req = urllib.request.Request(
+                current,
+                method="GET",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Accept": "application/json",
+                    "User-Agent": "cloakcli-worker/0.1",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw, body_trunc = _read_limited(resp, MAX_MODELS_BODY)
+            except urllib.error.HTTPError as e:
+                try:
+                    e.read()
+                except Exception:
+                    pass
+                out["error"] = redact_text(
+                    f"GET /models HTTP {e.code}", extra=[key]
+                )
+                return out
+            except urllib.error.URLError as e:
+                out["error"] = redact_text(f"GET /models network: {e.reason}", extra=[key])
+                return out
+            if body_trunc:
+                truncated = True
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                out["error"] = (
+                    "GET /models response exceeded size cap (truncated, not JSON)"
+                    if body_trunc
+                    else "GET /models returned non-JSON"
+                )
+                return out
+            if not isinstance(parsed, dict):
+                out["error"] = "GET /models returned non-object JSON"
+                return out
+            data = parsed.get("data")
+            if not isinstance(data, list):
+                out["error"] = "GET /models JSON missing data[] array of objects with string id"
+                return out
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                mid = item.get("id")
+                if not isinstance(mid, str):
+                    continue
+                mid = mid.strip()
+                if not mid:
+                    continue
+                if len(mid) > MAX_MODEL_ID_LEN:
+                    truncated = True
+                    continue
+                if len(ids) >= MAX_MODELS:
+                    truncated = True
+                    break
+                if mid not in ids:
+                    ids.append(mid)
+            if len(ids) >= MAX_MODELS:
+                truncated = True
+                break
+            has_more = bool(parsed.get("has_more"))
+            nxt = parsed.get("next")
+            if not has_more:
+                break
+            if isinstance(nxt, str) and nxt.strip():
+                nxt_url = _resolve_next(current, nxt.strip(), origin)
+                if not nxt_url:
+                    truncated = True
+                    break
+                current = nxt_url
+            else:
+                if not ids:
+                    break
+                last = ids[-1]
+                if last in seen_after:
+                    break
+                seen_after.append(last)
+                current = _append_query(url, "after", last)
+        if pages >= MAX_MODELS_PAGES and has_more:
+            truncated = True
+    except Exception as e:
+        out["error"] = redact_text(f"{type(e).__name__}: {e}", extra=[key])
+        return out
+
+    if not ids:
+        out["error"] = "GET /models returned no model ids (empty or unusable data[])"
+        return out
+    out["ok"] = True
+    out["ids"] = ids
+    out["truncated"] = truncated
+    out["pages"] = pages
+    return out
+
+
+def _read_limited(resp: Any, cap: int) -> tuple[bytes, bool]:
+    data = resp.read(cap + 1)
+    if len(data) > cap:
+        return data[:cap], True
+    return data, False
+
+
+def _origin(url: str) -> str:
+    from urllib.parse import urlparse
+
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}".lower()
+
+
+def _resolve_next(current: str, nxt: str, origin: str) -> str:
+    from urllib.parse import urljoin, urlparse
+
+    if nxt.startswith("http://") or nxt.startswith("https://"):
+        cand = nxt
+    else:
+        cand = urljoin(current, nxt)
+    p = urlparse(cand)
+    if p.scheme not in ("http", "https"):
+        return ""
+    if f"{p.scheme}://{p.netloc}".lower() != origin:
+        return ""
+    return cand
+
+
+def _append_query(url: str, key: str, value: str) -> str:
+    from urllib.parse import quote
+
+    enc = quote(value, safe="-_.~")
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}{key}={enc}"
+
+
 def test_llm(cfg: LlmConfig) -> dict[str, Any]:
     """Connectivity probe. Response never includes the API key."""
-    key_present = bool(os.environ.get(cfg.api_key_env))
+    key_present = bool(resolve_api_key(cfg))
     out: dict[str, Any] = {
         "ok": False,
         "model": cfg.model,

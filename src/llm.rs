@@ -1,11 +1,16 @@
 //! LLM stall-recovery config: `config/llm.json` (mode 0600).
-//! API keys are referenced by environment variable name only — never stored.
+//!
+//! Key strategy A: store `api_key_env` only (default `CLOAKCLI_LLM_API_KEY`).
+//! Never persist a raw key in llm.json, cache, logs, `show`, or artifacts.
+//! Reject CLI `--api-key` (shell history / argv). Accept TTY hidden prompt,
+//! `--stdin-key`, or an already-set env (`OPENAI_API_KEY` as documented fallback).
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
 use crate::state;
 use crate::util;
@@ -14,6 +19,15 @@ pub const DEFAULT_RECOVER_TIMEOUT_SEC: u64 = 300;
 pub const DEFAULT_MAX_ACTIONS: u32 = 120;
 pub const DEFAULT_MAX_LOOPS: u32 = 60;
 pub const DEFAULT_MAX_TOKENS: u32 = 200_000;
+pub const DEFAULT_API_KEY_ENV: &str = "CLOAKCLI_LLM_API_KEY";
+pub const COMPAT_API_KEY_ENV: &str = "OPENAI_API_KEY";
+pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+pub const MAX_MODELS_BODY: usize = 1_048_576;
+pub const MAX_MODELS: usize = 256;
+pub const MAX_MODEL_ID_LEN: usize = 128;
+pub const MAX_MODELS_PAGES: u32 = 5;
+pub const MODELS_CONNECT_TIMEOUT_SEC: u64 = 10;
+pub const MODELS_READ_TIMEOUT_SEC: u64 = 20;
 const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +78,7 @@ impl Default for LlmConfig {
             enabled: false,
             base_url: String::new(),
             model: String::new(),
-            api_key_env: "OPENAI_API_KEY".into(),
+            api_key_env: DEFAULT_API_KEY_ENV.into(),
             recover_timeout_sec: DEFAULT_RECOVER_TIMEOUT_SEC,
             allow_hosts: Vec::new(),
             max_actions: DEFAULT_MAX_ACTIONS,
@@ -131,14 +145,14 @@ pub fn save(root: &Path, cfg: &LlmConfig) -> Result<()> {
 
 fn sanitize_loaded(cfg: &mut LlmConfig) -> Result<()> {
     cfg.schema_version = SCHEMA_VERSION;
-    cfg.base_url = cfg.base_url.trim().trim_end_matches('/').to_string();
     cfg.model = cfg.model.trim().to_string();
     cfg.api_key_env = cfg.api_key_env.trim().to_string();
-    if !cfg.api_key_env.is_empty() {
-        validate_env_name(&cfg.api_key_env)?;
+    if cfg.api_key_env.is_empty() {
+        cfg.api_key_env = DEFAULT_API_KEY_ENV.into();
     }
+    validate_env_name(&cfg.api_key_env)?;
     if !cfg.base_url.is_empty() {
-        validate_base_url(&cfg.base_url)?;
+        cfg.base_url = normalize_base_url(&cfg.base_url)?;
     }
     if cfg.recover_timeout_sec < 5 {
         cfg.recover_timeout_sec = 5;
@@ -193,12 +207,107 @@ pub fn validate_env_name(name: &str) -> Result<()> {
 }
 
 pub fn validate_base_url(url: &str) -> Result<()> {
-    let lower = url.to_ascii_lowercase();
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("file:") || lower.starts_with("javascript:") || lower.starts_with("data:")
+    {
+        bail!("base_url rejects file:/javascript:/data:");
+    }
     if !(lower.starts_with("https://") || lower.starts_with("http://")) {
         bail!("base_url must be http(s):// (got scheme-less or blocked URL)");
     }
-    if lower.starts_with("file:") || lower.starts_with("javascript:") || lower.starts_with("data:") {
-        bail!("base_url rejects file:/javascript:/data:");
+    // Disallow control chars / whitespace in the URL itself.
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("base_url must not contain whitespace");
+    }
+    Ok(())
+}
+
+/// Strip trailing slashes, drop accidental `/models` or `/chat/completions`
+/// suffixes, collapse `/v1/v1`. http(s) only.
+pub fn normalize_base_url(raw: &str) -> Result<String> {
+    validate_base_url(raw)?;
+    let mut s = raw.trim().trim_end_matches('/').to_string();
+    let suffixes = ["/chat/completions", "/completions", "/models"];
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let mut hit = false;
+        for suffix in suffixes {
+            if lower.ends_with(suffix) {
+                s.truncate(s.len() - suffix.len());
+                s = s.trim_end_matches('/').to_string();
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            break;
+        }
+    }
+    // Collapse duplicated /v1 path segments.
+    loop {
+        let lower = s.to_ascii_lowercase();
+        if let Some(i) = lower.find("/v1/v1") {
+            s.replace_range(i..i + 6, "/v1");
+        } else {
+            break;
+        }
+    }
+    validate_base_url(&s)?;
+    if s.ends_with("://") {
+        bail!("base_url missing host");
+    }
+    Ok(s)
+}
+
+/// Join `{base}/{path}` without duplicating a trailing `/v1`.
+pub fn join_openai_path(base: &str, path: &str) -> Result<String> {
+    let base = normalize_base_url(base)?;
+    let path = path.trim().trim_start_matches('/');
+    if path.is_empty() {
+        return Ok(base);
+    }
+    let base_l = base.to_ascii_lowercase();
+    let path_l = path.to_ascii_lowercase();
+    if base_l.ends_with("/v1") && (path_l == "v1" || path_l.starts_with("v1/")) {
+        let rest = if path_l.starts_with("v1/") {
+            &path[3..]
+        } else {
+            ""
+        };
+        if rest.is_empty() {
+            return Ok(base);
+        }
+        return Ok(format!("{base}/{rest}"));
+    }
+    Ok(format!("{base}/{path}"))
+}
+
+pub fn models_url(base: &str) -> Result<String> {
+    join_openai_path(base, "models")
+}
+
+pub fn chat_completions_url(base: &str) -> Result<String> {
+    join_openai_path(base, "chat/completions")
+}
+
+/// Reject `--api-key` / `--api-key=` in argv so clap never interpolates the value.
+pub fn reject_api_key_argv<I, S>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for a in args {
+        let a = a.as_ref();
+        if a == "--api-key" || a.starts_with("--api-key=") {
+            bail!(
+                "--api-key is rejected (appears in shell history and process argv). \
+                 Set {} (or {}), use a TTY hidden prompt, \
+                 or pipe the key with --stdin-key. llm.json stores api_key_env only.",
+                DEFAULT_API_KEY_ENV,
+                COMPAT_API_KEY_ENV
+            );
+        }
     }
     Ok(())
 }
@@ -235,19 +344,24 @@ pub fn apply_set(root: &Path, args: LlmSetArgs) -> Result<LlmConfig> {
         && cfg.model.is_empty();
 
     if let Some(u) = args.base_url {
-        validate_base_url(&u)?;
-        cfg.base_url = u.trim().trim_end_matches('/').to_string();
+        cfg.base_url = normalize_base_url(&u)?;
     }
     if let Some(m) = args.model {
         let m = m.trim().to_string();
         if m.is_empty() {
             bail!("model must not be empty");
         }
+        if m.len() > MAX_MODEL_ID_LEN {
+            bail!("model id exceeds {MAX_MODEL_ID_LEN} characters");
+        }
+        validate_model_against_cache(root, &cfg.base_url, &m)?;
         cfg.model = m;
     }
     if let Some(e) = args.api_key_env {
         validate_env_name(&e)?;
         cfg.api_key_env = e;
+    } else if cfg.api_key_env.is_empty() {
+        cfg.api_key_env = DEFAULT_API_KEY_ENV.into();
     }
     if let Some(en) = args.enabled {
         cfg.enabled = en;
@@ -292,7 +406,7 @@ pub fn apply_set(root: &Path, args: LlmSetArgs) -> Result<LlmConfig> {
 
 pub fn toggle_enabled(root: &Path) -> Result<LlmView> {
     let mut cfg = load(root)?.ok_or_else(|| {
-        anyhow::anyhow!("no config/llm.json — run: cloakcli llm set --base-url … --model … --api-key-env …")
+        anyhow::anyhow!("no config/llm.json — run: cloakcli llm configure")
     })?;
     cfg.enabled = !cfg.enabled;
     save(root, &cfg)?;
@@ -325,7 +439,7 @@ fn view_of(root: &Path, cfg: Option<&LlmConfig>) -> LlmView {
             model: c.model.clone(),
             base_url: c.base_url.clone(),
             api_key_env: c.api_key_env.clone(),
-            key_present: env_is_set(&c.api_key_env),
+            key_present: resolve_api_key_from_env(&c.api_key_env).is_some(),
             recover_timeout_sec: c.recover_timeout_sec,
             allow_hosts: c.allow_hosts.clone(),
             max_actions: c.max_actions,
@@ -335,14 +449,410 @@ fn view_of(root: &Path, cfg: Option<&LlmConfig>) -> LlmView {
     }
 }
 
-fn env_is_set(name: &str) -> bool {
+fn env_nonempty(name: &str) -> Option<String> {
     if name.is_empty() {
-        return false;
+        return None;
     }
     match env::var(name) {
-        Ok(v) => !v.is_empty(),
-        Err(_) => false,
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => None,
     }
+}
+
+/// Look up the API key for `env_name`. If the name is the default
+/// `CLOAKCLI_LLM_API_KEY` and unset, fall back to `OPENAI_API_KEY`.
+pub fn resolve_api_key_from_env(env_name: &str) -> Option<String> {
+    if let Some(v) = env_nonempty(env_name) {
+        return Some(v);
+    }
+    if env_name == DEFAULT_API_KEY_ENV {
+        return env_nonempty(COMPAT_API_KEY_ENV);
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Env,
+    CompatEnv,
+    Stdin,
+    Tty,
+}
+
+/// Resolve the key without accepting `--api-key` argv.
+/// `stdin_key` must be explicit (`--stdin-key`).
+pub fn resolve_api_key(
+    env_name: &str,
+    stdin_key: bool,
+    interactive: bool,
+) -> Result<(String, KeySource)> {
+    if let Some(v) = env_nonempty(env_name) {
+        return Ok((v, KeySource::Env));
+    }
+    if env_name == DEFAULT_API_KEY_ENV {
+        if let Some(v) = env_nonempty(COMPAT_API_KEY_ENV) {
+            return Ok((v, KeySource::CompatEnv));
+        }
+    }
+    if stdin_key {
+        let key = read_key_from_stdin()?;
+        env::set_var(env_name, &key);
+        return Ok((key, KeySource::Stdin));
+    }
+    if interactive && io::stdin().is_terminal() {
+        let key = read_hidden_tty_key()?;
+        env::set_var(env_name, &key);
+        return Ok((key, KeySource::Tty));
+    }
+    bail!(
+        "API key not found. Set {env_name} (or {}), use a TTY hidden prompt, \
+         or pipe the key with --stdin-key. Do not pass --api-key (shell history).",
+        COMPAT_API_KEY_ENV
+    );
+}
+
+fn read_key_from_stdin() -> Result<String> {
+    let mut s = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut s)
+        .context("read API key from stdin")?;
+    let key = s.trim_end_matches(['\n', '\r']).to_string();
+    if key.is_empty() {
+        bail!("stdin API key was empty");
+    }
+    Ok(key)
+}
+
+fn read_hidden_tty_key() -> Result<String> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    eprint!("API key (hidden, not saved to disk): ");
+    let _ = io::stderr().flush();
+    enable_raw_mode().context("enable raw mode for hidden key")?;
+    struct RawGuard;
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+    let _guard = RawGuard;
+    let mut buf = String::new();
+    loop {
+        match event::read() {
+            Ok(Event::Key(k)) => {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match k.code {
+                    KeyCode::Enter => break,
+                    KeyCode::Esc => {
+                        eprintln!();
+                        bail!("cancelled");
+                    }
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        eprintln!();
+                        bail!("cancelled");
+                    }
+                    KeyCode::Char(c) => buf.push(c),
+                    _ => {}
+                }
+            }
+            Ok(_) => {}
+            Err(e) => bail!("read hidden key: {e}"),
+        }
+    }
+    drop(_guard);
+    eprintln!();
+    if buf.is_empty() {
+        bail!("API key was empty");
+    }
+    Ok(buf)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelsCache {
+    pub base_url: String,
+    #[serde(default)]
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+pub fn models_cache_path(root: &Path) -> PathBuf {
+    state::config_dir(root).join("llm_models_cache.json")
+}
+
+pub fn load_models_cache(root: &Path) -> Option<ModelsCache> {
+    let path = models_cache_path(root);
+    let text = fs::read_to_string(path).ok()?;
+    let mut cache: ModelsCache = serde_json::from_str(&text).ok()?;
+    cache.base_url = normalize_base_url(&cache.base_url).ok()?;
+    cache.ids.retain(|id| {
+        let t = id.trim();
+        !t.is_empty() && t.len() <= MAX_MODEL_ID_LEN
+    });
+    if cache.ids.len() > MAX_MODELS {
+        cache.ids.truncate(MAX_MODELS);
+        cache.truncated = true;
+    }
+    Some(cache)
+}
+
+pub fn save_models_cache(root: &Path, cache: &ModelsCache) -> Result<()> {
+    let path = models_cache_path(root);
+    let json = serde_json::to_string_pretty(cache)?;
+    // Cache is ids only — never raw /models JSON or keys.
+    util::write_mode_0600(&path, format!("{json}\n").as_bytes())?;
+    Ok(())
+}
+
+pub fn validate_model_against_cache(root: &Path, base_url: &str, model: &str) -> Result<()> {
+    let Some(cache) = load_models_cache(root) else {
+        // No last fetch: allow (legacy `llm set`) and document re-fetch.
+        return Ok(());
+    };
+    let base = if base_url.is_empty() {
+        cache.base_url.clone()
+    } else {
+        normalize_base_url(base_url).unwrap_or_else(|_| base_url.to_string())
+    };
+    if !cache.base_url.is_empty() && cache.base_url != base {
+        return Ok(());
+    }
+    if cache.ids.iter().any(|id| id == model) {
+        return Ok(());
+    }
+    bail!(
+        "model '{model}' is not in the last fetched list ({} ids{}). \
+         Re-run: cloakcli llm models   or   cloakcli llm configure",
+        cache.ids.len(),
+        if cache.truncated { ", truncated" } else { "" }
+    );
+}
+
+pub fn format_models_list(list: &crate::llm_client::ModelsList) -> String {
+    let mut out = format!(
+        "models: {}  truncated={}  pages={}  GET {}\n",
+        list.ids.len(),
+        list.truncated,
+        list.pages,
+        list.url
+    );
+    for (i, id) in list.ids.iter().enumerate() {
+        out.push_str(&format!("  {:>3}. {id}\n", i + 1));
+    }
+    if list.truncated {
+        out.push_str(&format!(
+            "note: list truncated (caps: body {MAX_MODELS_BODY}B, count {MAX_MODELS}, id {MAX_MODEL_ID_LEN}, pages {MAX_MODELS_PAGES})\n"
+        ));
+    }
+    out
+}
+
+fn prompt_line(prompt: &str, default: &str) -> Result<String> {
+    eprint!("{prompt}");
+    if !default.is_empty() {
+        eprint!(" [{default}]");
+    }
+    eprint!(": ");
+    io::stderr().flush().ok();
+    let mut s = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut s)
+        .context("read prompt")?;
+    let t = s.trim().to_string();
+    if t.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(t)
+    }
+}
+
+fn pick_from_list(
+    ids: &[String],
+    model: Option<String>,
+    pick: Option<usize>,
+    interactive: bool,
+) -> Result<String> {
+    if let Some(m) = model {
+        let m = m.trim().to_string();
+        if ids.iter().any(|id| id == &m) {
+            return Ok(m);
+        }
+        bail!(
+            "model '{m}' is not in the fetched list ({} ids). Pass an id from `cloakcli llm models` or --pick N.",
+            ids.len()
+        );
+    }
+    if let Some(n) = pick {
+        if n == 0 || n > ids.len() {
+            bail!("--pick {n} out of range (1..={})", ids.len());
+        }
+        return Ok(ids[n - 1].clone());
+    }
+    if interactive && io::stdin().is_terminal() {
+        eprint!("select model 1-{} (or id): ", ids.len());
+        io::stderr().flush().ok();
+        let mut s = String::new();
+        io::stdin()
+            .lock()
+            .read_line(&mut s)
+            .context("read model pick")?;
+        let t = s.trim();
+        if t.is_empty() {
+            bail!("no model selected");
+        }
+        if let Ok(n) = t.parse::<usize>() {
+            if n == 0 || n > ids.len() {
+                bail!("pick {n} out of range (1..={})", ids.len());
+            }
+            return Ok(ids[n - 1].clone());
+        }
+        if ids.iter().any(|id| id == t) {
+            return Ok(t.to_string());
+        }
+        bail!("'{t}' is not in the fetched model list");
+    }
+    bail!("non-interactive configure requires --model ID or --pick N (1-based)");
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConfigureArgs {
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub pick: Option<usize>,
+    pub api_key_env: Option<String>,
+    pub stdin_key: bool,
+    pub enabled: Option<bool>,
+    pub recover_timeout_sec: Option<u64>,
+    pub allow_hosts: Option<Vec<String>>,
+}
+
+pub fn run_configure(root: &Path, args: ConfigureArgs) -> Result<LlmConfig> {
+    let interactive = io::stdin().is_terminal() && !args.stdin_key;
+    let existing = load(root)?;
+
+    let env_name = match args.api_key_env.as_deref() {
+        Some(e) => {
+            validate_env_name(e)?;
+            e.to_string()
+        }
+        None => existing
+            .as_ref()
+            .map(|c| c.api_key_env.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string()),
+    };
+
+    let base_url = match args.base_url.as_deref() {
+        Some(u) => normalize_base_url(u)?,
+        None if interactive => {
+            let def = existing
+                .as_ref()
+                .map(|c| c.base_url.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+            let entered = prompt_line("base_url (OpenAI-compatible /v1)", &def)?;
+            normalize_base_url(&entered)?
+        }
+        None => {
+            let from_cfg = existing
+                .as_ref()
+                .map(|c| c.base_url.clone())
+                .filter(|s| !s.is_empty());
+            match from_cfg {
+                Some(u) => normalize_base_url(&u)?,
+                None => bail!("configure requires --base-url (or a TTY to prompt)"),
+            }
+        }
+    };
+
+    let (key, source) = resolve_api_key(&env_name, args.stdin_key, interactive)?;
+    let _ = source;
+    let list = crate::llm_client::fetch_models(&base_url, &key).map_err(|e| {
+        anyhow::anyhow!("{}", redact_secrets(&e.to_string(), Some(&key)))
+    })?;
+    save_models_cache(
+        root,
+        &ModelsCache {
+            base_url: normalize_base_url(&base_url)?,
+            ids: list.ids.clone(),
+            truncated: list.truncated,
+        },
+    )?;
+    print!("{}", format_models_list(&list));
+
+    let model = pick_from_list(&list.ids, args.model, args.pick, interactive)?;
+
+    let cfg = apply_set(
+        root,
+        LlmSetArgs {
+            base_url: Some(base_url),
+            model: Some(model),
+            api_key_env: Some(env_name.clone()),
+            enabled: args.enabled,
+            recover_timeout_sec: args.recover_timeout_sec,
+            allow_hosts: args.allow_hosts,
+            ..Default::default()
+        },
+    )?;
+    eprintln!(
+        "key: stored api_key_env={env_name} only (not the secret). \
+         export {env_name} before worker/recover if it is not already in the environment."
+    );
+    Ok(cfg)
+}
+
+pub fn run_models(
+    root: &Path,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    stdin_key: bool,
+) -> Result<crate::llm_client::ModelsList> {
+    let interactive = io::stdin().is_terminal() && !stdin_key;
+    let existing = load(root)?;
+    let env_name = match api_key_env.as_deref() {
+        Some(e) => {
+            validate_env_name(e)?;
+            e.to_string()
+        }
+        None => existing
+            .as_ref()
+            .map(|c| c.api_key_env.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string()),
+    };
+    let base = match base_url.as_deref() {
+        Some(u) => normalize_base_url(u)?,
+        None => {
+            let u = existing
+                .as_ref()
+                .map(|c| c.base_url.clone())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no base_url — pass --base-url or run cloakcli llm configure")
+                })?;
+            normalize_base_url(&u)?
+        }
+    };
+    let (key, _) = resolve_api_key(&env_name, stdin_key, interactive)?;
+    let list = crate::llm_client::fetch_models(&base, &key)
+        .map_err(|e| anyhow::anyhow!("{}", redact_secrets(&e.to_string(), Some(&key))))?;
+    save_models_cache(
+        root,
+        &ModelsCache {
+            base_url: base,
+            ids: list.ids.clone(),
+            truncated: list.truncated,
+        },
+    )?;
+    Ok(list)
 }
 
 /// IPC wait for a worker cmd. `run_skill` must outlive recover_timeout_sec.
@@ -508,8 +1018,8 @@ fn strip_json_string_field(s: &str, field: &str) -> String {
 pub fn format_show(view: &LlmView) -> String {
     if !view.configured {
         return format!(
-            "llm: not configured\n  path: {}\n  hint: cloakcli llm set --base-url URL --model MODEL --api-key-env VAR\n",
-            view.path
+            "llm: not configured\n  path: {}\n  hint: cloakcli llm configure --base-url URL\n  key:  export {}  (or {}; never --api-key)\n",
+            view.path, DEFAULT_API_KEY_ENV, COMPAT_API_KEY_ENV
         );
     }
     let key = if view.key_present { "set" } else { "missing" };
@@ -617,7 +1127,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.to_string().contains("http"));
+        assert!(
+            err.to_string().contains("http") || err.to_string().contains("rejects"),
+            "{err}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -692,5 +1205,166 @@ mod tests {
             "example.com"
         );
         assert_eq!(normalize_host("*.example.com").unwrap(), "*.example.com");
+    }
+
+    #[test]
+    fn default_api_key_env_is_cloakcli() {
+        assert_eq!(LlmConfig::default().api_key_env, DEFAULT_API_KEY_ENV);
+        assert_eq!(DEFAULT_API_KEY_ENV, "CLOAKCLI_LLM_API_KEY");
+    }
+
+    #[test]
+    fn normalize_base_url_strips_slash_and_endpoints() {
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1/").unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1/models").unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1/chat/completions").unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1/v1").unwrap(),
+            "https://api.openai.com/v1"
+        );
+    }
+
+    #[test]
+    fn join_does_not_duplicate_v1() {
+        let base = "https://api.openai.com/v1";
+        assert_eq!(
+            join_openai_path(base, "models").unwrap(),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            join_openai_path(base, "/v1/models").unwrap(),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            join_openai_path(base, "chat/completions").unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            join_openai_path(base, "v1/chat/completions").unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            models_url(base).unwrap(),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            chat_completions_url(base).unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn rejects_javascript_and_data_urls() {
+        for u in ["javascript:alert(1)", "data:text/plain,hi", "file:///etc/passwd"] {
+            let err = validate_base_url(u).unwrap_err().to_string();
+            assert!(
+                err.contains("http") || err.contains("rejects"),
+                "{u}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_api_key_argv_does_not_echo_value() {
+        let err = reject_api_key_argv(["cloakcli", "llm", "configure", "--api-key", "sk-must-not-echo"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--api-key"));
+        assert!(err.contains("shell history"));
+        assert!(!err.contains("sk-must-not-echo"));
+        reject_api_key_argv(["cloakcli", "llm", "set", "--api-key-env", "CLOAKCLI_LLM_API_KEY"])
+            .unwrap();
+        let err2 = reject_api_key_argv(["--api-key=sk-equals-form-secret"])
+            .unwrap_err()
+            .to_string();
+        assert!(!err2.contains("sk-equals-form-secret"));
+    }
+
+    #[test]
+    fn set_model_validates_against_last_fetch() {
+        let root = tmp_root();
+        apply_set(
+            &root,
+            LlmSetArgs {
+                base_url: Some("https://api.example.com/v1".into()),
+                model: Some("vision".into()),
+                api_key_env: Some("CLOAKCLI_LLM_API_KEY".into()),
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        save_models_cache(
+            &root,
+            &ModelsCache {
+                base_url: "https://api.example.com/v1".into(),
+                ids: vec!["vision".into(), "other".into()],
+                truncated: false,
+            },
+        )
+        .unwrap();
+        apply_set(
+            &root,
+            LlmSetArgs {
+                model: Some("other".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = apply_set(
+            &root,
+            LlmSetArgs {
+                model: Some("not-in-list".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("last fetched"), "{err}");
+        assert!(!err.contains("sk-"));
+        let cache_text = fs::read_to_string(models_cache_path(&root)).unwrap();
+        assert!(!cache_text.contains("api_key"));
+        assert!(!cache_text.to_ascii_lowercase().contains("bearer"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn show_never_prints_env_value_or_raw_key_field() {
+        let root = tmp_root();
+        apply_set(
+            &root,
+            LlmSetArgs {
+                base_url: Some("https://api.example.com/v1".into()),
+                model: Some("vision".into()),
+                api_key_env: Some(DEFAULT_API_KEY_ENV.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        env::set_var(DEFAULT_API_KEY_ENV, "sk-super-secret-show-test");
+        let shown = format_show(&view(&root));
+        assert!(!shown.contains("sk-super-secret-show-test"));
+        assert!(!shown.to_ascii_lowercase().contains("sk-super"));
+        assert!(shown.contains(DEFAULT_API_KEY_ENV));
+        env::remove_var(DEFAULT_API_KEY_ENV);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_key_falls_back_to_openai_compat() {
+        env::remove_var(DEFAULT_API_KEY_ENV);
+        env::set_var(COMPAT_API_KEY_ENV, "sk-compat-only");
+        let v = resolve_api_key_from_env(DEFAULT_API_KEY_ENV).unwrap();
+        assert_eq!(v, "sk-compat-only");
+        env::remove_var(COMPAT_API_KEY_ENV);
     }
 }

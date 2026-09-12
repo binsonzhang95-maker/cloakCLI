@@ -780,7 +780,37 @@ fn hint_line(msg: &str) -> Line<'static> {
     ))
 }
 
-fn draw_config(f: &mut Frame, area: Rect, app: &App) {
+fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(14), Constraint::Length(10)])
+        .split(area);
+
+    let saved_model = if app.llm.model.is_empty() {
+        "(none)".to_string()
+    } else {
+        app.llm.model.clone()
+    };
+    let base_shown = if app.llm_draft_base_url.is_empty() {
+        app.llm.base_url.clone()
+    } else {
+        app.llm_draft_base_url.clone()
+    };
+    let env_name = if app.llm.api_key_env.is_empty() {
+        crate::llm::DEFAULT_API_KEY_ENV.to_string()
+    } else {
+        app.llm.api_key_env.clone()
+    };
+    let key_label = if app.llm.key_present {
+        if app.llm_session_key_set {
+            "session env set (not on disk)"
+        } else {
+            "set"
+        }
+    } else {
+        "missing"
+    };
+
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             "  Runtime defaults",
@@ -800,89 +830,50 @@ fn draw_config(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(INFO),
         ),
         kv("hub bind", app.hub_bind.clone(), Style::default().fg(INFO)),
-        kv(
-            "desired rev",
-            app.desired_rev.to_string(),
-            Style::default().fg(MUTED),
-        ),
-        kv(
-            "root",
-            truncate(&app.root.to_string_lossy(), 48),
-            Style::default().fg(INFO),
-        ),
-        kv(
-            "animations",
-            if app.animations_enabled {
-                "on"
-            } else {
-                "off (NO_COLOR / CLOAKCLI_ANIMATIONS)"
-            },
-            Style::default().fg(if app.animations_enabled { OK } else { MUTED }),
-        ),
         Line::from(""),
         Line::from(Span::styled(
-            "  LLM stall-recovery",
+            "  LLM (OpenAI-compatible · key strategy A)",
             Style::default()
                 .fg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-    ];
-    if !app.llm.configured {
-        lines.push(kv(
-            "llm",
-            "not configured (cloakcli llm set)",
-            Style::default().fg(MUTED),
-        ));
-    } else {
-        lines.push(kv(
-            "enabled",
+        kv(
+            "enabled [l]",
             if app.llm.enabled { "true" } else { "false" },
             Style::default().fg(if app.llm.enabled { OK } else { MUTED }),
-        ));
-        lines.push(kv(
-            "model",
-            truncate(&app.llm.model, 40),
+        ),
+        kv(
+            "saved model",
+            truncate(&saved_model, 40),
             Style::default().fg(INFO),
-        ));
-        lines.push(kv(
-            "base_url",
-            truncate(&app.llm.base_url, 42),
+        ),
+        kv(
+            "base_url [b]",
+            truncate(&base_shown, 42),
             Style::default().fg(INFO),
-        ));
-        lines.push(kv(
-            "api_key_env",
-            format!(
-                "{} ({})",
-                app.llm.api_key_env,
-                if app.llm.key_present { "set" } else { "missing" }
-            ),
+        ),
+        kv(
+            "api_key [K]",
+            format!("********  {key_label} · env {env_name}"),
             Style::default().fg(if app.llm.key_present { OK } else { WARN }),
-        ));
-        lines.push(kv(
-            "recover_timeout_sec",
-            app.llm.recover_timeout_sec.to_string(),
+        ),
+        kv(
+            "recover_timeout [t]",
+            format!("{}s", app.llm.recover_timeout_sec),
             Style::default().fg(INFO),
-        ));
-        let hosts = if app.llm.allow_hosts.is_empty() {
-            "(same origin only)".into()
-        } else {
-            app.llm.allow_hosts.join(",")
-        };
+        ),
+    ];
+    if let Some(err) = &app.llm_fetch_err {
         lines.push(kv(
-            "allow_hosts",
-            truncate(&hosts, 40),
-            Style::default().fg(MUTED),
+            "fetch",
+            truncate(err, 48),
+            Style::default().fg(ERR),
         ));
     }
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  Fleet protocol is a DEV STUB (plaintext token).",
-        Style::default().fg(PURPLE).add_modifier(Modifier::ITALIC),
-    )));
-    lines.push(Line::from(Span::styled(
-        "  Stealth ≠ anonymity guarantee. Key is env-only; never shown.",
-        Style::default().fg(MUTED),
+        "  Key is env-only (never saved). Failed fetch does not change saved model.",
+        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
     )));
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -892,7 +883,40 @@ fn draw_config(f: &mut Frame, area: Rect, app: &App) {
             app.animation_phase,
             app.animations_enabled,
         ));
-    f.render_widget(p, area);
+    f.render_widget(p, chunks[0]);
+
+    let items: Vec<ListItem> = if app.llm_models.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "  (f fetch models — GET {base}/models; Enter saves selected id)",
+            Style::default().fg(MUTED),
+        ))]
+    } else {
+        app.llm_models
+            .iter()
+            .map(|id| {
+                let mark = if *id == app.llm.model { " *" } else { "" };
+                ListItem::new(Span::styled(
+                    format!("  {id}{mark}"),
+                    Style::default().fg(FG),
+                ))
+            })
+            .collect()
+    };
+    let title = if app.llm_models_truncated {
+        format!("Models / 模型  ({} truncated)", app.llm_models.len())
+    } else {
+        format!("Models / 模型  ({})", app.llm_models.len())
+    };
+    let list = List::new(items)
+        .highlight_style(style_selected())
+        .highlight_symbol("▸ ")
+        .block(bordered(
+            &title,
+            true,
+            app.animation_phase,
+            app.animations_enabled,
+        ));
+    f.render_stateful_widget(list, chunks[1], &mut app.llm_model_state);
 }
 
 fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
@@ -973,9 +997,12 @@ fn context_help(tab: Tab) -> Vec<Span<'static>> {
         Tab::Sessions => help_bits(&[("x", "close session"), ("o", "open from Profiles")]),
         Tab::Clients => help_bits(&[("J", "submit remote job (skill@profile)")]),
         Tab::Config => help_bits(&[
-            ("h", "toggle headed"),
-            ("c/[ ]", "concurrency"),
-            ("l", "toggle llm recover"),
+            ("b", "base_url"),
+            ("K", "session key"),
+            ("f", "fetch models"),
+            ("Enter", "save model"),
+            ("t", "timeout"),
+            ("l", "toggle llm"),
         ]),
         Tab::Logs => {
             let mut s = vec![Span::styled("auto-refresh live", style_desc())];
@@ -1040,17 +1067,33 @@ fn draw_input_modal(f: &mut Frame, area: Rect, app: &App) {
             "Export cookies",
             "output path (required) → Enter · Esc cancel · mode 0600",
         ),
+        InputMode::LlmBaseUrl => (
+            "LLM base_url",
+            "http(s) OpenAI-compatible root (single /v1) → Enter · Esc cancel",
+        ),
+        InputMode::LlmApiKey => (
+            "LLM API key (masked)",
+            "sets session env only — never saved to llm.json or logs → Enter · Esc cancel",
+        ),
+        InputMode::LlmTimeout => (
+            "LLM recover_timeout_sec",
+            "5..=3600 → Enter · Esc cancel",
+        ),
     };
 
     let modal = centered_rect(64, 28, area);
     f.render_widget(Clear, modal);
 
+    let shown = match mode {
+        InputMode::LlmApiKey => format!("{}█", "*".repeat(app.input_buf.chars().count())),
+        _ => format!("{}█", app.input_buf),
+    };
     let body = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  > ", Style::default().fg(ACCENT)),
             Span::styled(
-                format!("{}█", app.input_buf),
+                shown,
                 Style::default()
                     .fg(FG)
                     .add_modifier(Modifier::BOLD),

@@ -196,13 +196,51 @@ pub enum FleetCmd {
 pub enum LlmCmd {
     /// Show config (never prints API keys or env values)
     Show,
+    /// Interactive OpenAI-compatible setup: fetch GET /models, pick id, write llm.json (0600).
+    ///
+    /// Key strategy A: llm.json stores api_key_env only (default CLOAKCLI_LLM_API_KEY).
+    /// Do not pass --api-key (shell history). Use env, TTY hidden prompt, or --stdin-key.
+    Configure {
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Model id from the fetched list (required when stdin is not a TTY)
+        #[arg(long)]
+        model: Option<String>,
+        /// 1-based index into the fetched list (alternative to --model)
+        #[arg(long)]
+        pick: Option<usize>,
+        /// Environment variable *name* that holds the API key (never a raw key)
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Read one line from stdin as the API key (not stored; sets process env)
+        #[arg(long)]
+        stdin_key: bool,
+        #[arg(long, group = "en")]
+        enabled: bool,
+        #[arg(long, group = "en")]
+        disabled: bool,
+        #[arg(long)]
+        recover_timeout_sec: Option<u64>,
+        #[arg(long)]
+        allow_hosts: Option<String>,
+    },
+    /// GET {base}/models and print ids (Bearer, timeouts, caps, redacted errors)
+    Models {
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        api_key_env: Option<String>,
+        #[arg(long)]
+        stdin_key: bool,
+    },
     /// Create or update config/llm.json (mode 0600). Pass --api-key-env NAME, never a raw key.
+    /// `--model` is checked against the last `llm models`/`configure` fetch when that cache exists.
     Set {
         #[arg(long)]
         base_url: Option<String>,
         #[arg(long)]
         model: Option<String>,
-        /// Environment variable *name* that holds the API key (e.g. OPENAI_API_KEY)
+        /// Environment variable *name* that holds the API key (e.g. CLOAKCLI_LLM_API_KEY)
         #[arg(long)]
         api_key_env: Option<String>,
         #[arg(long, group = "en")]
@@ -1042,6 +1080,54 @@ pub async fn handle_llm(root: &Path, action: LlmCmd) -> Result<()> {
             let v = crate::llm::view(root);
             print!("{}", crate::llm::format_show(&v));
         }
+        LlmCmd::Configure {
+            base_url,
+            model,
+            pick,
+            api_key_env,
+            stdin_key,
+            enabled,
+            disabled,
+            recover_timeout_sec,
+            allow_hosts,
+        } => {
+            let hosts = allow_hosts.map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            });
+            let en = if enabled {
+                Some(true)
+            } else if disabled {
+                Some(false)
+            } else {
+                None
+            };
+            crate::llm::run_configure(
+                root,
+                crate::llm::ConfigureArgs {
+                    base_url,
+                    model,
+                    pick,
+                    api_key_env,
+                    stdin_key,
+                    enabled: en,
+                    recover_timeout_sec,
+                    allow_hosts: hosts,
+                },
+            )?;
+            println!("wrote {} (mode 0600)", crate::llm::config_path(root).display());
+            print!("{}", crate::llm::format_show(&crate::llm::view(root)));
+        }
+        LlmCmd::Models {
+            base_url,
+            api_key_env,
+            stdin_key,
+        } => {
+            let list = crate::llm::run_models(root, base_url, api_key_env, stdin_key)?;
+            print!("{}", crate::llm::format_models_list(&list));
+        }
         LlmCmd::Set {
             base_url,
             model,
@@ -1097,7 +1183,7 @@ pub async fn handle_llm(root: &Path, action: LlmCmd) -> Result<()> {
         LlmCmd::Test => {
             let v = crate::llm::view(root);
             if !v.configured {
-                bail!("no config/llm.json — run: cloakcli llm set --base-url URL --model MODEL --api-key-env VAR");
+                bail!("no config/llm.json — run: cloakcli llm configure");
             }
             let extra_key = std::env::var(&v.api_key_env).ok();
             let resp = worker::oneshot(

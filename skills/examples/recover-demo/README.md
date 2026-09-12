@@ -11,8 +11,8 @@ Example skill for AI stall-recovery MVP.
 Requires:
 
 ```bash
-export OPENAI_API_KEY=...          # never stored in llm.json
-cloakcli llm set --base-url https://api.openai.com/v1 --model gpt-4o --api-key-env OPENAI_API_KEY --enabled
+export CLOAKCLI_LLM_API_KEY=...    # or OPENAI_API_KEY; never stored in llm.json; never --api-key
+cloakcli llm configure --base-url https://api.openai.com/v1 --model gpt-4o --enabled
 cloakcli skill run recover-demo --profile demo --headless
 ```
 

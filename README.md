@@ -199,12 +199,19 @@ Recover action whitelist (in-browser only):
 Recover **may** type into username/password form fields when the skill needs login. Trajectories and logs still never persist API keys, Authorization headers, raw `llm.json` secrets, or cookie **values**. Config keys stay env-var-only (`api_key_env`). See [`python/cloakcli_worker/recover/NOTES.md`](python/cloakcli_worker/recover/NOTES.md).
 
 ```bash
-cloakcli llm set --base-url https://api.openai.com/v1 --model gpt-4o --api-key-env OPENAI_API_KEY --recover-timeout-sec 300
+export CLOAKCLI_LLM_API_KEY=...          # or OPENAI_API_KEY (compat); never --api-key
+cloakcli llm configure --base-url https://api.openai.com/v1
+# non-interactive: --model gpt-4o   or   --pick 1
+# pipe key:        --stdin-key  (do not put the key on the command line)
+cloakcli llm models  # GET {base}/models — prints ids only
+cloakcli llm set --model gpt-4o   # checked against last fetch when cache exists
 cloakcli llm show    # never prints key values
 cloakcli llm test    # connectivity; redacts secrets
 ```
 
-`config/llm.json` is mode `0600` and stores the **env var name** only (`api_key_env`), never a raw key. Example skill: `skills/examples/recover-demo/`. TUI Config pane shows LLM status; `l` toggles `enabled`.
+`config/llm.json` is mode `0600` and stores the **env var name** only (`api_key_env`, default `CLOAKCLI_LLM_API_KEY`), never a raw key. `OPENAI_API_KEY` is a documented fallback when the default env is unset. `--api-key` as argv is rejected (shell history). `base_url` is http(s) only, trailing slash stripped, single `/v1` — CloakCLI calls `{base}/models` and `{base}/chat/completions` without duplicating `/v1`.
+
+TUI Config: `b` base_url, `K` masked session key (sets process env / `api_key_env`, **not** saved to disk), `f` fetch models, `jk`/`↑↓` select, Enter save model, `l` toggle enabled, `t` recover timeout. A failed fetch does not change the saved model. Example skill: `skills/examples/recover-demo/`.
 
 ## Security notes
 

@@ -28,7 +28,7 @@ Still **never** log or persist:
 
 - API keys
 - Authorization headers
-- raw `llm.json` secrets (config stores `api_key_env` only)
+- raw `llm.json` secrets (config stores `api_key_env` only, default `CLOAKCLI_LLM_API_KEY`; never `--api-key` argv)
 - cookie **values**
 
 ## Tests (Astra #4)

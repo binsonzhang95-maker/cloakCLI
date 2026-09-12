@@ -24,3 +24,6 @@ uuid = { version = "1", features = ["v4"] }
 which = "=6.0.3"
 home = "=0.5.9"
 throbber-widgets-tui = "=0.7.1"
+ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
+# rustc 1.85: url >=2.5.4 pulls idna/icu needing rustc 1.86+.
+url = "=2.5.0"

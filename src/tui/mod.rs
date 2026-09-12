@@ -87,6 +87,9 @@ enum InputMode {
     EditProxy,
     CookieImport,
     CookieExport,
+    LlmBaseUrl,
+    LlmApiKey,
+    LlmTimeout,
 }
 
 /// Real waits that may show a throbber. Idle / input / error do not.
@@ -97,6 +100,7 @@ enum BusyKind {
     SkillRun,
     HubConnect,
     SessionsLoad,
+    LlmFetch,
 }
 
 impl BusyKind {
@@ -107,6 +111,7 @@ impl BusyKind {
             BusyKind::SkillRun => "running skill",
             BusyKind::HubConnect => "connecting hub",
             BusyKind::SessionsLoad => "loading sessions",
+            BusyKind::LlmFetch => "fetching models",
         }
     }
 }
@@ -122,6 +127,10 @@ enum PendingDone {
         log: String,
         status: String,
         sessions: Result<Vec<SessionRow>, String>,
+    },
+    LlmModels {
+        result: Result<crate::llm_client::ModelsList, String>,
+        saved_model: String,
     },
 }
 
@@ -151,6 +160,12 @@ struct App {
     headed: bool,
     concurrency: usize,
     llm: LlmView,
+    llm_draft_base_url: String,
+    llm_session_key_set: bool,
+    llm_models: Vec<String>,
+    llm_models_truncated: bool,
+    llm_model_state: ListState,
+    llm_fetch_err: Option<String>,
     hub: SharedHub,
     hub_bind: String,
     hub_bind_ok: bool,
@@ -192,6 +207,12 @@ impl App {
             headed: fleet_cfg.default_headed || state::default_headed(),
             concurrency: fleet_cfg.default_concurrency.max(1),
             llm: llm::view(root),
+            llm_draft_base_url: String::new(),
+            llm_session_key_set: false,
+            llm_models: Vec::new(),
+            llm_models_truncated: false,
+            llm_model_state: ListState::default(),
+            llm_fetch_err: None,
             hub,
             hub_bind,
             hub_bind_ok: false,
@@ -325,6 +346,54 @@ impl App {
                 self.clear_busy();
                 self.status = status;
             }
+            PendingDone::LlmModels {
+                result,
+                saved_model,
+            } => {
+                self.clear_busy();
+                match result {
+                    Ok(list) => {
+                        self.llm_fetch_err = None;
+                        self.llm_models = list.ids;
+                        self.llm_models_truncated = list.truncated;
+                        if let Some(pos) = self
+                            .llm_models
+                            .iter()
+                            .position(|id| id == &saved_model)
+                        {
+                            self.llm_model_state.select(Some(pos));
+                        } else if !self.llm_models.is_empty() {
+                            self.llm_model_state.select(Some(0));
+                        }
+                        let _ = llm::save_models_cache(
+                            &self.root,
+                            &llm::ModelsCache {
+                                base_url: self.llm_draft_base_url.clone(),
+                                ids: self.llm_models.clone(),
+                                truncated: self.llm_models_truncated,
+                            },
+                        );
+                        // Fetch must not change the saved model.
+                        self.llm = llm::view(&self.root);
+                        let n = self.llm_models.len();
+                        self.status = format!(
+                            "fetched {n} models{}",
+                            if list.truncated { " (truncated)" } else { "" }
+                        );
+                        self.log(format!(
+                            "llm models fetched n={n} truncated={} (saved model unchanged)",
+                            list.truncated
+                        ));
+                    }
+                    Err(e) => {
+                        let e = llm::redact_secrets(&e, None);
+                        self.llm_fetch_err = Some(e.clone());
+                        self.llm = llm::view(&self.root);
+                        self.status = format!("llm fetch failed: {e}");
+                        self.log(format!("llm fetch failed: {e}"));
+                    }
+                }
+            }
         }
     }
 
@@ -363,6 +432,33 @@ impl App {
         }
 
         self.llm = llm::view(&self.root);
+        if self.llm_draft_base_url.is_empty() {
+            self.llm_draft_base_url = if self.llm.base_url.is_empty() {
+                llm::DEFAULT_BASE_URL.to_string()
+            } else {
+                self.llm.base_url.clone()
+            };
+        }
+        if self.llm_models.is_empty() {
+            if let Some(cache) = llm::load_models_cache(&self.root) {
+                if cache.base_url.is_empty()
+                    || cache.base_url == self.llm_draft_base_url
+                    || cache.base_url == self.llm.base_url
+                {
+                    self.llm_models = cache.ids;
+                    self.llm_models_truncated = cache.truncated;
+                    if let Some(pos) = self
+                        .llm_models
+                        .iter()
+                        .position(|id| id == &self.llm.model)
+                    {
+                        self.llm_model_state.select(Some(pos));
+                    } else if !self.llm_models.is_empty() {
+                        self.llm_model_state.select(Some(0));
+                    }
+                }
+            }
+        }
         self.ensure_selections();
         Ok(())
     }
@@ -433,6 +529,18 @@ impl App {
                     None
                 } else {
                     Some(self.client_rows.len() - 1)
+                });
+            }
+        }
+        if self.llm_model_state.selected().is_none() && !self.llm_models.is_empty() {
+            self.llm_model_state.select(Some(0));
+        }
+        if let Some(i) = self.llm_model_state.selected() {
+            if i >= self.llm_models.len() {
+                self.llm_model_state.select(if self.llm_models.is_empty() {
+                    None
+                } else {
+                    Some(self.llm_models.len() - 1)
                 });
             }
         }
@@ -720,10 +828,120 @@ impl App {
         Ok(())
     }
 
+    fn start_llm_base_url(&mut self) {
+        self.input_mode = Some(InputMode::LlmBaseUrl);
+        self.input_buf = if self.llm_draft_base_url.is_empty() {
+            llm::DEFAULT_BASE_URL.to_string()
+        } else {
+            self.llm_draft_base_url.clone()
+        };
+        self.status = "llm base_url — http(s) OpenAI-compatible /v1".into();
+    }
+
+    fn start_llm_api_key(&mut self) {
+        self.input_mode = Some(InputMode::LlmApiKey);
+        self.input_buf.clear();
+        self.status = "llm API key (masked, session env only — not saved to disk)".into();
+    }
+
+    fn start_llm_timeout(&mut self) {
+        self.input_mode = Some(InputMode::LlmTimeout);
+        self.input_buf = self.llm.recover_timeout_sec.to_string();
+        self.status = "llm recover_timeout_sec (5..=3600)".into();
+    }
+
+    fn begin_llm_fetch(&mut self) {
+        let base = if self.llm_draft_base_url.is_empty() {
+            self.llm.base_url.clone()
+        } else {
+            self.llm_draft_base_url.clone()
+        };
+        if base.is_empty() {
+            self.status = "llm: set base_url first (b)".into();
+            return;
+        }
+        let env_name = if self.llm.api_key_env.is_empty() {
+            llm::DEFAULT_API_KEY_ENV.to_string()
+        } else {
+            self.llm.api_key_env.clone()
+        };
+        let Some(key) = llm::resolve_api_key_from_env(&env_name) else {
+            self.status = format!("llm: session key missing — press K or export {env_name}");
+            self.llm_fetch_err = Some(self.status.clone());
+            return;
+        };
+        let saved_model = self.llm.model.clone();
+        self.llm_fetch_err = None;
+        self.set_busy(BusyKind::LlmFetch);
+        self.pending = Some(tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::llm_client::fetch_models(&base, &key)
+                    .map_err(|e| llm::redact_secrets(&e.to_string(), Some(&key)))
+            })
+            .await;
+            PendingDone::LlmModels {
+                result: match result {
+                    Ok(Ok(list)) => Ok(list),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(format!("fetch join: {e}")),
+                },
+                saved_model,
+            }
+        }));
+    }
+
+    fn save_selected_llm_model(&mut self) -> Result<()> {
+        let Some(i) = self.llm_model_state.selected() else {
+            self.status = "llm: fetch models (f) then select one".into();
+            return Ok(());
+        };
+        let Some(model) = self.llm_models.get(i).cloned() else {
+            self.status = "llm: fetch models (f) then select one".into();
+            return Ok(());
+        };
+        let prev = self.llm.model.clone();
+        let base = if self.llm_draft_base_url.is_empty() {
+            self.llm.base_url.clone()
+        } else {
+            self.llm_draft_base_url.clone()
+        };
+        let env_name = if self.llm.api_key_env.is_empty() {
+            llm::DEFAULT_API_KEY_ENV.to_string()
+        } else {
+            self.llm.api_key_env.clone()
+        };
+        match llm::apply_set(
+            &self.root,
+            llm::LlmSetArgs {
+                base_url: Some(base),
+                model: Some(model.clone()),
+                api_key_env: Some(env_name),
+                enabled: if self.llm.configured {
+                    None
+                } else {
+                    Some(true)
+                },
+                ..Default::default()
+            },
+        ) {
+            Ok(_) => {
+                self.llm = llm::view(&self.root);
+                self.status = format!("llm model saved: {model}");
+                self.log(format!("llm model saved: {model} (key not written)"));
+            }
+            Err(e) => {
+                let e = llm::redact_secrets(&e.to_string(), None);
+                self.llm = llm::view(&self.root);
+                self.status = format!("llm save failed (model unchanged={prev}): {e}");
+                self.log(format!("llm save failed: {e}"));
+            }
+        }
+        Ok(())
+    }
+
     fn commit_input(&mut self) -> Result<()> {
         let mode = self.input_mode.take();
-        let buf = self.input_buf.clone();
-        self.input_buf.clear();
+        let buf = std::mem::take(&mut self.input_buf);
         match mode {
             Some(InputMode::NewProfile) => {
                 let name = buf.trim();
@@ -795,6 +1013,106 @@ impl App {
                     st.cookie_count
                 ));
                 self.status = format!("cookies exported {name}");
+            }
+            Some(InputMode::LlmBaseUrl) => {
+                let raw = buf.trim();
+                if raw.is_empty() {
+                    self.status = "cancelled".into();
+                    return Ok(());
+                }
+                match llm::normalize_base_url(raw) {
+                    Ok(u) => {
+                        self.llm_draft_base_url = u.clone();
+                        if self.llm.configured && !self.llm.model.is_empty() {
+                            match llm::apply_set(
+                                &self.root,
+                                llm::LlmSetArgs {
+                                    base_url: Some(u.clone()),
+                                    ..Default::default()
+                                },
+                            ) {
+                                Ok(_) => {
+                                    self.llm = llm::view(&self.root);
+                                    self.log(format!("llm base_url saved: {u}"));
+                                }
+                                Err(e) => {
+                                    self.log(format!("llm base_url draft only: {e}"));
+                                }
+                            }
+                        }
+                        self.status = format!("llm base_url={u}");
+                    }
+                    Err(e) => {
+                        self.status = format!("llm base_url: {e}");
+                    }
+                }
+            }
+            Some(InputMode::LlmApiKey) => {
+                // Masked value is session env only. Never write to llm.json / logs.
+                let key = buf;
+                if key.is_empty() {
+                    self.status = "cancelled".into();
+                    return Ok(());
+                }
+                let env_name = if self.llm.api_key_env.is_empty() {
+                    llm::DEFAULT_API_KEY_ENV.to_string()
+                } else {
+                    self.llm.api_key_env.clone()
+                };
+                std::env::set_var(&env_name, &key);
+                drop(key);
+                self.llm_session_key_set = true;
+                if self.llm.configured {
+                    let _ = llm::apply_set(
+                        &self.root,
+                        llm::LlmSetArgs {
+                            api_key_env: Some(env_name.clone()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                self.llm = llm::view(&self.root);
+                self.status = format!(
+                    "session env {env_name} set (not saved to disk; restart worker for recover)"
+                );
+                self.log(format!(
+                    "llm: session key set for {env_name} (not persisted)"
+                ));
+            }
+            Some(InputMode::LlmTimeout) => {
+                let raw = buf.trim();
+                if raw.is_empty() {
+                    self.status = "cancelled".into();
+                    return Ok(());
+                }
+                match raw.parse::<u64>() {
+                    Ok(t) if (5..=3600).contains(&t) => {
+                        if self.llm.configured {
+                            match llm::apply_set(
+                                &self.root,
+                                llm::LlmSetArgs {
+                                    recover_timeout_sec: Some(t),
+                                    ..Default::default()
+                                },
+                            ) {
+                                Ok(_) => {
+                                    self.llm = llm::view(&self.root);
+                                    self.status = format!("llm recover_timeout_sec={t}");
+                                    self.log(format!("llm recover_timeout_sec={t}"));
+                                }
+                                Err(e) => {
+                                    self.status = format!("llm timeout: {e}");
+                                }
+                            }
+                        } else {
+                            self.status =
+                                format!("timeout {t} remembered; save a model to persist");
+                        }
+                    }
+                    _ => {
+                        self.status = "llm recover_timeout_sec must be 5..=3600".into();
+                    }
+                }
             }
             None => {}
         }
@@ -996,6 +1314,26 @@ async fn event_loop(
                             }
                         }
                     }
+                    KeyCode::Char('b') => {
+                        if app.tab == Tab::Config {
+                            app.start_llm_base_url();
+                        }
+                    }
+                    KeyCode::Char('K') => {
+                        if app.tab == Tab::Config {
+                            app.start_llm_api_key();
+                        }
+                    }
+                    KeyCode::Char('f') => {
+                        if app.tab == Tab::Config {
+                            app.begin_llm_fetch();
+                        }
+                    }
+                    KeyCode::Char('t') => {
+                        if app.tab == Tab::Config {
+                            app.start_llm_timeout();
+                        }
+                    }
                     KeyCode::Char('h') | KeyCode::Char('H') => {
                         app.headed = !app.headed;
                         let _ = fleet::update_defaults(&app.root, None, Some(app.headed));
@@ -1060,7 +1398,12 @@ async fn event_loop(
                     KeyCode::Down | KeyCode::Char('j') => move_sel(app, 1),
                     KeyCode::Up | KeyCode::Char('k') => move_sel(app, -1),
                     KeyCode::Enter => {
-                        if let Err(e) = app.begin_skill_run() {
+                        if app.tab == Tab::Config {
+                            if let Err(e) = app.save_selected_llm_model() {
+                                app.log(format!("llm save: {e}"));
+                                app.status = format!("err: {e}");
+                            }
+                        } else if let Err(e) = app.begin_skill_run() {
                             app.log(format!("run error: {e}"));
                             app.status = format!("err: {e}");
                         }
@@ -1135,6 +1478,7 @@ mod tests {
         assert_eq!(BusyKind::SkillRun.label(), "running skill");
         assert_eq!(BusyKind::HubConnect.label(), "connecting hub");
         assert_eq!(BusyKind::SessionsLoad.label(), "loading sessions");
+        assert_eq!(BusyKind::LlmFetch.label(), "fetching models");
     }
 }
 
@@ -1144,6 +1488,7 @@ fn move_sel(app: &mut App, delta: i32) {
         Tab::Skills => (app.skill_rows.len(), &mut app.skill_state),
         Tab::Sessions => (app.session_rows.len(), &mut app.session_state),
         Tab::Clients => (app.client_rows.len(), &mut app.client_state),
+        Tab::Config => (app.llm_models.len(), &mut app.llm_model_state),
         _ => return,
     };
     if len == 0 {

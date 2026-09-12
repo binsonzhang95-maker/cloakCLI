@@ -7,6 +7,7 @@ mod fleet;
 mod jobs;
 mod locks;
 mod llm;
+mod llm_client;
 mod master_hub;
 mod profiles;
 mod protocol;
@@ -22,6 +23,9 @@ use cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Reject --api-key *before* clap so the value is never interpolated into
+    // "unexpected argument" errors (shell history / process list still saw it).
+    llm::reject_api_key_argv(std::env::args())?;
     let cli = Cli::parse();
     let root = state::project_root()?;
 

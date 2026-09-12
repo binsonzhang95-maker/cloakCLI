@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,15 @@ DEFAULT_RECOVER_TIMEOUT_SEC = 300
 DEFAULT_MAX_ACTIONS = 120
 DEFAULT_MAX_LOOPS = 60
 DEFAULT_MAX_TOKENS = 200_000
+DEFAULT_API_KEY_ENV = "CLOAKCLI_LLM_API_KEY"
+COMPAT_API_KEY_ENV = "OPENAI_API_KEY"
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+MAX_MODELS_BODY = 1_048_576
+MAX_MODELS = 256
+MAX_MODEL_ID_LEN = 128
+MAX_MODELS_PAGES = 5
+MODELS_CONNECT_TIMEOUT_SEC = 10
+MODELS_READ_TIMEOUT_SEC = 20
 
 
 @dataclass
@@ -21,7 +31,7 @@ class LlmConfig:
     enabled: bool = False
     base_url: str = ""
     model: str = ""
-    api_key_env: str = "OPENAI_API_KEY"
+    api_key_env: str = DEFAULT_API_KEY_ENV
     recover_timeout_sec: float = DEFAULT_RECOVER_TIMEOUT_SEC
     allow_hosts: list[str] = field(default_factory=list)
     max_actions: int = DEFAULT_MAX_ACTIONS
@@ -64,11 +74,7 @@ def load_llm_config(root: Path | None = None) -> LlmConfig | None:
 
 
 def parse_llm_config(data: dict[str, Any], *, path: str = "") -> LlmConfig:
-    base_url = str(data.get("base_url") or "").strip().rstrip("/")
-    if base_url:
-        parsed = urlparse(base_url)
-        if parsed.scheme not in ("http", "https"):
-            base_url = ""
+    base_url = normalize_base_url(str(data.get("base_url") or ""))
     timeout = data.get("recover_timeout_sec", DEFAULT_RECOVER_TIMEOUT_SEC)
     try:
         timeout_f = float(timeout)
@@ -93,9 +99,9 @@ def parse_llm_config(data: dict[str, Any], *, path: str = "") -> LlmConfig:
             v = default
         return max(lo, min(hi, v if v else default))
 
-    api_key_env = str(data.get("api_key_env") or "OPENAI_API_KEY").strip()
+    api_key_env = str(data.get("api_key_env") or DEFAULT_API_KEY_ENV).strip()
     if not _valid_env_name(api_key_env):
-        api_key_env = "OPENAI_API_KEY"
+        api_key_env = DEFAULT_API_KEY_ENV
 
     return LlmConfig(
         enabled=bool(data.get("enabled", False)),
@@ -111,6 +117,70 @@ def parse_llm_config(data: dict[str, Any], *, path: str = "") -> LlmConfig:
         ),
         path=path,
     )
+
+
+def normalize_base_url(url: str) -> str:
+    """http(s) only, strip trailing slash, drop endpoint suffixes, collapse /v1/v1."""
+    s = (url or "").strip()
+    if not s:
+        return ""
+    lower = s.lower()
+    if lower.startswith(("file:", "javascript:", "data:")):
+        return ""
+    parsed = urlparse(s)
+    if parsed.scheme not in ("http", "https"):
+        return ""
+    if any(c.isspace() for c in s):
+        return ""
+    s = s.rstrip("/")
+    changed = True
+    while changed:
+        changed = False
+        low = s.lower()
+        for suffix in ("/chat/completions", "/completions", "/models"):
+            if low.endswith(suffix):
+                s = s[: -len(suffix)].rstrip("/")
+                changed = True
+                break
+    while "/v1/v1" in s.lower():
+        idx = s.lower().rfind("/v1/v1")
+        s = s[:idx] + "/v1" + s[idx + 6 :]
+    return s
+
+
+def join_openai_path(base: str, path: str) -> str:
+    """Build `{base}/{path}` without duplicating a trailing `/v1`."""
+    base = normalize_base_url(base)
+    if not base:
+        return ""
+    path = (path or "").strip().lstrip("/")
+    if not path:
+        return base
+    if base.lower().endswith("/v1") and (
+        path.lower() == "v1" or path.lower().startswith("v1/")
+    ):
+        rest = path[3:] if path.lower().startswith("v1/") else ""
+        return f"{base}/{rest}" if rest else base
+    return f"{base}/{path}"
+
+
+def models_url(base: str) -> str:
+    return join_openai_path(base, "models")
+
+
+def chat_completions_url(base: str) -> str:
+    return join_openai_path(base, "chat/completions")
+
+
+def resolve_api_key(cfg: LlmConfig) -> str:
+    """Env named in api_key_env, with OPENAI_API_KEY fallback for the default name."""
+    name = cfg.api_key_env or DEFAULT_API_KEY_ENV
+    v = os.environ.get(name) or ""
+    if v:
+        return v
+    if name == DEFAULT_API_KEY_ENV:
+        return os.environ.get(COMPAT_API_KEY_ENV) or ""
+    return ""
 
 
 def _valid_env_name(name: str) -> bool:
