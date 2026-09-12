@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::cookies::{self, CookieFormat};
@@ -87,6 +88,42 @@ enum InputMode {
     CookieExport,
 }
 
+/// Real waits that may show a throbber. Idle / input / error do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BusyKind {
+    WorkerStart,
+    WorkerRefresh,
+    SkillRun,
+    HubConnect,
+    SessionsLoad,
+}
+
+impl BusyKind {
+    fn label(self) -> &'static str {
+        match self {
+            BusyKind::WorkerStart => "starting worker",
+            BusyKind::WorkerRefresh => "refreshing worker",
+            BusyKind::SkillRun => "running skill",
+            BusyKind::HubConnect => "connecting hub",
+            BusyKind::SessionsLoad => "loading sessions",
+        }
+    }
+}
+
+enum PendingDone {
+    HubConnect { ok: bool },
+    WorkerStart { result: Result<(), String> },
+    Sessions {
+        rows: Result<Vec<SessionRow>, String>,
+        done_status: String,
+    },
+    SkillRun {
+        log: String,
+        status: String,
+        sessions: Result<Vec<SessionRow>, String>,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct SessionRow {
     id: String,
@@ -119,7 +156,13 @@ struct App {
     input_mode: Option<InputMode>,
     input_buf: String,
     last_refresh: Instant,
+    last_anim: Instant,
     logged_invalid_skills: bool,
+    animation_phase: u32,
+    animations_enabled: bool,
+    busy: Option<BusyKind>,
+    pending: Option<JoinHandle<PendingDone>>,
+    throbber_state: throbber_widgets_tui::ThrobberState,
 }
 
 impl App {
@@ -148,15 +191,138 @@ impl App {
             concurrency: fleet_cfg.default_concurrency.max(1),
             hub,
             hub_bind,
-            hub_bind_ok: true,
+            hub_bind_ok: false,
             desired_rev: 1,
             input_mode: None,
             input_buf: String::new(),
             last_refresh: Instant::now(),
+            last_anim: Instant::now(),
             logged_invalid_skills: false,
+            animation_phase: 0,
+            animations_enabled: detect_animations_enabled(),
+            busy: None,
+            pending: None,
+            throbber_state: throbber_widgets_tui::ThrobberState::default(),
         };
         app.reload_static()?;
         Ok(app)
+    }
+
+    fn set_busy(&mut self, kind: BusyKind) {
+        self.busy = Some(kind);
+        self.status = kind.label().into();
+    }
+
+    fn clear_busy(&mut self) {
+        self.busy = None;
+        self.pending = None;
+    }
+
+    fn tick_animation(&mut self) {
+        if !self.animations_enabled {
+            return;
+        }
+        if self.last_anim.elapsed() < Duration::from_millis(90) {
+            return;
+        }
+        self.last_anim = Instant::now();
+        self.animation_phase = self.animation_phase.wrapping_add(1);
+        if self.busy.is_some() {
+            self.throbber_state.calc_next();
+        }
+    }
+
+    fn start_boot(&mut self) {
+        self.set_busy(BusyKind::HubConnect);
+        let ctrl = master_hub::control_sock_path(&self.root);
+        self.pending = Some(tokio::spawn(async move {
+            PendingDone::HubConnect {
+                ok: wait_hub_ready(ctrl).await,
+            }
+        }));
+    }
+
+    fn begin_worker_start(&mut self) {
+        self.set_busy(BusyKind::WorkerStart);
+        let root = self.root.clone();
+        self.pending = Some(tokio::spawn(async move {
+            PendingDone::WorkerStart {
+                result: worker::ensure_daemon(&root)
+                    .await
+                    .map_err(|e| e.to_string()),
+            }
+        }));
+    }
+
+    fn begin_sessions_load(&mut self, kind: BusyKind, done_status: &str) {
+        self.set_busy(kind);
+        let root = self.root.clone();
+        let done_status = done_status.to_string();
+        self.pending = Some(tokio::spawn(async move {
+            PendingDone::Sessions {
+                rows: list_sessions_async(&root)
+                    .await
+                    .map_err(|e| e.to_string()),
+                done_status,
+            }
+        }));
+    }
+
+    fn apply_sessions_result(&mut self, rows: Result<Vec<SessionRow>, String>) {
+        match rows {
+            Ok(rows) => {
+                if rows.is_empty() {
+                    self.session_rows.clear();
+                    self.sessions_hint =
+                        Some("(no open browser sessions on local daemon)".into());
+                } else {
+                    self.session_rows = rows;
+                    self.sessions_hint = None;
+                }
+            }
+            Err(e) => {
+                self.session_rows.clear();
+                self.sessions_hint = Some(format!("(sessions error: {e})"));
+            }
+        }
+        self.ensure_selections();
+        self.last_refresh = Instant::now();
+    }
+
+    fn apply_pending(&mut self, done: PendingDone) {
+        match done {
+            PendingDone::HubConnect { ok } => {
+                self.hub_bind_ok = ok;
+                if ok {
+                    self.log(format!("hub listening {}", self.hub_bind));
+                } else {
+                    self.log(format!("hub {} not ready", self.hub_bind));
+                }
+                self.begin_worker_start();
+            }
+            PendingDone::WorkerStart { result } => {
+                match result {
+                    Ok(()) => self.log("worker daemon ready"),
+                    Err(e) => self.log(format!("worker start: {e}")),
+                }
+                self.begin_sessions_load(BusyKind::SessionsLoad, "ready");
+            }
+            PendingDone::Sessions { rows, done_status } => {
+                self.apply_sessions_result(rows);
+                self.clear_busy();
+                self.status = done_status;
+            }
+            PendingDone::SkillRun {
+                log,
+                status,
+                sessions,
+            } => {
+                self.log(log);
+                self.apply_sessions_result(sessions);
+                self.clear_busy();
+                self.status = status;
+            }
+        }
     }
 
     fn log(&mut self, msg: impl Into<String>) {
@@ -308,7 +474,7 @@ impl App {
         self.ensure_selections();
     }
 
-    async fn run_selected_local(&mut self) -> Result<()> {
+    fn begin_skill_run(&mut self) -> Result<()> {
         let Some(profile_name) = self.selected_profile_name() else {
             self.status = "select a profile first".into();
             self.log("no profile selected");
@@ -319,51 +485,71 @@ impl App {
             self.log("no skill selected");
             return Ok(());
         };
-        self.status = format!("local run {skill_name}@{profile_name}…");
-        self.log(format!(
-            "local skill={skill_name} profile={profile_name} headed={}",
-            self.headed
-        ));
         let prof = profiles::get(&self.root, &profile_name)?;
         let skill = skills::get(&self.root, &skill_name)?;
-        let _lock =
-            crate::locks::ProfileLock::acquire(&self.root, &prof.name, Duration::from_secs(300))
+        let cookie_file = cookies::cookie_file_for_open(&self.root, &prof.name)?;
+        let root = self.root.clone();
+        let headed = self.headed;
+        let prof_name = prof.name.clone();
+        let skill_name_owned = skill.name.clone();
+        let proxy = prof.proxy.clone();
+        let user_data_dir = prof.user_data_dir.clone();
+        let skill_path = skill.path.join("skill.json").to_string_lossy().to_string();
+        let root_str = self.root.to_string_lossy().to_string();
+        self.log(format!(
+            "local skill={skill_name} profile={profile_name} headed={headed}"
+        ));
+        self.set_busy(BusyKind::SkillRun);
+        self.status = format!("running {skill_name}@{profile_name}");
+        self.pending = Some(tokio::spawn(async move {
+            let outcome = async {
+                let _lock = crate::locks::ProfileLock::acquire(
+                    &root,
+                    &prof_name,
+                    Duration::from_secs(300),
+                )
                 .await?;
-        let resp = worker::oneshot(
-            &self.root,
-            Request {
-                id: worker::next_id(),
-                cmd: "run_skill".into(),
-                profile: Some(prof.name.clone()),
-                url: None,
-                headed: Some(self.headed),
-                skill: Some(skill.name.clone()),
-                vars: Some(serde_json::json!({})),
-                session: None,
-                proxy: prof.proxy.clone(),
-                user_data_dir: Some(prof.user_data_dir.clone()),
-                skill_path: Some(skill.path.join("skill.json").to_string_lossy().to_string()),
-                root: Some(self.root.to_string_lossy().to_string()),
-                cookie_file: cookies::cookie_file_for_open(&self.root, &prof.name)?,
-            },
-        )
-        .await;
-        match resp {
-            Ok(r) if r.ok => {
-                self.log(format!("OK {}", r.data.unwrap_or_default()));
-                self.status = "ok".into();
+                worker::oneshot(
+                    &root,
+                    Request {
+                        id: worker::next_id(),
+                        cmd: "run_skill".into(),
+                        profile: Some(prof_name.clone()),
+                        url: None,
+                        headed: Some(headed),
+                        skill: Some(skill_name_owned.clone()),
+                        vars: Some(serde_json::json!({})),
+                        session: None,
+                        proxy,
+                        user_data_dir: Some(user_data_dir),
+                        skill_path: Some(skill_path),
+                        root: Some(root_str),
+                        cookie_file,
+                    },
+                )
+                .await
             }
-            Ok(r) => {
-                let err = r.error.unwrap_or_else(|| "failed".into());
-                self.log(format!("FAIL {err}"));
-                self.status = format!("fail: {err}");
+            .await;
+            let (log, status) = match outcome {
+                Ok(r) if r.ok => (
+                    format!("OK {}", r.data.unwrap_or_default()),
+                    "ok".into(),
+                ),
+                Ok(r) => {
+                    let err = r.error.unwrap_or_else(|| "failed".into());
+                    (format!("FAIL {err}"), format!("fail: {err}"))
+                }
+                Err(e) => (format!("ERR {e}"), format!("err: {e}")),
+            };
+            let sessions = list_sessions_async(&root)
+                .await
+                .map_err(|e| e.to_string());
+            PendingDone::SkillRun {
+                log,
+                status,
+                sessions,
             }
-            Err(e) => {
-                self.log(format!("ERR {e}"));
-                self.status = format!("err: {e}");
-            }
-        }
-        self.refresh_sessions().await;
+        }));
         Ok(())
     }
 
@@ -685,8 +871,6 @@ pub async fn run(root: &Path) -> Result<()> {
         }
     });
 
-    let _ = worker::ensure_daemon(root).await;
-
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -694,7 +878,7 @@ pub async fn run(root: &Path) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(root, hub, bind)?;
-    app.refresh_sessions().await;
+    app.start_boot();
     let result = event_loop(&mut terminal, &mut app).await;
 
     disable_raw_mode()?;
@@ -712,14 +896,38 @@ async fn event_loop(
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
 
-        // Auto-refresh sessions/clients ~every 2s while idle
-        if app.input_mode.is_none() && app.last_refresh.elapsed() >= Duration::from_secs(2) {
+        if app.pending.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Some(handle) = app.pending.take() {
+                match handle.await {
+                    Ok(done) => app.apply_pending(done),
+                    Err(e) => {
+                        app.clear_busy();
+                        app.log(format!("task join: {e}"));
+                        app.status = format!("err: {e}");
+                    }
+                }
+            }
+        }
+
+        // Auto-refresh sessions/clients ~every 2s while idle (no throbber)
+        if app.busy.is_none()
+            && app.input_mode.is_none()
+            && app.last_refresh.elapsed() >= Duration::from_secs(2)
+        {
             app.refresh_live().await;
         }
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                if app.busy.is_some() {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        _ => {}
+                    }
                     continue;
                 }
 
@@ -766,9 +974,8 @@ async fn event_loop(
                     KeyCode::Char('6') => app.tab = Tab::Logs,
                     KeyCode::Char('r') => {
                         let _ = app.reload_static();
-                        app.refresh_sessions().await;
                         app.log("reloaded");
-                        app.status = "reloaded".into();
+                        app.begin_sessions_load(BusyKind::WorkerRefresh, "reloaded");
                     }
                     KeyCode::Char('h') | KeyCode::Char('H') => {
                         app.headed = !app.headed;
@@ -834,7 +1041,7 @@ async fn event_loop(
                     KeyCode::Down | KeyCode::Char('j') => move_sel(app, 1),
                     KeyCode::Up | KeyCode::Char('k') => move_sel(app, -1),
                     KeyCode::Enter => {
-                        if let Err(e) = app.run_selected_local().await {
+                        if let Err(e) = app.begin_skill_run() {
                             app.log(format!("run error: {e}"));
                             app.status = format!("err: {e}");
                         }
@@ -843,8 +1050,73 @@ async fn event_loop(
                 }
             }
         }
+
+        app.tick_animation();
     }
     Ok(())
+}
+
+/// Honor `NO_COLOR` (any value) and `CLOAKCLI_ANIMATIONS=0/false/off`.
+fn detect_animations_enabled() -> bool {
+    animations_enabled_from(
+        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var("CLOAKCLI_ANIMATIONS").ok().as_deref(),
+    )
+}
+
+fn animations_enabled_from(no_color: bool, cloakcli_animations: Option<&str>) -> bool {
+    if no_color {
+        return false;
+    }
+    match cloakcli_animations {
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "false" | "off" | "no" | "disable" | "disabled")
+        }
+        None => true,
+    }
+}
+
+async fn wait_hub_ready(ctrl: PathBuf) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if ctrl.exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn animations_disabled_when_no_color_set() {
+        assert!(!animations_enabled_from(true, None));
+        assert!(!animations_enabled_from(true, Some("1")));
+    }
+
+    #[test]
+    fn animations_follow_cloakcli_animations_env() {
+        assert!(animations_enabled_from(false, None));
+        assert!(animations_enabled_from(false, Some("1")));
+        assert!(animations_enabled_from(false, Some("on")));
+        assert!(!animations_enabled_from(false, Some("0")));
+        assert!(!animations_enabled_from(false, Some("false")));
+        assert!(!animations_enabled_from(false, Some("OFF")));
+        assert!(!animations_enabled_from(false, Some("no")));
+    }
+
+    #[test]
+    fn busy_kind_labels_describe_the_wait() {
+        assert_eq!(BusyKind::WorkerStart.label(), "starting worker");
+        assert_eq!(BusyKind::WorkerRefresh.label(), "refreshing worker");
+        assert_eq!(BusyKind::SkillRun.label(), "running skill");
+        assert_eq!(BusyKind::HubConnect.label(), "connecting hub");
+        assert_eq!(BusyKind::SessionsLoad.label(), "loading sessions");
+    }
 }
 
 fn move_sel(app: &mut App, delta: i32) {

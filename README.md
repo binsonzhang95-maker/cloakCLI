@@ -59,6 +59,8 @@ cloakcli doctor
 | `CLOAKCLI_IPC_TIMEOUT` | Worker/daemon IPC timeout (seconds) |
 | `CLOAKCLI_MASTER_BIND` | Master listen addr (default `127.0.0.1:7750`) |
 | `CLOAKCLI_MASTER_TOKEN` | **Dev stub** shared token (plaintext). NOT production auth |
+| `NO_COLOR` | Disable TUI shimmer/throbber (static busy text still shown) |
+| `CLOAKCLI_ANIMATIONS=0` | Same as `NO_COLOR` for TUI animation (`false`/`off`/`no` also work) |
 
 ## Quick start
 
@@ -91,7 +93,7 @@ cloakcli master job-state --job-id <id>
 
 ### TUI keys
 
-Ops-console layout: **header** (version / DEV STUB / headed / concurrency / hub) → **tabs** → **list+detail** → **context help** → **status**. Forms open as a centered modal.
+Ops-console layout: **header** (shimmering `CloakCLI` / version / DEV STUB / headed / concurrency / hub) → **tabs** → **list+detail** → **context help** → **status**. Forms open as a centered modal. Lightweight shimmer on the brand, current pane title, and short busy text; ASCII `| / - \` throbber only while starting/refreshing the worker, running a skill, connecting the hub, or loading sessions. `NO_COLOR` or `CLOAKCLI_ANIMATIONS=0` freezes animation but still shows `[busy]` plus the wait reason.
 
 | Key | Action |
 |-----|--------|
@@ -107,6 +109,7 @@ Ops-console layout: **header** (version / DEV STUB / headed / concurrency / hub)
 | `c` or `[` `]` | Concurrency + / − / + |
 | `r` | Reload profiles/skills |
 | (idle) | Sessions + clients auto-refresh ~2s |
+| (busy) | Throbber + status text during worker/hub/skill/sessions waits |
 
 Cookie **values** and full proxy credentials never appear in the TUI (status chips / `redact_proxy` only).
 

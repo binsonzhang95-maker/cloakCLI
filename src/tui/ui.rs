@@ -18,7 +18,10 @@ const BG: Color = Color::Rgb(22, 22, 24);
 const SURFACE: Color = Color::Rgb(30, 30, 30);
 const FG: Color = Color::Rgb(230, 230, 230);
 const MUTED: Color = Color::Rgb(120, 120, 128);
-const ACCENT: Color = Color::Rgb(217, 119, 87); // coral-orange brand
+const ACCENT: Color = Color::Rgb(217, 119, 87); // coral-orange brand / active
+const ACCENT_HOT: Color = Color::Rgb(255, 176, 148); // shimmer peak
+const ACCENT_MID: Color = Color::Rgb(196, 108, 78); // version / key status
+const ACCENT_DIM: Color = Color::Rgb(138, 76, 56); // borders / separators
 const INFO: Color = Color::Rgb(96, 165, 250);
 const PURPLE: Color = Color::Rgb(167, 139, 250);
 const OK: Color = Color::Rgb(74, 222, 128);
@@ -60,18 +63,147 @@ fn pill(text: impl AsRef<str>, bg: Color) -> Span<'static> {
             .add_modifier(Modifier::BOLD),
     )
 }
-fn bordered(title: &str, focused: bool) -> Block<'static> {
-    let border_fg = if focused { ACCENT } else { MUTED };
-    let title_style = if focused {
-        style_title()
-    } else {
-        Style::default().fg(MUTED).bg(BG)
-    };
+fn bordered(title: &str, focused: bool, phase: u32, animations_enabled: bool) -> Block<'static> {
+    let border_fg = if focused { ACCENT_DIM } else { MUTED };
+    let title_line = pane_title_line(title, focused, phase, animations_enabled);
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_fg))
-        .title(Span::styled(format!(" {title} "), title_style))
+        .title(title_line)
         .style(Style::default().bg(BG).fg(FG))
+}
+
+fn pane_title_line(title: &str, focused: bool, phase: u32, animations_enabled: bool) -> Line<'static> {
+    if !focused {
+        return Line::from(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(MUTED).bg(BG),
+        ));
+    }
+    let mut spans = vec![Span::raw(" ")];
+    if animations_enabled {
+        spans.extend(shimmer_spans(title, phase, style_title()));
+    } else {
+        spans.push(Span::styled(title.to_string(), style_title()));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+/// Lightweight warm-orange highlight that sweeps across `text`.
+/// Brightness + bold only — no invert, no hue flash, no full-screen scroll.
+fn shimmer_spans(text: &str, phase: u32, base_style: Style) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let n = chars.len();
+    let period = (n + 3).max(1);
+    let head = (phase as usize) % period;
+    let band = 2usize;
+    let peak = shimmer_highlight_style(base_style);
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for (i, ch) in chars.into_iter().enumerate() {
+        let style = if i >= head && i < head.saturating_add(band) {
+            peak
+        } else {
+            base_style
+        };
+        match cur {
+            Some(s) if s == style => buf.push(ch),
+            Some(s) => {
+                out.push(Span::styled(std::mem::take(&mut buf), s));
+                buf.push(ch);
+                cur = Some(style);
+            }
+            None => {
+                buf.push(ch);
+                cur = Some(style);
+            }
+        }
+    }
+    if let Some(s) = cur {
+        if !buf.is_empty() {
+            out.push(Span::styled(buf, s));
+        }
+    }
+    out
+}
+
+fn shimmer_highlight_style(base: Style) -> Style {
+    let fg = match base.fg {
+        Some(Color::Rgb(r, g, b)) => Color::Rgb(
+            r.saturating_add(38).min(255),
+            g.saturating_add(48).min(255),
+            b.saturating_add(36).min(255),
+        ),
+        Some(c) => c,
+        None => ACCENT_HOT,
+    };
+    base.fg(fg).add_modifier(Modifier::BOLD)
+}
+
+/// ASCII `| / - \` spinner via throbber-widgets-tui (ratatui 0.28). Static `[busy]` when off.
+fn draw_throbber(app: &App) -> Vec<Span<'static>> {
+    let Some(kind) = app.busy else {
+        return Vec::new();
+    };
+    let label = if app.status.is_empty() {
+        kind.label().to_string()
+    } else {
+        app.status.clone()
+    };
+    let mut spans = vec![Span::raw(" ")];
+    if app.animations_enabled {
+        let throb = throbber_widgets_tui::Throbber::default()
+            .throbber_set(throbber_widgets_tui::ASCII)
+            .use_type(throbber_widgets_tui::WhichUse::Spin)
+            .throbber_style(
+                Style::default()
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            );
+        let sym = throb.to_symbol_span(&app.throbber_state);
+        spans.push(Span::styled(sym.content.to_string(), sym.style));
+        spans.extend(shimmer_spans(
+            &label,
+            app.animation_phase,
+            Style::default().fg(ACCENT).bg(BG),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "[busy] ",
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(label, Style::default().fg(FG).bg(BG)));
+    }
+    spans
+}
+
+fn throbber_symbol(app: &App) -> Span<'static> {
+    if !app.animations_enabled {
+        return Span::styled(
+            "[busy]",
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let throb = throbber_widgets_tui::Throbber::default()
+        .throbber_set(throbber_widgets_tui::ASCII)
+        .use_type(throbber_widgets_tui::WhichUse::Spin)
+        .throbber_style(
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        );
+    let sym = throb.to_symbol_span(&app.throbber_state);
+    Span::styled(sym.content.to_string(), sym.style)
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -93,7 +225,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    draw_header(f, chunks[0], app);
+    draw_top_bar(f, chunks[0], app);
     draw_tabs(f, chunks[1], app);
     draw_main(f, chunks[2], app);
     draw_footer(f, chunks[3], app);
@@ -104,13 +236,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, app: &App) {
+fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
     let headed_pill = if app.headed {
         pill("HEADED", WARN)
     } else {
         pill("HEADLESS", MUTED)
     };
-    let conc_pill = pill(format!("conc:{}", app.concurrency), ACCENT);
+    let conc_pill = pill(format!("conc:{}", app.concurrency), ACCENT_MID);
     let stub = pill("DEV STUB", PURPLE);
     let hub_ok = app.hub_bind_ok;
     let hub_span = if hub_ok {
@@ -119,32 +251,42 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         pill(format!("hub {}?", app.hub_bind), WARN)
     };
 
-    let line = Line::from(vec![
-        Span::styled(
-            " CloakCLI ",
-            Style::default()
-                .fg(ACCENT)
-                .bg(BG)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("v{} ", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(MUTED),
-        ),
-        stub,
-        Span::raw("  "),
-        headed_pill,
-        Span::raw(" "),
-        conc_pill,
-        Span::raw("  "),
-        hub_span,
-        Span::styled("  │ master control plane", Style::default().fg(MUTED)),
-    ]);
+    let brand_style = Style::default()
+        .fg(ACCENT)
+        .bg(BG)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::raw(" ")];
+    if app.animations_enabled {
+        spans.extend(shimmer_spans("CloakCLI", app.animation_phase, brand_style));
+    } else {
+        spans.push(Span::styled("CloakCLI", brand_style));
+    }
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        format!("v{} ", env!("CARGO_PKG_VERSION")),
+        Style::default().fg(ACCENT_MID),
+    ));
+    spans.push(stub);
+    spans.push(Span::raw("  "));
+    spans.push(headed_pill);
+    spans.push(Span::raw(" "));
+    spans.push(conc_pill);
+    spans.push(Span::raw("  "));
+    spans.push(hub_span);
+    spans.push(Span::styled("  │ ", Style::default().fg(ACCENT_DIM)));
+    spans.push(Span::styled(
+        "master control plane",
+        Style::default().fg(ACCENT_DIM),
+    ));
+    if app.busy.is_some() {
+        spans.push(Span::raw(" "));
+        spans.push(throbber_symbol(app));
+    }
 
-    let p = Paragraph::new(line).block(
+    let p = Paragraph::new(Line::from(spans)).block(
         Block::bordered()
             .border_type(BorderType::Double)
-            .border_style(Style::default().fg(ACCENT))
+            .border_style(Style::default().fg(ACCENT_DIM))
             .style(Style::default().bg(BG)),
     );
     f.render_widget(p, area);
@@ -155,17 +297,21 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let label = format!(" {} {} ", i + 1, t.title_bilingual());
+            let label = format!("{} {}", i + 1, t.title_bilingual());
             if *t == app.tab {
-                Line::from(Span::styled(
-                    label,
-                    Style::default()
-                        .fg(ON_PILL)
-                        .bg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ))
+                let mut spans = vec![Span::raw(" ")];
+                if app.animations_enabled {
+                    spans.extend(shimmer_spans(label.as_str(), app.animation_phase, style_selected()));
+                } else {
+                    spans.push(Span::styled(label, style_selected()));
+                }
+                spans.push(Span::raw(" "));
+                Line::from(spans)
             } else {
-                Line::from(Span::styled(label, Style::default().fg(MUTED)))
+                Line::from(Span::styled(
+                    format!(" {label} "),
+                    Style::default().fg(MUTED),
+                ))
             }
         })
         .collect();
@@ -356,7 +502,12 @@ fn draw_list_pane(f: &mut Frame, area: Rect, app: &mut App) {
         Tab::Clients => &mut app.client_state,
         _ => {
             // unreachable for split panes
-            let list = List::new(items).block(bordered(title, true));
+            let list = List::new(items).block(bordered(
+                title,
+                true,
+                app.animation_phase,
+                app.animations_enabled,
+            ));
             f.render_widget(list, area);
             return;
         }
@@ -378,7 +529,12 @@ fn draw_list_pane(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let list = List::new(items)
-        .block(bordered(title, true))
+        .block(bordered(
+            title,
+            true,
+            app.animation_phase,
+            app.animations_enabled,
+        ))
         .highlight_style(style_selected())
         .highlight_symbol(" ▸ ");
     f.render_stateful_widget(list, area, state);
@@ -402,7 +558,12 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App) {
 
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .block(bordered("Detail / 详情", false))
+        .block(bordered(
+            "Detail / 详情",
+            false,
+            app.animation_phase,
+            app.animations_enabled,
+        ))
         .style(style_normal());
     f.render_widget(p, area);
 }
@@ -649,6 +810,15 @@ fn draw_config(f: &mut Frame, area: Rect, app: &App) {
             truncate(&app.root.to_string_lossy(), 48),
             Style::default().fg(INFO),
         ),
+        kv(
+            "animations",
+            if app.animations_enabled {
+                "on"
+            } else {
+                "off (NO_COLOR / CLOAKCLI_ANIMATIONS)"
+            },
+            Style::default().fg(if app.animations_enabled { OK } else { MUTED }),
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "  Fleet protocol is a DEV STUB (plaintext token).",
@@ -661,7 +831,12 @@ fn draw_config(f: &mut Frame, area: Rect, app: &App) {
     ];
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .block(bordered("Config / 配置", true));
+        .block(bordered(
+            "Config / 配置",
+            true,
+            app.animation_phase,
+            app.animations_enabled,
+        ));
     f.render_widget(p, area);
 }
 
@@ -687,7 +862,12 @@ fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
     let title = format!("Logs / 日志  ({} entries, latest at bottom)", app.logs.len());
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .block(bordered(&title, true));
+        .block(bordered(
+            &title,
+            true,
+            app.animation_phase,
+            app.animations_enabled,
+        ));
     f.render_widget(p, area);
 }
 
@@ -751,6 +931,13 @@ fn context_help(tab: Tab) -> Vec<Span<'static>> {
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    if app.busy.is_some() {
+        let p = Paragraph::new(Line::from(draw_throbber(app)))
+            .alignment(Alignment::Left)
+            .style(Style::default().bg(BG).fg(ACCENT));
+        f.render_widget(p, area);
+        return;
+    }
     let (fg, bg) = status_colors(&app.status);
     let text = format!(" {} ", app.status);
     let p = Paragraph::new(Span::styled(
@@ -863,5 +1050,57 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let t: String = s.chars().take(max - 1).collect();
         format!("{t}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect_text(spans: &[Span<'_>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn shimmer_spans_preserve_text() {
+        let style = Style::default().fg(ACCENT);
+        let spans = shimmer_spans("CloakCLI", 0, style);
+        assert_eq!(collect_text(&spans), "CloakCLI");
+        assert!(!spans.is_empty());
+        for s in &spans {
+            assert!(!s.style.add_modifier.contains(Modifier::REVERSED));
+            assert!(!s.style.sub_modifier.contains(Modifier::REVERSED));
+        }
+    }
+
+    #[test]
+    fn shimmer_highlight_moves_with_phase() {
+        let style = Style::default().fg(ACCENT);
+        let a = shimmer_spans("CloakCLI", 0, style);
+        let b = shimmer_spans("CloakCLI", 3, style);
+        assert_eq!(collect_text(&a), collect_text(&b));
+        // Peak style should sit on different characters as phase advances.
+        let peak = shimmer_highlight_style(style);
+        let peak_a: String = a
+            .iter()
+            .filter(|s| s.style.fg == peak.fg)
+            .map(|s| s.content.as_ref())
+            .collect();
+        let peak_b: String = b
+            .iter()
+            .filter(|s| s.style.fg == peak.fg)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_ne!(peak_a, peak_b);
+    }
+
+    #[test]
+    fn shimmer_empty_text() {
+        assert!(shimmer_spans("", 4, Style::default()).is_empty());
+    }
+
+    #[test]
+    fn ascii_throbber_set_is_pipe_slash_dash_backslash() {
+        assert_eq!(throbber_widgets_tui::ASCII.symbols, &["|", "/", "-", "\\"]);
     }
 }

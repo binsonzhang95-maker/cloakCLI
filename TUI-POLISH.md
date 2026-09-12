@@ -4,12 +4,12 @@ Visual / UX pass on the master TUI so it reads as a **control plane**, not a bar
 
 ## Files
 
-- `src/tui/mod.rs` — app state, keybindings, actions, ~2s live refresh
-- `src/tui/ui.rs` — dark theme rendering (header / tabs / split / footer / status / modal)
+- `src/tui/mod.rs` — app state, keybindings, actions, ~2s live refresh, animation tick, busy waits
+- `src/tui/ui.rs` — dark theme rendering (header / tabs / split / footer / status / modal) + lightweight shimmer/throbber
 
 ## Layout
 
-1. **Header** (double coral-orange border): `CloakCLI` title + `vX.Y.Z` + purple **DEV STUB** + amber/muted headed pill + orange `conc:N` + info-blue hub bind
+1. **Header** (double dim-orange border): `CloakCLI` brand (shimmer) + mid-orange `vX.Y.Z` + purple **DEV STUB** + amber/muted headed pill + `conc:N` + hub bind. Three-level warm-orange: brand/active brightest, version/status mid, border/separator dim.
 2. **Tab bar**: Profiles | Skills | Sessions | Clients | Config | Logs — active tab coral-orange inverted; numbered `1`–`6`
 3. **Main**: list **60%** + detail **40%** (Config/Logs full-width)
 4. **Footer**: context-sensitive key help for the current tab (not a wall of text)
@@ -67,6 +67,20 @@ Claude Code–inspired **rich multi-color dark theme** (`Color::Rgb`, not flat c
 
 - Target: rustc 1.85 / `ratatui = 0.28.1` APIs only (`Block::bordered`, `BorderType::{Rounded,Double}`, `Clear`, `title_bottom`)
 - `cargo build` OK; CLI subcommands untouched
+
+## Animation (MVP)
+
+Hand-rolled shimmer (~50 lines in `ui.rs`) — **not** `tui-shimmer`, **no** ratatui upgrade. Sweeps a 2-cell brightness/bold highlight across:
+
+- `CloakCLI` brand
+- current pane title (active tab + focused list/config/logs title)
+- short busy status text
+
+ASCII throbber (`| / - \`) via `throbber-widgets-tui = 0.7.1` (verified single `ratatui 0.28.1`). Shown **only** during real waits: worker start/refresh, skill run, hub connect, sessions load. Idle, input modal, and error states stay static.
+
+- Tick: existing ~100ms event-loop poll (`animation_phase` + throbber step)
+- Off: `NO_COLOR` (any value) or `CLOAKCLI_ANIMATIONS=0/false/off` — static titles remain; busy still prints `[busy] starting worker` (etc.)
+- Animation is never the only signal — status text always says what is waiting
 
 ## README
 
