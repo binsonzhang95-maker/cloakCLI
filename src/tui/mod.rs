@@ -400,6 +400,9 @@ impl App {
                     }
                     Err(e) => {
                         let e = llm::redact_secrets(&e, None);
+                        // Same-base refetch failure must drop the picker so Enter
+                        // cannot persist ids from the previous successful fetch.
+                        self.clear_llm_models_list();
                         self.llm_fetch_err = Some(e.clone());
                         self.llm = llm::view(&self.root);
                         self.status = format!("llm fetch failed: {e}");
@@ -452,7 +455,11 @@ impl App {
                 self.llm.base_url.clone()
             };
         }
-        if self.llm_models.is_empty() {
+        // Do not revive a list we just invalidated (in-flight fetch or last fetch failed).
+        if self.llm_models.is_empty()
+            && self.llm_fetch_err.is_none()
+            && self.busy != Some(BusyKind::LlmFetch)
+        {
             if let Some(cache) = llm::load_models_cache(&self.root) {
                 let draft = self.current_llm_base();
                 if llm::models_bound_to_request_base(&cache.base_url, &draft) {
@@ -871,9 +878,11 @@ impl App {
     }
 
     fn clear_llm_models_list(&mut self) {
-        self.llm_models.clear();
-        self.llm_models_truncated = false;
-        self.llm_models_base_url.clear();
+        invalidate_llm_picker(
+            &mut self.llm_models,
+            &mut self.llm_models_truncated,
+            &mut self.llm_models_base_url,
+        );
         self.llm_model_state.select(None);
     }
 
@@ -899,6 +908,8 @@ impl App {
         };
         let saved_model = self.llm.model.clone();
         let requested_base = base.clone();
+        // Drop ids before the request so mid-fetch Enter cannot save a stale model.
+        self.clear_llm_models_list();
         self.llm_fetch_err = None;
         self.set_busy(BusyKind::LlmFetch);
         self.pending = Some(tokio::spawn(async move {
@@ -921,9 +932,7 @@ impl App {
 
     fn save_selected_llm_model(&mut self) -> Result<()> {
         let base = self.current_llm_base();
-        if self.llm_models.is_empty()
-            || !llm::models_bound_to_request_base(&self.llm_models_base_url, &base)
-        {
+        if !llm_picker_can_save(&self.llm_models, &self.llm_models_base_url, &base) {
             self.status = "llm: fetch models (f) for this base_url before saving".into();
             return Ok(());
         }
@@ -1241,6 +1250,9 @@ async fn event_loop(
                 match handle.await {
                     Ok(done) => app.apply_pending(done),
                     Err(e) => {
+                        if app.busy == Some(BusyKind::LlmFetch) {
+                            app.clear_llm_models_list();
+                        }
                         app.clear_busy();
                         app.log(format!("task join: {e}"));
                         app.status = format!("err: {e}");
@@ -1468,6 +1480,18 @@ async fn wait_hub_ready(ctrl: PathBuf) -> bool {
     false
 }
 
+/// Enter may persist a picker id only after a successful fetch for this base.
+fn llm_picker_can_save(ids: &[String], list_base: &str, current_base: &str) -> bool {
+    !ids.is_empty() && llm::models_bound_to_request_base(list_base, current_base)
+}
+
+/// Drop in-memory picker ids (fetch start or failed refetch).
+fn invalidate_llm_picker(ids: &mut Vec<String>, truncated: &mut bool, list_base: &mut String) {
+    ids.clear();
+    *truncated = false;
+    list_base.clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1503,11 +1527,34 @@ mod tests {
     fn changing_base_unbinds_stale_model_list() {
         let old = "https://api.example.com/v1";
         let new = "https://other.example.com/v1";
-        let ids = ["stale-model"];
-        let can_save = !ids.is_empty() && llm::models_bound_to_request_base(old, new);
-        assert!(!can_save);
-        assert!(llm::models_bound_to_request_base(old, old));
-        assert!(!llm::models_bound_to_request_base("", new));
+        let ids = vec!["stale-model".to_string()];
+        assert!(!llm_picker_can_save(&ids, old, new));
+        assert!(llm_picker_can_save(&ids, old, old));
+        assert!(!llm_picker_can_save(&ids, "", new));
+    }
+
+    #[test]
+    fn same_base_refetch_start_and_failure_invalidate_picker() {
+        let base = "https://api.example.com/v1";
+        let mut ids = vec!["stale-model".to_string()];
+        let mut truncated = true;
+        let mut list_base = base.to_string();
+        assert!(llm_picker_can_save(&ids, &list_base, base));
+
+        // Start of fetch (same base_url): list must not remain saveable.
+        invalidate_llm_picker(&mut ids, &mut truncated, &mut list_base);
+        assert!(ids.is_empty());
+        assert!(!truncated);
+        assert!(list_base.is_empty());
+        assert!(!llm_picker_can_save(&ids, &list_base, base));
+
+        // Simulate a previous successful list still sitting in memory, then fail.
+        ids = vec!["stale-model".to_string()];
+        truncated = false;
+        list_base = base.to_string();
+        assert!(llm_picker_can_save(&ids, &list_base, base));
+        invalidate_llm_picker(&mut ids, &mut truncated, &mut list_base);
+        assert!(!llm_picker_can_save(&ids, &list_base, base));
     }
 }
 
