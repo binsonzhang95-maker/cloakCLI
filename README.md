@@ -60,7 +60,7 @@ cloakcli doctor
 | `CLOAKCLI_HOME` | Project root override |
 | `CLOAKCLI_HEADED=1` | Default headed |
 | `CLOAKCLI_PYTHON` | Python binary |
-| `CLOAKCLI_IPC_TIMEOUT` | Worker/daemon IPC timeout (seconds) |
+| `CLOAKCLI_IPC_TIMEOUT` | Worker/daemon IPC timeout (seconds); skill runs extend to recover budget + 60s when LLM recover is enabled |
 | `CLOAKCLI_MASTER_BIND` | Master listen addr (default `127.0.0.1:7750`) |
 | `CLOAKCLI_MASTER_TOKEN` | **Dev stub** shared token (plaintext). NOT production auth |
 | `NO_COLOR` | Disable TUI shimmer/throbber (static busy text still shown) |
@@ -110,6 +110,7 @@ Ops-console layout: **header** (shimmering `CloakCLI` / version / DEV STUB / hea
 | `n` / `e` | New profile / edit proxy (modal) |
 | `i` / `E` / `C` | Import / export / clear **cookies** (Profiles pane; modal for paths) |
 | `h` | Toggle headed default |
+| `l` | Config pane: toggle LLM stall-recover `enabled` |
 | `c` or `[` `]` | Concurrency + / − / + |
 | `r` | Reload profiles/skills |
 | (idle) | Sessions + clients auto-refresh ~2s |
@@ -163,8 +164,35 @@ TUI Profiles pane shows cookie status; keys `i` / `E` / `C` = import path / expo
 }
 ```
 
-Actions: `goto` `click` `type`/`fill` `wait` `screenshot` `extract_text`.  
+Actions: `goto` `click` `type`/`fill` `wait` `screenshot` `extract_text` `assert`.  
 `{{var}}` substitution errors if undefined; required `params` are validated.
+
+Optional stall-recovery fields (inherit skill → step; default `on_stall` is `fail`):
+
+```json
+{
+  "on_stall": "recover",
+  "steps": [
+    {
+      "action": "click",
+      "selector": "#maybe-missing",
+      "timeout": 4000,
+      "goal": "Click the More information link",
+      "on_stall": "recover"
+    }
+  ]
+}
+```
+
+On timeout / selector / assertion failure with `on_stall: recover`, the Python worker keeps the **existing** Playwright page, takes a screenshot + compact DOM summary, and asks one OpenAI-compatible vision model (`chat/completions` + `image_url`) for JSON actions: `click` `type`/`fill` `scroll` `wait` `goto` `done` `fail` `ask_human`. Default recover wall-clock budget is **300 seconds** (`recover_timeout_sec`). No host filesystem read, no shell/code exec. `goto` stays on the task start origin unless `allow_hosts` lists extra hosts; `file:` / `javascript:` / `data:` are rejected.
+
+```bash
+cloakcli llm set --base-url https://api.openai.com/v1 --model gpt-4o --api-key-env OPENAI_API_KEY --recover-timeout-sec 300
+cloakcli llm show    # never prints key values
+cloakcli llm test    # connectivity; redacts secrets
+```
+
+`config/llm.json` is mode `0600` and stores the **env var name** only (`api_key_env`), never a raw key. Example skill: `skills/examples/recover-demo/`. TUI Config pane shows LLM status; `l` toggles `enabled`.
 
 ## Security notes
 
@@ -183,6 +211,8 @@ Box uses **rustc 1.85** — keep `ratatui=0.28.1` / pinned `instability`/`darlin
 
 ```bash
 cargo build
+cargo test
+PYTHONPATH=python python3 -m unittest discover -s python/tests -v
 cloakcli doctor
 PYTHONPATH=python python3 -m cloakcli_worker serve --root "$PWD" --socket data/worker.sock
 ```

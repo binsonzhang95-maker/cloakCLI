@@ -36,5 +36,8 @@ def ok(req_id: str, data: Any = None) -> dict[str, Any]:
     return {"id": req_id, "ok": True, "data": data if data is not None else {}}
 
 
-def err(req_id: str, message: str) -> dict[str, Any]:
-    return {"id": req_id, "ok": False, "error": message}
+def err(req_id: str, message: str, data: Any = None) -> dict[str, Any]:
+    resp: dict[str, Any] = {"id": req_id, "ok": False, "error": message}
+    if data is not None:
+        resp["data"] = data
+    return resp

@@ -1,5 +1,10 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// Strict name for profiles / skills: 1-64 chars, start alphanumeric, then [A-Za-z0-9._-].
 pub fn validate_name(name: &str, kind: &str) -> Result<()> {
@@ -111,6 +116,46 @@ fn normalize_and_check(root_canon: &Path, path: &Path) -> Result<PathBuf> {
         );
     }
     Ok(out)
+}
+
+/// Atomic-ish write with mode 0600 (config/secrets). Never world-readable.
+pub fn write_mode_0600(path: &Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create parent {}", parent.display()))?;
+    }
+    let fname = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(".{fname}.tmp.{}", uuid::Uuid::new_v4().simple()));
+
+    {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("open temp {}", tmp.display()))?;
+        f.write_all(data)
+            .with_context(|| format!("write temp {}", tmp.display()))?;
+        f.sync_all().ok();
+    }
+
+    fs::rename(&tmp, path).with_context(|| {
+        let _ = fs::remove_file(&tmp);
+        format!("rename {} → {}", tmp.display(), path.display())
+    })?;
+
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(())
 }
 
 /// Redact credentials in proxy URLs: `scheme://user:pass@host` → `scheme://***:***@host`

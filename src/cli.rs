@@ -67,6 +67,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: FleetCmd,
     },
+    /// Vision LLM stall-recovery config (`config/llm.json`, key via env var name only)
+    Llm {
+        #[command(subcommand)]
+        action: LlmCmd,
+    },
     /// Check Rust binary, Python worker, cloakbrowser, daemon
     Doctor,
 }
@@ -185,6 +190,40 @@ pub enum FleetCmd {
         #[arg(long, group = "mode")]
         headless: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LlmCmd {
+    /// Show config (never prints API keys or env values)
+    Show,
+    /// Create or update config/llm.json (mode 0600). Pass --api-key-env NAME, never a raw key.
+    Set {
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Environment variable *name* that holds the API key (e.g. OPENAI_API_KEY)
+        #[arg(long)]
+        api_key_env: Option<String>,
+        #[arg(long, group = "en")]
+        enabled: bool,
+        #[arg(long, group = "en")]
+        disabled: bool,
+        /// Recover wall-clock budget in seconds (default 300)
+        #[arg(long)]
+        recover_timeout_sec: Option<u64>,
+        /// Comma-separated extra hosts allowed for recover goto (cross-origin)
+        #[arg(long)]
+        allow_hosts: Option<String>,
+        #[arg(long)]
+        clear_allow_hosts: bool,
+        #[arg(long)]
+        max_actions: Option<u32>,
+        #[arg(long)]
+        max_loops: Option<u32>,
+    },
+    /// Probe chat/completions connectivity (redacts secrets in output)
+    Test,
 }
 
 #[derive(Subcommand, Debug)]
@@ -594,6 +633,9 @@ pub async fn handle_skill(root: &Path, action: SkillCmd) -> Result<()> {
             )
             .await?;
             if !resp.ok {
+                if let Some(data) = &resp.data {
+                    eprintln!("{}", serde_json::to_string_pretty(data)?);
+                }
                 bail!("{}", resp.error.unwrap_or_else(|| "run_skill failed".into()));
             }
             println!("{}", serde_json::to_string_pretty(&resp.data)?);
@@ -989,6 +1031,118 @@ pub fn handle_fleet(root: &Path, action: FleetCmd) -> Result<()> {
                 "defaults: concurrency={} headed={}",
                 cfg.default_concurrency, cfg.default_headed
             );
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_llm(root: &Path, action: LlmCmd) -> Result<()> {
+    match action {
+        LlmCmd::Show => {
+            let v = crate::llm::view(root);
+            print!("{}", crate::llm::format_show(&v));
+        }
+        LlmCmd::Set {
+            base_url,
+            model,
+            api_key_env,
+            enabled,
+            disabled,
+            recover_timeout_sec,
+            allow_hosts,
+            clear_allow_hosts,
+            max_actions,
+            max_loops,
+        } => {
+            if let Some(ref k) = api_key_env {
+                if k.to_ascii_lowercase().contains("sk-") || k.contains("Bearer") {
+                    bail!("--api-key-env takes an environment variable NAME, not a raw key");
+                }
+            }
+            let hosts = if clear_allow_hosts {
+                Some(Vec::new())
+            } else {
+                allow_hosts.map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                })
+            };
+            let en = if enabled {
+                Some(true)
+            } else if disabled {
+                Some(false)
+            } else {
+                None
+            };
+            let cfg = crate::llm::apply_set(
+                root,
+                crate::llm::LlmSetArgs {
+                    base_url,
+                    model,
+                    api_key_env,
+                    enabled: en,
+                    recover_timeout_sec,
+                    allow_hosts: hosts,
+                    max_actions,
+                    max_loops,
+                    max_tokens_per_recover: None,
+                },
+            )?;
+            println!("wrote {} (mode 0600)", crate::llm::config_path(root).display());
+            print!("{}", crate::llm::format_show(&crate::llm::view(root)));
+            let _ = cfg;
+        }
+        LlmCmd::Test => {
+            let v = crate::llm::view(root);
+            if !v.configured {
+                bail!("no config/llm.json — run: cloakcli llm set --base-url URL --model MODEL --api-key-env VAR");
+            }
+            let extra_key = std::env::var(&v.api_key_env).ok();
+            let resp = worker::oneshot(
+                root,
+                Request {
+                    id: worker::next_id(),
+                    cmd: "llm_test".into(),
+                    profile: None,
+                    url: None,
+                    headed: None,
+                    skill: None,
+                    vars: None,
+                    session: None,
+                    proxy: None,
+                    user_data_dir: None,
+                    skill_path: None,
+                    root: Some(root.to_string_lossy().to_string()),
+                    cookie_file: None,
+                },
+            )
+            .await?;
+            let raw = if resp.ok {
+                serde_json::to_string_pretty(&resp.data)?
+            } else {
+                let mut obj = serde_json::json!({
+                    "ok": false,
+                    "error": resp.error,
+                });
+                if let Some(data) = resp.data {
+                    obj["data"] = data;
+                }
+                serde_json::to_string_pretty(&obj)?
+            };
+            let redacted = crate::llm::redact_secrets(&raw, extra_key.as_deref());
+            println!("{redacted}");
+            if !resp.ok {
+                bail!("{}", resp.error.unwrap_or_else(|| "llm test failed".into()));
+            }
+            if extra_key
+                .as_deref()
+                .map(|k| k.len() >= 4 && redacted.contains(k))
+                .unwrap_or(false)
+            {
+                bail!("internal error: llm test output leaked a secret (redaction failed)");
+            }
         }
     }
     Ok(())

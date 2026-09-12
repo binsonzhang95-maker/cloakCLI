@@ -16,6 +16,12 @@ pub struct Skill {
     pub description: String,
     #[serde(default)]
     pub params: Vec<Value>,
+    /// Skill-level stall policy: `fail` (default) or `recover`. Steps inherit unless overridden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_stall: Option<String>,
+    /// Optional skill-level goal used when a step omits `goal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
     #[serde(default)]
     pub steps: Vec<Value>,
     /// Absolute path to the skill directory (not in skill.json)
@@ -171,6 +177,55 @@ pub fn import(root: &Path, src: &Path, name: Option<&str>) -> Result<Skill> {
         format!("{}\n", serde_json::to_string_pretty(&data)?),
     )?;
     load_dir(&dest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_root() -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("cloakcli_skill_test_{n}"));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(p.join("skills")).unwrap();
+        fs::write(
+            p.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.0.0\"\n",
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn parses_goal_and_on_stall() {
+        let root = tmp_root();
+        let dir = state::skills_dir(&root).join("recover-demo");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("skill.json"),
+            r##"{
+              "schema_version": 1,
+              "name": "recover-demo",
+              "on_stall": "recover",
+              "goal": "finish the page",
+              "steps": [
+                {"action":"click","selector":"#missing","goal":"Click more info","on_stall":"recover"}
+              ]
+            }"##,
+        )
+        .unwrap();
+        let s = get(&root, "recover-demo").unwrap();
+        assert_eq!(s.on_stall.as_deref(), Some("recover"));
+        assert_eq!(s.goal.as_deref(), Some("finish the page"));
+        let step = &s.steps[0];
+        assert_eq!(step["goal"], "Click more info");
+        assert_eq!(step["on_stall"], "recover");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 fn resolve_import_name(

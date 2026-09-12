@@ -100,7 +100,12 @@ impl Worker {
         self.child.id()
     }
 
-    pub async fn request(&self, mut req: Request) -> Result<Response> {
+    pub async fn request(&self, req: Request) -> Result<Response> {
+        let ipc_timeout = Duration::from_secs(state::ipc_timeout_secs());
+        self.request_timeout(req, ipc_timeout).await
+    }
+
+    pub async fn request_timeout(&self, mut req: Request, ipc_timeout: Duration) -> Result<Response> {
         if req.id.is_empty() {
             req.id = NEXT_ID.fetch_add(1, Ordering::SeqCst).to_string();
         }
@@ -113,7 +118,6 @@ impl Worker {
             stdin.flush().await?;
         }
 
-        let ipc_timeout = Duration::from_secs(state::ipc_timeout_secs());
         let result = timeout(ipc_timeout, async {
             let mut stdout = self.stdout.lock().await;
             let mut buf = String::new();
@@ -149,7 +153,7 @@ impl Worker {
             Ok(inner) => inner,
             Err(_) => bail!(
                 "IPC timeout after {}s waiting for worker response id={want_id}",
-                state::ipc_timeout_secs()
+                ipc_timeout.as_secs()
             ),
         }
     }
@@ -206,10 +210,15 @@ fn python_command(root: &Path) -> Result<(String, Command)> {
     bail!("python3 not found; set CLOAKCLI_PYTHON");
 }
 
+fn timeout_for(root: &Path, cmd: &str) -> Duration {
+    Duration::from_secs(crate::llm::ipc_timeout_secs_for(root, cmd))
+}
+
 /// One-shot: spawn worker, send one request, graceful shutdown.
 pub async fn oneshot(root: &Path, req: Request) -> Result<Response> {
     let worker = Worker::spawn(root).await?;
-    let resp = worker.request(req).await;
+    let t = timeout_for(root, &req.cmd);
+    let resp = worker.request_timeout(req, t).await;
     let _ = worker.shutdown().await;
     resp
 }
@@ -248,7 +257,8 @@ pub async fn oneshot_killable(
         }
     });
 
-    let resp = worker.request(req).await;
+    let t = timeout_for(root, &req.cmd);
+    let resp = worker.request_timeout(req, t).await;
     let was_cancelled = cancel.load(Ordering::SeqCst);
     stop.store(true, Ordering::SeqCst);
     let _ = killer.await;
@@ -522,7 +532,7 @@ async fn daemon_request_raw(root: &Path, mut req: Request) -> Result<Response> {
     writer.write_all(b"\n").await?;
     writer.flush().await?;
 
-    let ipc_timeout = Duration::from_secs(state::ipc_timeout_secs());
+    let ipc_timeout = timeout_for(root, &req.cmd);
     let result = timeout(ipc_timeout, async {
         let mut reader = BufReader::new(reader);
         let mut buf = String::new();
@@ -557,7 +567,7 @@ async fn daemon_request_raw(root: &Path, mut req: Request) -> Result<Response> {
         Ok(inner) => inner,
         Err(_) => bail!(
             "IPC timeout after {}s waiting for daemon response id={want_id}",
-            state::ipc_timeout_secs()
+            ipc_timeout.as_secs()
         ),
     }
 }

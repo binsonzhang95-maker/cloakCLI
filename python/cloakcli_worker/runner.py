@@ -1,4 +1,4 @@
-"""Execute skill.json steps."""
+"""Execute skill.json steps, with optional vision stall-recovery on the same page."""
 
 from __future__ import annotations
 
@@ -8,13 +8,26 @@ from pathlib import Path
 from typing import Any
 
 from .browser import apply_cookie_file, get_page, launch_context
-from .paths import ensure_under_root, get_root, set_root
+from .llm_config import load_llm_config
+from .paths import PathTrustError, ensure_under_root, get_root, set_root
+from .redact import looks_secret_key, redact_any, redact_text
+from .recover.loop import AskHumanError, RecoverFailed, RecoverResult, run_recover
+from .recover.origin import origin_of
 
 _VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 
 
 class UndefinedVarError(ValueError):
     pass
+
+
+class SkillRunError(Exception):
+    """Worker-visible skill failure with structured data (trajectory, status)."""
+
+    def __init__(self, message: str, *, status: str, data: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.status = status
+        self.data = data or {}
 
 
 def _subst(value: Any, variables: dict[str, Any], *, allow_missing: bool = False) -> Any:
@@ -72,6 +85,35 @@ def _validate_params(skill: dict[str, Any], variables: dict[str, Any]) -> None:
         )
 
 
+def resolve_on_stall(step: dict[str, Any], skill: dict[str, Any]) -> str:
+    raw = step.get("on_stall", skill.get("on_stall", "fail"))
+    v = str(raw or "fail").strip().lower()
+    if v in ("recover", "fail"):
+        return v
+    return "fail"
+
+
+def step_goal(step: dict[str, Any], skill: dict[str, Any], action: str) -> str:
+    g = step.get("goal") or skill.get("goal")
+    if isinstance(g, str) and g.strip():
+        return g.strip()
+    sel = step.get("selector") or step.get("css") or ""
+    return f"Complete step {action}" + (f" ({sel})" if sel else "")
+
+
+def _is_recoverable(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (PathTrustError, UndefinedVarError, SkillRunError, KeyboardInterrupt, SystemExit),
+    ):
+        return False
+    if isinstance(exc, ValueError):
+        msg = str(exc).lower()
+        if "unknown action" in msg or "undefined variable" in msg or "missing required" in msg:
+            return False
+    return True
+
+
 def run_skill(
     *,
     skill_path: str,
@@ -81,6 +123,8 @@ def run_skill(
     vars: dict[str, Any] | None = None,
     root: str | None = None,
     cookie_file: str | None = None,
+    cancel_check: Any | None = None,
+    provider: Any | None = None,
 ) -> dict[str, Any]:
     if root:
         set_root(root)
@@ -112,10 +156,13 @@ def run_skill(
                 pass
             raise
     page = get_page(ctx)
-    extracts: dict[str, Any] = {}
 
     skill_name = skill.get("name") or Path(skill_path_safe).parent.name
     if "/" in skill_name or "\\" in skill_name or ".." in skill_name:
+        try:
+            ctx.close()
+        except Exception:
+            pass
         raise ValueError(f"unsafe skill name for artifacts: {skill_name}")
 
     artifacts_dir = ensure_under_root(
@@ -124,30 +171,198 @@ def run_skill(
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        for i, raw_step in enumerate(skill.get("steps") or []):
-            step = _subst(raw_step, {**variables, **extracts})
-            action = (step.get("action") or "").strip().lower()
-            if not action:
-                raise ValueError(f"Step {i}: missing action")
-            _run_step(page, step, action, extracts, artifacts_dir, variables, project_root)
+        result = execute_skill(
+            page=page,
+            skill=skill,
+            skill_name=skill_name,
+            variables=variables,
+            artifacts_dir=artifacts_dir,
+            project_root=project_root,
+            cookie_meta=cookie_meta,
+            cancel_check=cancel_check,
+            provider=provider,
+        )
+        return result
     finally:
         try:
             ctx.close()
         except Exception:
             pass
 
-    result = {
-        "skill": skill_name,
-        "extracts": extracts,
-        "vars": variables,
-        "artifacts_dir": str(artifacts_dir),
+
+def execute_skill(
+    *,
+    page: Any,
+    skill: dict[str, Any],
+    skill_name: str,
+    variables: dict[str, Any],
+    artifacts_dir: Path,
+    project_root: Path,
+    cookie_meta: dict[str, Any] | None = None,
+    cancel_check: Any | None = None,
+    provider: Any | None = None,
+) -> dict[str, Any]:
+    extracts: dict[str, Any] = {}
+    recover_runs: list[dict[str, Any]] = []
+    task_origin: str | None = None
+    llm_cfg = load_llm_config(project_root)
+
+    def _write(status: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        result = {
+            "skill": skill_name,
+            "status": status,
+            "extracts": extracts,
+            "vars": redact_any(_public_vars(variables)),
+            "artifacts_dir": str(artifacts_dir),
+        }
+        if cookie_meta:
+            result["cookies"] = cookie_meta
+        if recover_runs:
+            result["recover"] = recover_runs
+        if extra:
+            result.update(extra)
+        (artifacts_dir / "last_result.json").write_text(
+            json.dumps(redact_any(result), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return result
+
+    try:
+        for i, raw_step in enumerate(skill.get("steps") or []):
+            step = _subst(raw_step, {**variables, **extracts})
+            if not isinstance(step, dict):
+                raise ValueError(f"Step {i}: must be an object")
+            action = (step.get("action") or "").strip().lower()
+            if not action:
+                raise ValueError(f"Step {i}: missing action")
+            try:
+                _run_step(
+                    page, step, action, extracts, artifacts_dir, variables, project_root
+                )
+                if action == "goto":
+                    task_origin = task_origin or origin_of(getattr(page, "url", None))
+                else:
+                    task_origin = task_origin or origin_of(getattr(page, "url", None))
+            except Exception as e:
+                if not _is_recoverable(e) or resolve_on_stall(step, skill) != "recover":
+                    raise
+                if not llm_cfg or not llm_cfg.enabled:
+                    raise SkillRunError(
+                        f"{e}; recover skipped (llm disabled or unconfigured)",
+                        status="failed",
+                        data={"step": i, "action": action},
+                    ) from e
+                stall = _stall_payload(i, action, step, e)
+                goal = step_goal(step, skill, action)
+                outcome: RecoverResult = run_recover(
+                    page=page,
+                    goal=goal,
+                    stall=stall,
+                    artifacts_dir=artifacts_dir,
+                    skill_name=skill_name,
+                    task_origin=task_origin or origin_of(getattr(page, "url", None)),
+                    cfg=llm_cfg,
+                    root=project_root,
+                    provider=provider,
+                    cancel_check=cancel_check,
+                )
+                recover_runs.append(outcome.public_dict())
+                if outcome.status == "done":
+                    task_origin = task_origin or origin_of(getattr(page, "url", None))
+                    continue
+                data = {
+                    "status": "paused" if outcome.status == "ask_human" else outcome.status,
+                    "recover": outcome.public_dict(),
+                    "trajectory": outcome.trajectory_path,
+                    "step": i,
+                }
+                _write(
+                    "paused" if outcome.status == "ask_human" else "failed",
+                    {"recover_last": outcome.public_dict()},
+                )
+                if outcome.status == "ask_human":
+                    raise SkillRunError(
+                        f"ASK_HUMAN: {outcome.reason}",
+                        status="paused",
+                        data=data,
+                    ) from e
+                if outcome.status == "timeout":
+                    raise SkillRunError(
+                        f"RECOVER_TIMEOUT: {outcome.reason}",
+                        status="timeout",
+                        data=data,
+                    ) from e
+                if outcome.status == "cancelled":
+                    raise SkillRunError(
+                        f"RECOVER_CANCELLED: {outcome.reason}",
+                        status="cancelled",
+                        data=data,
+                    ) from e
+                raise SkillRunError(
+                    f"RECOVER_FAILED: {outcome.reason}",
+                    status="failed",
+                    data=data,
+                ) from e
+    except SkillRunError:
+        raise
+    except AskHumanError as e:
+        recover_runs.append(e.result.public_dict())
+        _write("paused", {"recover_last": e.result.public_dict()})
+        raise SkillRunError(
+            f"ASK_HUMAN: {e.result.reason}",
+            status="paused",
+            data={"status": "paused", "recover": e.result.public_dict()},
+        ) from e
+    except RecoverFailed as e:
+        recover_runs.append(e.result.public_dict())
+        _write("failed", {"recover_last": e.result.public_dict()})
+        raise SkillRunError(
+            str(e),
+            status=e.result.status,
+            data={"status": e.result.status, "recover": e.result.public_dict()},
+        ) from e
+
+    return _write("succeeded")
+
+
+def _public_vars(variables: dict[str, Any]) -> dict[str, Any]:
+    out = {}
+    for k, v in variables.items():
+        if looks_secret_key(str(k)):
+            out[k] = "***"
+        else:
+            out[k] = v
+    return out
+
+
+def _stall_payload(index: int, action: str, step: dict[str, Any], exc: BaseException) -> dict[str, Any]:
+    sel = step.get("selector") or step.get("css")
+    payload: dict[str, Any] = {
+        "step_index": index,
+        "action": action,
+        "error_type": type(exc).__name__,
+        "error": redact_text(str(exc)),
     }
-    if cookie_meta:
-        result["cookies"] = cookie_meta  # counts/domains only
-    (artifacts_dir / "last_result.json").write_text(
-        json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    return result
+    if sel:
+        payload["selector"] = sel
+    intended = step.get("text", step.get("value"))
+    if intended is not None and not looks_secret_key(str(sel or "")) and not looks_secret_key(action):
+        # Do not auto-inject secrets into the model prompt
+        if looks_secret_key("text") or _value_looks_secret(intended, step):
+            payload["intended_text"] = "(redacted)"
+        else:
+            payload["intended_text"] = str(intended)[:80]
+    return payload
+
+
+def _value_looks_secret(value: Any, step: dict[str, Any]) -> bool:
+    for key in ("name", "as", "var"):
+        v = step.get(key)
+        if isinstance(v, str) and looks_secret_key(v):
+            return True
+    if isinstance(value, str) and looks_secret_key(value):
+        return True
+    return False
 
 
 def _run_step(
@@ -201,11 +416,35 @@ def _run_step(
         if not sel:
             raise ValueError("extract_text requires css/selector")
         loc = page.locator(sel).first
+        timeout = step.get("timeout", 30000)
+        wait_for = getattr(loc, "wait_for", None)
+        if callable(wait_for):
+            wait_for(state="visible", timeout=timeout)
         if attr:
             val = loc.get_attribute(attr)
         else:
-            val = loc.inner_text()
+            inner = loc.inner_text
+            val = inner(timeout=timeout) if callable(inner) else inner
         extracts[as_name] = val
+        return
+
+    if action in ("assert", "assert_visible"):
+        sel = step.get("selector") or step.get("css")
+        if not sel:
+            raise ValueError("assert requires selector/css")
+        loc = page.locator(sel).first
+        timeout = step.get("timeout", 10000)
+        wait_for = getattr(loc, "wait_for", None)
+        if callable(wait_for):
+            wait_for(state="visible", timeout=timeout)
+        contains = step.get("contains") or step.get("text")
+        if contains:
+            inner = loc.inner_text
+            text = inner(timeout=timeout) if callable(inner) else str(inner)
+            if str(contains) not in str(text):
+                raise AssertionError(
+                    f"assert text {contains!r} not in {str(text)[:80]!r}"
+                )
         return
 
     if action == "screenshot":

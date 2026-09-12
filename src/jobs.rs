@@ -94,7 +94,7 @@ pub fn upsert_state(
 
 /// Terminal states that make re-submit of the same job_id a no-op (idempotent).
 pub fn is_terminal(state: &str) -> bool {
-    matches!(state, "succeeded" | "failed" | "cancelled")
+    matches!(state, "succeeded" | "failed" | "cancelled" | "paused")
 }
 
 pub fn to_json(rec: &JobRecord) -> serde_json::Value {

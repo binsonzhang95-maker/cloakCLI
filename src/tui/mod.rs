@@ -24,6 +24,7 @@ use crate::master_hub::{self, ClientInfo, SharedHub};
 use crate::profiles::{self, Profile};
 use crate::skills::{self, Skill};
 use crate::state;
+use crate::llm::{self, LlmView};
 use crate::util::redact_proxy;
 use crate::worker::{self, Request};
 
@@ -149,6 +150,7 @@ struct App {
     status: String,
     headed: bool,
     concurrency: usize,
+    llm: LlmView,
     hub: SharedHub,
     hub_bind: String,
     hub_bind_ok: bool,
@@ -189,6 +191,7 @@ impl App {
             status: "ready".into(),
             headed: fleet_cfg.default_headed || state::default_headed(),
             concurrency: fleet_cfg.default_concurrency.max(1),
+            llm: llm::view(root),
             hub,
             hub_bind,
             hub_bind_ok: false,
@@ -359,6 +362,7 @@ impl App {
                 .sort_by(|a, b| a.client_id.cmp(&b.client_id));
         }
 
+        self.llm = llm::view(&self.root);
         self.ensure_selections();
         Ok(())
     }
@@ -976,6 +980,21 @@ async fn event_loop(
                         let _ = app.reload_static();
                         app.log("reloaded");
                         app.begin_sessions_load(BusyKind::WorkerRefresh, "reloaded");
+                    }
+                    KeyCode::Char('l') => {
+                        if app.tab == Tab::Config {
+                            match llm::toggle_enabled(&app.root) {
+                                Ok(v) => {
+                                    app.llm = v;
+                                    app.log(format!("llm recover enabled={}", app.llm.enabled));
+                                    app.status = format!("llm enabled={}", app.llm.enabled);
+                                }
+                                Err(e) => {
+                                    app.log(format!("llm: {e}"));
+                                    app.status = format!("llm: {e}");
+                                }
+                            }
+                        }
                     }
                     KeyCode::Char('h') | KeyCode::Char('H') => {
                         app.headed = !app.headed;

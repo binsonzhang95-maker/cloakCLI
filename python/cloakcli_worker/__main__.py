@@ -21,8 +21,10 @@ from typing import Any
 
 from . import protocol
 from .browser import InvalidCookieError, apply_cookie_file, get_page, launch_context
+from .llm_config import load_llm_config
 from .paths import PathTrustError, ensure_under_root, get_root, set_root
-from .runner import run_skill
+from .redact import redact_any, redact_text
+from .runner import SkillRunError, run_skill
 
 # In-process sessions for open/close within a long-lived worker
 _sessions: dict[str, dict[str, Any]] = {}
@@ -69,15 +71,20 @@ def _handle(req: dict[str, Any]) -> dict[str, Any]:
         if cmd == "run_skill":
             return _cmd_run_skill(req_id, req)
 
+        if cmd == "llm_test":
+            return _cmd_llm_test(req_id)
+
         return protocol.err(req_id, f"unknown cmd: {cmd}")
     except PathTrustError as e:
         return protocol.err(req_id, f"path trust: {e}")
     except InvalidCookieError as e:
         return protocol.err(req_id, str(e))
+    except SkillRunError as e:
+        return protocol.err(req_id, redact_text(str(e)), data=redact_any(e.data))
     except Exception as e:
         tb = traceback.format_exc()
         sys.stderr.write(tb)
-        return protocol.err(req_id, str(e))
+        return protocol.err(req_id, redact_text(str(e)))
 
 
 def _trusted_path(req: dict[str, Any], key: str) -> str | None:
@@ -220,6 +227,22 @@ def _cmd_run_skill(req_id: str, req: dict[str, Any]) -> dict[str, Any]:
         cookie_file=cookie_file,
     )
     return protocol.ok(req_id, result)
+
+
+def _cmd_llm_test(req_id: str) -> dict[str, Any]:
+    from .recover.provider import test_llm
+
+    cfg = load_llm_config()
+    if not cfg:
+        return protocol.err(
+            req_id,
+            "no config/llm.json — run: cloakcli llm set --base-url URL --model MODEL --api-key-env VAR",
+        )
+    data = test_llm(cfg)
+    data = redact_any(data)
+    if data.get("ok"):
+        return protocol.ok(req_id, data)
+    return protocol.err(req_id, str(data.get("error") or "llm test failed"), data=data)
 
 
 def main_stdio() -> None:

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "name": "recover-demo",
+  "description": "Selector miss on example.com; stall-recover clicks More information and continues",
+  "on_stall": "recover",
+  "params": [],
+  "steps": [
+    {"action": "goto", "url": "https://example.com", "timeout": 30000},
+    {
+      "action": "click",
+      "selector": "#cloakcli-missing-more-info",
+      "timeout": 4000,
+      "goal": "Click the More information link on the page",
+      "on_stall": "recover"
+    },
+    {"action": "wait", "ms": 500},
+    {"action": "extract_text", "css": "h1", "as": "title"},
+    {"action": "screenshot", "path": "artifacts/recover-demo.png"}
+  ]
+}

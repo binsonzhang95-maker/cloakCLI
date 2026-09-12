@@ -60,6 +60,14 @@ pub fn data_dir(root: &Path) -> PathBuf {
     root.join("data")
 }
 
+pub fn config_dir(root: &Path) -> PathBuf {
+    root.join("config")
+}
+
+pub fn llm_config_path(root: &Path) -> PathBuf {
+    config_dir(root).join("llm.json")
+}
+
 pub fn profile_user_data_dir(root: &Path, name: &str) -> PathBuf {
     data_dir(root).join("profiles").join(name)
 }

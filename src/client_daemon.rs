@@ -431,9 +431,16 @@ async fn handle_job<W: AsyncWriteExt + Unpin + Send + 'static>(
             .await?;
         }
         Err(e) => {
-            let cancelled = cancel_flag.load(Ordering::SeqCst)
-                || e.to_string().contains("cancelled");
-            let state_name = if cancelled { "cancelled" } else { "failed" };
+            let msg = e.to_string();
+            let cancelled = cancel_flag.load(Ordering::SeqCst) || msg.contains("cancelled");
+            let paused = msg.contains("ASK_HUMAN") || msg.contains("paused_ask_human");
+            let state_name = if cancelled {
+                "cancelled"
+            } else if paused {
+                "paused"
+            } else {
+                "failed"
+            };
             let _ = jobs::upsert_state(
                 root,
                 &job_id,

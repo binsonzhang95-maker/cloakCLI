@@ -781,7 +781,7 @@ fn hint_line(msg: &str) -> Line<'static> {
 }
 
 fn draw_config(f: &mut Frame, area: Rect, app: &App) {
-    let lines: Vec<Line> = vec![
+    let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             "  Runtime defaults",
             Style::default()
@@ -821,14 +821,69 @@ fn draw_config(f: &mut Frame, area: Rect, app: &App) {
         ),
         Line::from(""),
         Line::from(Span::styled(
-            "  Fleet protocol is a DEV STUB (plaintext token).",
-            Style::default().fg(PURPLE).add_modifier(Modifier::ITALIC),
+            "  LLM stall-recovery",
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(
-            "  Stealth ≠ anonymity guarantee.",
-            Style::default().fg(MUTED),
-        )),
+        Line::from(""),
     ];
+    if !app.llm.configured {
+        lines.push(kv(
+            "llm",
+            "not configured (cloakcli llm set)",
+            Style::default().fg(MUTED),
+        ));
+    } else {
+        lines.push(kv(
+            "enabled",
+            if app.llm.enabled { "true" } else { "false" },
+            Style::default().fg(if app.llm.enabled { OK } else { MUTED }),
+        ));
+        lines.push(kv(
+            "model",
+            truncate(&app.llm.model, 40),
+            Style::default().fg(INFO),
+        ));
+        lines.push(kv(
+            "base_url",
+            truncate(&app.llm.base_url, 42),
+            Style::default().fg(INFO),
+        ));
+        lines.push(kv(
+            "api_key_env",
+            format!(
+                "{} ({})",
+                app.llm.api_key_env,
+                if app.llm.key_present { "set" } else { "missing" }
+            ),
+            Style::default().fg(if app.llm.key_present { OK } else { WARN }),
+        ));
+        lines.push(kv(
+            "recover_timeout_sec",
+            app.llm.recover_timeout_sec.to_string(),
+            Style::default().fg(INFO),
+        ));
+        let hosts = if app.llm.allow_hosts.is_empty() {
+            "(same origin only)".into()
+        } else {
+            app.llm.allow_hosts.join(",")
+        };
+        lines.push(kv(
+            "allow_hosts",
+            truncate(&hosts, 40),
+            Style::default().fg(MUTED),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Fleet protocol is a DEV STUB (plaintext token).",
+        Style::default().fg(PURPLE).add_modifier(Modifier::ITALIC),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Stealth ≠ anonymity guarantee. Key is env-only; never shown.",
+        Style::default().fg(MUTED),
+    )));
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .block(bordered(
@@ -917,7 +972,11 @@ fn context_help(tab: Tab) -> Vec<Span<'static>> {
         Tab::Skills => help_bits(&[("Enter", "run on selected profile (local)")]),
         Tab::Sessions => help_bits(&[("x", "close session"), ("o", "open from Profiles")]),
         Tab::Clients => help_bits(&[("J", "submit remote job (skill@profile)")]),
-        Tab::Config => help_bits(&[("h", "toggle headed"), ("c/[ ]", "concurrency")]),
+        Tab::Config => help_bits(&[
+            ("h", "toggle headed"),
+            ("c/[ ]", "concurrency"),
+            ("l", "toggle llm recover"),
+        ]),
         Tab::Logs => {
             let mut s = vec![Span::styled("auto-refresh live", style_desc())];
             s.push(Span::styled(" · ", style_desc()));

@@ -6,6 +6,7 @@ mod client_daemon;
 mod fleet;
 mod jobs;
 mod locks;
+mod llm;
 mod master_hub;
 mod profiles;
 mod protocol;
@@ -34,6 +35,7 @@ async fn main() -> Result<()> {
         Some(Commands::Master { action }) => cli::handle_master(&root, action).await,
         Some(Commands::Client { action }) => cli::handle_client(&root, action).await,
         Some(Commands::Fleet { action }) => cli::handle_fleet(&root, action),
+        Some(Commands::Llm { action }) => cli::handle_llm(&root, action).await,
         Some(Commands::Doctor) => cli::handle_doctor(&root).await,
     }
 }
