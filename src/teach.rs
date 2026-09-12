@@ -216,6 +216,9 @@ pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
 
     let _lock = acquire_teach_lock(root, &prof.name).await?;
 
+    let py = python_bin()?;
+    preflight_browser_binary(&py)?;
+
     let std_listener = StdTcpListener::bind("127.0.0.1:0")
         .context("bind teach export server on 127.0.0.1")?;
     std_listener.set_nonblocking(true)?;
@@ -404,6 +407,63 @@ fn python_bin() -> Result<String> {
         }
     }
     bail!("python3 not found; set CLOAKCLI_PYTHON");
+}
+
+/// Fail before launching the headed worker if CloakBrowser Chromium is missing.
+pub fn preflight_browser_binary(py: &str) -> Result<PathBuf> {
+    let script = r#"
+import json, sys
+try:
+    from cloakbrowser import binary_info
+except Exception as e:
+    sys.stderr.write(f"import cloakbrowser failed: {type(e).__name__}: {e}\n")
+    sys.exit(2)
+info = binary_info()
+path = str(info.get("binary_path") or "")
+installed = bool(info.get("installed"))
+print(json.dumps({"path": path, "installed": installed}))
+sys.exit(0 if installed else 3)
+"#;
+    let out = std::process::Command::new(py)
+        .args(["-c", script])
+        .output()
+        .with_context(|| format!("run {py} cloakbrowser binary preflight"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.code() == Some(2) {
+        bail!(
+            "teach: cloakbrowser is not importable with {py}. \
+             Install worker deps (pip install -e python/) or set CLOAKCLI_PYTHON. {stderr}"
+        );
+    }
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|l| l.starts_with('{'))
+        .unwrap_or(stdout.as_str());
+    let info: Value = serde_json::from_str(json_line).unwrap_or_else(|_| json!({}));
+    let path = info
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let installed = info
+        .get("installed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !out.status.success() || !installed || path.is_empty() || !Path::new(&path).is_file() {
+        let shown = if path.is_empty() {
+            "(unknown path)".to_string()
+        } else {
+            path
+        };
+        bail!(
+            "teach: CloakBrowser Chromium binary not found at {shown}. \
+             Download it before teach start: {py} -c \"from cloakbrowser import ensure_binary; print(ensure_binary())\". \
+             See also: cloakcli doctor."
+        );
+    }
+    Ok(PathBuf::from(path))
 }
 
 async fn run_export_server(listener: TcpListener, state: Arc<ExportState>) {
@@ -1207,5 +1267,58 @@ mod tests {
         assert_eq!(mapped.steps, expected["steps"].as_array().unwrap().clone());
         assert_eq!(mapped.goal.as_deref(), expected["goal"].as_str());
         assert_eq!(mapped.name, expected["name"]);
+    }
+
+    fn write_exec(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn preflight_reports_missing_binary() {
+        let root = tmp_root();
+        let fake = root.join("fake_python");
+        write_exec(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json, sys
+if len(sys.argv) >= 3 and sys.argv[1] == "-c" and "binary_info" in sys.argv[2]:
+    print(json.dumps({"path": "/nonexistent/cloak-chrome", "installed": False}))
+    sys.exit(3)
+sys.stderr.write("unexpected %r\n" % (sys.argv,))
+sys.exit(1)
+"#,
+        );
+        let err = preflight_browser_binary(&fake.to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("binary not found"), "{err}");
+        assert!(err.contains("ensure_binary") || err.contains("doctor"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preflight_reports_import_failure() {
+        let root = tmp_root();
+        let fake = root.join("fake_python");
+        write_exec(
+            &fake,
+            r#"#!/usr/bin/env python3
+import sys
+if len(sys.argv) >= 3 and sys.argv[1] == "-c":
+    sys.stderr.write("import cloakbrowser failed: ModuleNotFoundError: No module named 'cloakbrowser'\n")
+    sys.exit(2)
+sys.exit(1)
+"#,
+        );
+        let err = preflight_browser_binary(&fake.to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not importable"), "{err}");
+        let _ = fs::remove_dir_all(&root);
     }
 }

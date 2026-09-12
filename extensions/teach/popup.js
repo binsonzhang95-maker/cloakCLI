@@ -14,6 +14,22 @@ function send(msg) {
   });
 }
 
+function originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
+}
+
+function currentTab() {
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      resolve((tabs && tabs[0]) || null);
+    });
+  });
+}
+
 function setMsg(text, cls) {
   const el = $("msg");
   el.textContent = text || "";
@@ -35,7 +51,26 @@ async function refresh() {
     : `stopped · ${s.n} event(s)`;
   $("allow").textContent = (s.allowlist || []).length
     ? "origins: " + s.allowlist.join(", ")
-    : "origins: (none yet — start recording on an http(s) page)";
+    : "origins: (none — use --url or Allow this origin)";
+
+  const tab = await currentTab();
+  const origin = originOf((tab && tab.url) || "");
+  const allowed = origin && (s.allowlist || []).includes(origin);
+  const cur = $("current");
+  if (!origin) {
+    cur.textContent = "this tab: (not http(s))";
+    cur.className = "muted";
+  } else if (allowed) {
+    cur.textContent = "this tab: " + origin + " (allowed)";
+    cur.className = "ok";
+  } else {
+    const ignored =
+      s.ignoredOrigin && s.ignoredOrigin === origin
+        ? " — not recorded until you Allow"
+        : " (not allowed)";
+    cur.textContent = "this tab: " + origin + ignored;
+    cur.className = "warn";
+  }
   if (s.goal && !$("goal").value) $("goal").value = s.goal;
   return s;
 }
@@ -55,6 +90,17 @@ $("stop").addEventListener("click", async () => {
 $("goalbtn").addEventListener("click", async () => {
   const r = await send({ type: "goal", text: $("goal").value });
   setMsg(r.ok ? `goal: ${r.goal || "(empty)"}` : r.error || "failed", r.ok ? "ok" : "err");
+});
+
+$("allowbtn").addEventListener("click", async () => {
+  const tab = await currentTab();
+  const origin = originOf((tab && tab.url) || "");
+  const r = await send({ type: "approveOrigin", origin });
+  setMsg(
+    r.ok ? "allowed " + (r.origin || origin) : r.error || "failed",
+    r.ok ? "ok" : "err"
+  );
+  await refresh();
 });
 
 $("export").addEventListener("click", async () => {

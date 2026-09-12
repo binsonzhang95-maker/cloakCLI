@@ -1,6 +1,6 @@
 /* CloakCLI Teach — service worker.
- * Origin allowlist only (no default <all_urls> content_scripts).
- * Events stay in memory until export. Secrets are not written to storage.
+ * Origin allowlist: CLI --url origin from session.json, plus origins the
+ * user explicitly Allows in the popup. Navigating does not silent-add.
  */
 
 const state = {
@@ -9,6 +9,7 @@ const state = {
   events: [],
   goal: "",
   allowlist: new Set(),
+  ignoredOrigin: "",
 };
 
 function isHttpOrigin(origin) {
@@ -45,7 +46,9 @@ async function loadConfig() {
     if (!r.ok) return null;
     state.cfg = await r.json();
     for (const o of state.cfg.allowOrigins || []) {
-      if (isHttpOrigin(o)) state.allowlist.add(o);
+      if (isHttpOrigin(o) && !(exportOrigin() && o === originOf(exportOrigin()))) {
+        state.allowlist.add(o);
+      }
     }
     return state.cfg;
   } catch {
@@ -57,6 +60,7 @@ function addOrigin(origin) {
   if (!isHttpOrigin(origin)) return false;
   if (exportOrigin() && origin === originOf(exportOrigin())) return false;
   state.allowlist.add(origin);
+  if (state.ignoredOrigin === origin) state.ignoredOrigin = "";
   return true;
 }
 
@@ -72,14 +76,16 @@ async function requestOrigin(origin) {
 
 async function inject(tabId, url) {
   const origin = originOf(url || "");
-  if (!originAllowed(origin)) return;
+  if (!originAllowed(origin)) return false;
   try {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: false },
       files: ["content.js"],
     });
+    return true;
   } catch {
     /* tab may be chrome:// or gone */
+    return false;
   }
 }
 
@@ -90,12 +96,15 @@ function record(event) {
   if (kind === "navigation") {
     const url = String(event.url || "");
     const origin = originOf(url);
-    if (!originAllowed(origin) && !addOrigin(origin)) return;
-  }
-  if (kind === "click" || kind === "input") {
-    /* content script already checked origin */
+    if (!originAllowed(origin)) return;
   }
   state.events.push(event);
+}
+
+function noteIgnored(origin) {
+  if (isHttpOrigin(origin) && !originAllowed(origin)) {
+    state.ignoredOrigin = origin;
+  }
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -107,13 +116,14 @@ chrome.webNavigation.onCommitted.addListener(async (d) => {
   await loadConfig();
   const origin = originOf(d.url);
   if (!isHttpOrigin(origin)) return;
-  if (state.recording) {
-    await requestOrigin(origin);
-    record({ kind: "navigation", url: d.url });
-    await inject(d.tabId, d.url);
-  } else if (originAllowed(origin)) {
-    await inject(d.tabId, d.url);
+  if (!originAllowed(origin)) {
+    if (state.recording) noteIgnored(origin);
+    return;
   }
+  if (state.recording) {
+    record({ kind: "navigation", url: d.url });
+  }
+  await inject(d.tabId, d.url);
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
@@ -121,12 +131,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   await loadConfig();
   const url = tab.url || "";
   const origin = originOf(url);
-  if (state.recording && isHttpOrigin(origin)) {
-    await requestOrigin(origin);
+  if (!originAllowed(origin)) {
+    if (state.recording) noteIgnored(origin);
+    return;
   }
-  if (originAllowed(origin)) {
-    await inject(tabId, url);
-  }
+  await inject(tabId, url);
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -158,6 +167,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         hasSession: Boolean(state.cfg),
         allowSecrets: Boolean(state.cfg && state.cfg.allowSecrets),
         exportOrigin: exportOrigin(),
+        ignoredOrigin: state.ignoredOrigin || "",
       });
       return;
     }
@@ -172,9 +182,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       state.recording = true;
       const tab = await activeHttpTab();
       if (tab) {
-        await requestOrigin(originOf(tab.url));
-        record({ kind: "navigation", url: tab.url });
-        await inject(tab.id, tab.url);
+        const origin = originOf(tab.url);
+        if (originAllowed(origin)) {
+          record({ kind: "navigation", url: tab.url });
+          await inject(tab.id, tab.url);
+        } else {
+          noteIgnored(origin);
+        }
       }
       sendResponse({ ok: true, recording: true, n: state.events.length });
       return;
@@ -191,6 +205,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         record({ kind: "goal", text });
       }
       sendResponse({ ok: true, goal: state.goal });
+      return;
+    }
+    if (type === "approveOrigin") {
+      /* Popup-only: a content script must not grow the allowlist. */
+      if (sender && sender.tab) {
+        sendResponse({ ok: false, error: "approve from the extension popup" });
+        return;
+      }
+      let origin = String(msg.origin || "").trim();
+      if (!origin) {
+        const tab = await activeHttpTab();
+        origin = tab ? originOf(tab.url) : "";
+      }
+      if (!isHttpOrigin(origin)) {
+        sendResponse({ ok: false, error: "not an http(s) origin" });
+        return;
+      }
+      if (exportOrigin() && origin === originOf(exportOrigin())) {
+        sendResponse({ ok: false, error: "cannot allowlist the export server" });
+        return;
+      }
+      const ok = await requestOrigin(origin);
+      if (!ok) {
+        sendResponse({ ok: false, error: "origin rejected" });
+        return;
+      }
+      const tabs = await chrome.tabs.query({});
+      for (const t of tabs || []) {
+        if (!t.id || originOf(t.url || "") !== origin) continue;
+        if (state.recording) {
+          record({ kind: "navigation", url: t.url });
+        }
+        await inject(t.id, t.url);
+      }
+      sendResponse({
+        ok: true,
+        origin,
+        allowlist: [...state.allowlist],
+      });
       return;
     }
     if (type === "export") {

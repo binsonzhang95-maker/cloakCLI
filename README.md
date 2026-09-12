@@ -162,7 +162,7 @@ cloakcli skill run <exported-name> --profile demo --var PASSWORD=...
 - TUI key `T` calls the same `teach start` path (no second launcher).
 - Export mapping: navigation → `goto`, click → `click` (selector), input → `fill`. Skill-level `goal` is the last marked goal; empty steps are rejected; missing goal is allowed (runner fallbacks).
 - Password / token / secret fields export as `{{vars.NAME}}` by default (listed in the generated README). Explicit `--allow-secrets` keeps plaintext and still writes a `.gitignore`.
-- Content script is origin-allowlisted (`http`/`https` added while recording). Manifest has no `<all_urls>`.
+- Content script is origin-allowlisted: the CLI `--url` origin plus origins you **Allow** in the extension popup. Navigating to another HTTPS site does not silent-add it. Manifest has no `<all_urls>`.
 - Takes the profile lock for the whole session; conflict with a batch worker prints a clear error.
 
 Fixture round-trip: `fixtures/teach/recorded-events.json` → `fixtures/teach/expected-skill.json`.

@@ -10,6 +10,7 @@
     <p id="session" class="muted">loading…</p>
     <p id="status">idle</p>
     <p id="allow" class="muted"></p>
+    <p id="current" class="muted"></p>
     <label>Skill name <input id="name" type="text" maxlength="64" placeholder="my-skill" /></label>
     <label>Goal <input id="goal" type="text" placeholder="what this skill should achieve" /></label>
     <div class="row">
@@ -18,7 +19,14 @@
       <button id="stop" type="button">Stop</button>
       <button id="export" type="button">Export</button>
     </div>
+    <div class="row">
+      <button id="allowbtn" type="button">Allow this origin</button>
+    </div>
     <p id="msg" class="muted"></p>
+    <p class="hint">
+      Only the CLI <code>--url</code> origin and origins you Allow here are
+      recorded. Navigating elsewhere does not add the site.
+    </p>
     <p class="hint">
       Passwords export as <code>{{vars.NAME}}</code> unless
       <code>cloakcli teach start --allow-secrets</code>.

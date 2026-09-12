@@ -129,6 +129,58 @@ fn no_extension_path_cli_flag() {
 }
 
 #[test]
+fn start_preflight_missing_browser_is_clear() {
+    let home = tmp_home();
+    let created = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args(["profile", "create", "demo"])
+        .output()
+        .expect("create");
+    assert!(created.status.success(), "{}", combined(&created));
+
+    let fake = home.join("fake_python");
+    fs::write(
+        &fake,
+        r#"#!/usr/bin/env python3
+import json, sys
+if len(sys.argv) >= 3 and sys.argv[1] == "-c" and "binary_info" in sys.argv[2]:
+    print(json.dumps({"path": "/nonexistent/cloak-chrome", "installed": False}))
+    sys.exit(3)
+sys.stderr.write("unexpected %r\n" % (sys.argv,))
+sys.exit(1)
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .env("CLOAKCLI_PYTHON", &fake)
+        .args([
+            "teach",
+            "start",
+            "--profile",
+            "demo",
+            "--url",
+            "https://example.com",
+        ])
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    let t = combined(&out);
+    assert!(
+        t.contains("binary not found") || t.to_ascii_lowercase().contains("chromium binary"),
+        "{t}"
+    );
+    assert!(!t.contains("TeachingSession"), "{t}");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn headed_smoke_or_skip() {
     let has_display = std::env::var_os("DISPLAY").is_some()
         || std::env::var_os("WAYLAND_DISPLAY").is_some();

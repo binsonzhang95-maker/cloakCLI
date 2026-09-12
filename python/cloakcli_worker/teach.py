@@ -21,6 +21,23 @@ def _require_headed(headed: bool) -> None:
         raise SystemExit("teach requires a headed CloakBrowser; headless is not supported")
 
 
+def _preflight_binary() -> Path:
+    try:
+        from cloakbrowser import binary_info
+    except Exception as e:
+        raise SystemExit(
+            f"teach: cloakbrowser is not importable: {type(e).__name__}: {e}"
+        ) from e
+    info = binary_info()
+    path = Path(str(info.get("binary_path") or ""))
+    if not info.get("installed") or not path.is_file():
+        raise SystemExit(
+            f"teach: CloakBrowser Chromium binary not found at {path}. "
+            "Download it with: python3 -c 'from cloakbrowser import ensure_binary; print(ensure_binary())'"
+        )
+    return path
+
+
 def _validate_extension(path: Path) -> Path:
     man = path / "manifest.json"
     if not man.is_file():
@@ -90,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
 
     user_data.mkdir(parents=True, exist_ok=True)
     ext = _validate_extension(ext)
+    _preflight_binary()
 
     smoke = 0.0
     raw = os.environ.get("CLOAKCLI_TEACH_SMOKE_SECONDS", "").strip()
