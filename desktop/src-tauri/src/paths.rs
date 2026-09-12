@@ -42,7 +42,14 @@ pub fn validate_home(raw: &str) -> Result<PathBuf, String> {
 }
 
 pub fn validate_bin(raw: &str) -> Result<PathBuf, String> {
-    validate_existing_path(raw, "CLOAKCLI_BIN", false)
+    let canon = validate_existing_path(raw, "CLOAKCLI_BIN", false)?;
+    if !is_executable_file(&canon) {
+        return Err(format!(
+            "CLOAKCLI_BIN is not executable: {}",
+            canon.display()
+        ));
+    }
+    Ok(canon)
 }
 
 fn validate_existing_path(raw: &str, label: &str, must_be_dir: bool) -> Result<PathBuf, String> {
@@ -104,36 +111,14 @@ pub fn resolve_home(
 
 pub fn resolve_bin(current_exe: &Path) -> Result<PathBuf, String> {
     if let Ok(value) = env::var("CLOAKCLI_BIN") {
-        return validate_bin(&value).map_err(|e| format!("{e}"));
+        // Trusted local override, but still absolute + existing + executable
+        // after canonicalize. Relative values are rejected.
+        return validate_bin(&value);
     }
 
-    if let Some(dir) = current_exe.parent() {
-        for name in BIN_NAMES {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Ok(candidate.canonicalize().unwrap_or(candidate));
-            }
-        }
-        // macOS app bundle: Contents/MacOS/<app> → Contents/MacOS/cloakcli already covered;
-        // also look in Contents/Resources and next to the .app
-        if dir.ends_with("MacOS") {
-            if let Some(contents) = dir.parent() {
-                let resources = contents.join("Resources");
-                for name in BIN_NAMES {
-                    let candidate = resources.join(name);
-                    if candidate.is_file() {
-                        return Ok(candidate.canonicalize().unwrap_or(candidate));
-                    }
-                }
-                if let Some(app_parent) = contents.parent() {
-                    for name in BIN_NAMES {
-                        let candidate = app_parent.join(name);
-                        if candidate.is_file() {
-                            return Ok(candidate.canonicalize().unwrap_or(candidate));
-                        }
-                    }
-                }
-            }
+    for candidate in sidecar_candidates(current_exe) {
+        if let Some(ok) = accept_executable(&candidate) {
+            return Ok(ok);
         }
     }
 
@@ -141,8 +126,8 @@ pub fn resolve_bin(current_exe: &Path) -> Result<PathBuf, String> {
         for profile in ["debug", "release"] {
             for name in BIN_NAMES {
                 let candidate = ancestor.join("target").join(profile).join(name);
-                if candidate.is_file() {
-                    return Ok(candidate.canonicalize().unwrap_or(candidate));
+                if let Some(ok) = accept_executable(&candidate) {
+                    return Ok(ok);
                 }
             }
         }
@@ -157,6 +142,77 @@ pub fn resolve_bin(current_exe: &Path) -> Result<PathBuf, String> {
          install cloakcli on PATH, or place it next to this app."
             .into(),
     )
+}
+
+/// Sidecar locations next to the desktop executable.
+///
+/// macOS `.app` layout:
+/// - `Foo.app/Contents/MacOS/cloakcli`
+/// - `Foo.app/Contents/Resources/cloakcli`
+/// - `Foo.app/cloakcli`
+/// - directory *beside* the `.app` (`…/cloakcli`) — one more parent than
+///   `Contents` so a sibling binary of the bundle is found.
+pub(crate) fn sidecar_candidates(current_exe: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(dir) = current_exe.parent() else {
+        return out;
+    };
+    for name in BIN_NAMES {
+        out.push(dir.join(name));
+    }
+    if dir.ends_with("MacOS") {
+        if let Some(contents) = dir.parent() {
+            let resources = contents.join("Resources");
+            for name in BIN_NAMES {
+                out.push(resources.join(name));
+            }
+            if let Some(app_bundle) = contents.parent() {
+                for name in BIN_NAMES {
+                    out.push(app_bundle.join(name));
+                }
+                if let Some(beside_app) = app_bundle.parent() {
+                    for name in BIN_NAMES {
+                        out.push(beside_app.join(name));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Keep a candidate only when it is absolute, `canonicalize` succeeds, and
+/// the resolved path is an executable file. Failed canonicalize is a drop,
+/// not a fallback to the original path.
+pub(crate) fn accept_executable(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let canon = path.canonicalize().ok()?;
+    if !canon.is_absolute() {
+        return None;
+    }
+    if !is_executable_file(&canon) {
+        return None;
+    }
+    Some(canon)
 }
 
 fn discover_repo_root(current_exe: &Path) -> Option<PathBuf> {
@@ -176,14 +232,21 @@ fn looks_like_root(path: &Path) -> bool {
 fn search_path(name: &str) -> Option<PathBuf> {
     let path_var = env::var_os("PATH")?;
     for dir in env::split_paths(&path_var) {
-        let mut candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate.canonicalize().unwrap_or(candidate));
+        // Empty PATH component means "current directory" on Unix and Windows.
+        // Relative entries also resolve against cwd. Reject both so we never
+        // exec a namesake from the process working directory.
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if let Some(ok) = accept_executable(&candidate) {
+            return Some(ok);
         }
         if cfg!(windows) {
-            candidate.set_extension("exe");
-            if candidate.is_file() {
-                return Some(candidate.canonicalize().unwrap_or(candidate));
+            let mut exe = candidate;
+            exe.set_extension("exe");
+            if let Some(ok) = accept_executable(&exe) {
+                return Some(ok);
             }
         }
     }
@@ -194,6 +257,9 @@ fn search_path(name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_dir() -> PathBuf {
         let base = env::temp_dir().join(format!(
@@ -256,6 +322,98 @@ mod tests {
     fn rejects_relative_bin() {
         let err = validate_bin("cloakcli").unwrap_err();
         assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_executable_bin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let file = dir.join("cloakcli");
+        fs::write(&file, b"#!/bin/sh\necho no\n").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = validate_bin(file.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not executable"), "{err}");
+        assert!(accept_executable(&file).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn accept_executable_drops_failed_canonicalize() {
+        let missing = PathBuf::from("/definitely/not/a/cloakcli/bin/that/does/not/exist");
+        assert!(accept_executable(&missing).is_none());
+        assert!(accept_executable(Path::new("relative/cloakcli")).is_none());
+        assert!(accept_executable(Path::new("")).is_none());
+    }
+
+    #[test]
+    fn search_path_skips_empty_and_relative_entries() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cwd = temp_dir();
+        let abs = temp_dir();
+        let name = "cloakcli-path-probe";
+        let cwd_bin = cwd.join(name);
+        let abs_bin = abs.join(name);
+        fs::write(&cwd_bin, b"#!/bin/sh\n").unwrap();
+        fs::write(&abs_bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&cwd_bin, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&abs_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let old_cwd = env::current_dir().unwrap();
+        let old_path = env::var_os("PATH");
+        env::set_current_dir(&cwd).unwrap();
+
+        env::set_var("PATH", ":.:./rel:relative");
+        assert!(
+            search_path(name).is_none(),
+            "empty/relative PATH must not exec from cwd"
+        );
+
+        env::set_var("PATH", format!(":./rel:{}", abs.display()));
+        let found = search_path(name).expect("absolute PATH entry should win");
+        assert_eq!(found, abs_bin.canonicalize().unwrap());
+
+        match old_path {
+            Some(p) => env::set_var("PATH", p),
+            None => env::remove_var("PATH"),
+        }
+        let _ = env::set_current_dir(old_cwd);
+        fs::remove_dir_all(&cwd).ok();
+        fs::remove_dir_all(&abs).ok();
+    }
+
+    #[test]
+    fn macos_sidecar_walks_beside_app_bundle() {
+        let exe = PathBuf::from("/Applications/CloakCLI.app/Contents/MacOS/cloakcli-desktop");
+        let cands = sidecar_candidates(&exe);
+        let as_str: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            as_str.iter().any(|p| p.ends_with("/Contents/MacOS/cloakcli")),
+            "{as_str:?}"
+        );
+        assert!(
+            as_str
+                .iter()
+                .any(|p| p.ends_with("/Contents/Resources/cloakcli")),
+            "{as_str:?}"
+        );
+        assert!(
+            as_str
+                .iter()
+                .any(|p| p == "/Applications/CloakCLI.app/cloakcli"),
+            "{as_str:?}"
+        );
+        assert!(
+            as_str.iter().any(|p| p == "/Applications/cloakcli"),
+            "must walk one parent past the .app: {as_str:?}"
+        );
     }
 
     #[test]

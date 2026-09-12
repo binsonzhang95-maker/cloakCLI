@@ -51,12 +51,14 @@ npm run tauri dev
 
 `npm run tauri dev` should open an ~1100×720 undecorated window, start `cloakcli tui` in the PTY, and pass colors / keys / Unicode / resize through xterm.js.
 
+The title bar has **Start**, **Stop**, and **Restart**. After the TUI exits (or after Stop), the status bar shows the result and those buttons start it again. Restart is `pty_stop` then `pty_start` in the same window.
+
 ## Binary resolution
 
-1. `CLOAKCLI_BIN` — development override; **must be an absolute existing file**. Relative paths are rejected.
-2. A `cloakcli` binary next to the desktop executable (and, on macOS, beside the `.app` / in `Contents/Resources`).
+1. `CLOAKCLI_BIN` — trusted local override; **must be an absolute existing executable** after canonicalize. Relative paths are rejected. This is not a signed-identity check.
+2. A `cloakcli` binary next to the desktop executable. On macOS also `Contents/Resources`, inside the `.app`, and **one directory above the `.app`** (sibling of the bundle).
 3. Dev fallback: `target/debug/cloakcli` or `target/release/cloakcli` found by walking up from the desktop executable.
-4. `PATH`.
+4. `PATH` — **empty and relative entries are ignored** so a namesake in cwd is never exec'd. Each candidate must `canonicalize` to an executable file; failed canonicalize drops the candidate.
 
 If none of those work, the window shows a clear error. It does not guess a relative command.
 
@@ -99,6 +101,7 @@ On macOS an empty application menu (app name only) may still appear — there is
 - window chrome: drag, minimize, maximize/restore, close, is-maximized
 - events for PTY I/O
 - the six app commands (`shell_status`, `set_home`, `pty_start`, `pty_write`, `pty_resize`, `pty_stop`)
+- `pty-status` is emitted when stop/reclaim finishes so the title-bar Start/Stop/Restart state can update
 
 No `shell`, `os`, `fs`, or `opener` plugins. `pty_start` always execs the resolved `cloakcli` binary with the single argument `tui`.
 
@@ -106,9 +109,15 @@ A generic Tauri PTY plugin (`tauri-plugin-pty` / `spawn(cmd, args)`) was not use
 
 ## Window close / orphans
 
-Closing the window sends Ctrl-C + SIGTERM to the PTY child (process group on Unix), waits ~2s, then kills. The intent is no leftover `cloakcli` PTY or worker started from that session.
+Natural exit, Stop, spawn/reader/writer failure, window close, and app exit share one reclaim path. The session is not cleared until kill + wait finish.
 
-Restarting the TUI from a still-open window is `pty_stop` then `pty_start` (already-running sessions are rejected).
+portable-pty `setsid`s the child, so the child's pid is the process-group id. After Ctrl-C, the shell SIGTERMs that group, waits ~2s, then SIGKILLs the group and `wait`s the direct child (no zombie).
+
+cloakcli's Python worker is spawned without `setsid`, so it stays in the group. Processes that leave the group (CloakBrowser/Chrome often daemonize) are reclaimed from a descendant snapshot plus `CLOAKCLI_HOME/data/worker.pid` when that pid appeared after this session started. A daemon that was already running before the window opened is left alone.
+
+## Unicode
+
+PTY reads are decoded with a stateful UTF-8 buffer so a CJK or emoji scalar split across two reads is not turned into U+FFFD. Covered by `drain_utf8` unit tests (`你好`, `😀` split mid-character).
 
 ## Known limits (this phase)
 

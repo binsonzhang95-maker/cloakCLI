@@ -42,9 +42,15 @@ const setupError = document.getElementById("setup-error");
 const homeInput = document.getElementById("home-input");
 const iconMaximize = document.getElementById("icon-maximize");
 const iconRestore = document.getElementById("icon-restore");
+const btnStart = document.getElementById("btn-start");
+const btnStop = document.getElementById("btn-stop");
+const btnRestart = document.getElementById("btn-restart");
 
 let starting = false;
+let stopping = false;
 let running = false;
+let lastExit = null;
+let canLaunch = false;
 
 function fit() {
   try {
@@ -128,23 +134,63 @@ homeInput.addEventListener("keydown", (event) => {
   }
 });
 
+function updateButtons() {
+  const busy = starting || stopping;
+  btnStart.disabled = busy || running || !canLaunch;
+  btnStop.disabled = busy || !running;
+  btnRestart.disabled = busy || !canLaunch;
+}
+
 function applyStatus(status) {
+  canLaunch = Boolean(status.binary && status.home);
   statusBin.textContent = status.binary
     ? `bin: ${status.binary}`
     : `bin: missing (${status.binary_error || "not found"})`;
   statusHome.textContent = status.home
     ? `home: ${status.home}`
     : `home: unset (${status.home_error || "not set"})`;
-  statusPty.textContent = `pty: ${status.running ? "running" : "stopped"}`;
-  sessionLabel.textContent = status.running
-    ? "cloakcli tui"
-    : status.binary_error || status.home_error || "idle";
   running = Boolean(status.running);
+  if (running) {
+    statusPty.textContent = "pty: running";
+    sessionLabel.textContent = "cloakcli tui";
+    lastExit = null;
+  } else {
+    statusPty.textContent = lastExit ? `pty: ${lastExit}` : "pty: stopped";
+    sessionLabel.textContent =
+      lastExit || status.binary_error || status.home_error || "idle";
+  }
+  updateButtons();
 }
 
-async function refreshAndStart() {
-  if (starting) return;
-  starting = true;
+function noteExit(payload) {
+  const code = payload && payload.code;
+  const reason = (payload && payload.reason) || "exited";
+  const message = (payload && payload.message) || "process exited";
+  if (reason === "stopped") {
+    lastExit = "stopped";
+  } else if (code === null || code === undefined) {
+    lastExit = reason === "error" ? "error" : "exited";
+  } else {
+    lastExit = `exited ${code}`;
+  }
+  if (starting) {
+    return;
+  }
+  running = false;
+  statusPty.textContent = `pty: ${lastExit}`;
+  sessionLabel.textContent = lastExit;
+  updateButtons();
+  term.writeln("");
+  term.writeln(
+    `\x1b[90m[${message}${code === null || code === undefined ? "" : ` (code ${code})`}]\x1b[0m`,
+  );
+  term.writeln("\x1b[90mStart or Restart in the title bar to run again.\x1b[0m");
+}
+
+async function startPty({ reset, continueFrom } = {}) {
+  if (!continueFrom && (starting || stopping || running)) return;
+  if (!continueFrom) starting = true;
+  updateButtons();
   try {
     const status = await invoke("shell_status");
     applyStatus(status);
@@ -165,8 +211,10 @@ async function refreshAndStart() {
     }
 
     hideSetup();
+    if (reset) term.reset();
     fit();
     await invoke("pty_start", { cols: term.cols, rows: term.rows });
+    lastExit = null;
     const next = await invoke("shell_status");
     applyStatus(next);
     term.focus();
@@ -176,10 +224,59 @@ async function refreshAndStart() {
     if (message.toLowerCase().includes("cloakcli_home") || message.toLowerCase().includes("project root")) {
       showSetup(message, homeInput.value);
     }
+    try {
+      applyStatus(await invoke("shell_status"));
+    } catch {
+      updateButtons();
+    }
   } finally {
     starting = false;
+    updateButtons();
   }
 }
+
+async function stopPty() {
+  if (starting || stopping || !running) return;
+  stopping = true;
+  updateButtons();
+  try {
+    await invoke("pty_stop");
+    try {
+      applyStatus(await invoke("shell_status"));
+    } catch {
+      running = false;
+      updateButtons();
+    }
+  } catch (err) {
+    term.writeln(`\r\n\x1b[31m${String(err)}\x1b[0m`);
+  } finally {
+    stopping = false;
+    updateButtons();
+  }
+}
+
+async function restartPty() {
+  if (starting || stopping || !canLaunch) return;
+  // Keep `starting` set across stop so a late pty-exit cannot write into
+  // the new session or clear running after the next spawn.
+  starting = true;
+  updateButtons();
+  try {
+    await invoke("pty_stop");
+  } catch {
+    // already stopped
+  }
+  running = false;
+  await startPty({ reset: true, continueFrom: true });
+}
+
+async function refreshAndStart() {
+  await startPty();
+}
+
+btnStart.addEventListener("click", () => startPty());
+btnStop.addEventListener("click", () => stopPty());
+btnRestart.addEventListener("click", () => restartPty());
 
 async function boot() {
   await listen("pty-data", (event) => {
@@ -189,23 +286,36 @@ async function boot() {
   });
 
   await listen("pty-exit", async (event) => {
-    running = false;
-    const payload = event.payload || {};
-    const code = payload.code;
-    const message = payload.message || "process exited";
-    term.writeln("");
-    term.writeln(
-      `\x1b[90m[${message}${code === null || code === undefined ? "" : ` (code ${code})`}]\x1b[0m`,
-    );
+    noteExit(event.payload || {});
     try {
       applyStatus(await invoke("shell_status"));
     } catch {
-      statusPty.textContent = "pty: stopped";
+      running = false;
+      updateButtons();
+    }
+  });
+
+  await listen("pty-status", async (event) => {
+    const payload = event.payload || {};
+    if (!starting && payload.running === false) {
+      running = false;
+      if (payload.reason) {
+        lastExit = payload.reason === "stopped" ? "stopped" : lastExit || payload.reason;
+      }
+      statusPty.textContent = `pty: ${lastExit || "stopped"}`;
+      sessionLabel.textContent = lastExit || "idle";
+      updateButtons();
+    }
+    try {
+      applyStatus(await invoke("shell_status"));
+    } catch {
+      updateButtons();
     }
   });
 
   fit();
   await syncMaximizeIcon();
+  updateButtons();
   await refreshAndStart();
   term.focus();
 }

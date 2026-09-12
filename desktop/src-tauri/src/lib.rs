@@ -87,13 +87,14 @@ fn pty_resize(state: tauri::State<AppState>, cols: u16, rows: u16) -> Result<(),
 }
 
 #[tauri::command]
-fn pty_stop(state: tauri::State<AppState>) -> Result<(), String> {
-    pty::stop(&state.pty)
+fn pty_stop(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    pty::stop(&state.pty, Some(&app))
 }
 
 fn terminate_pty(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
-        let _ = pty::stop(&state.pty);
+        let _ = pty::stop(&state.pty, Some(app));
     }
 }
 
@@ -129,6 +130,14 @@ pub fn run() {
                 let _ = window.destroy();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running CloakCLI desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building CloakCLI desktop")
+        .run(|app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                terminate_pty(app);
+            }
+        });
 }

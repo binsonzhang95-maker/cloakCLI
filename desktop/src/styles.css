@@ -38,9 +38,41 @@ body {
   background: var(--title);
   border-bottom: 1px solid var(--title-border);
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr auto auto;
   user-select: none;
   flex-shrink: 0;
+}
+
+.titlebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+}
+
+.titlebar-actions button {
+  appearance: none;
+  height: 22px;
+  padding: 0 9px;
+  border: 1px solid var(--title-border);
+  border-radius: 4px;
+  background: #241e19;
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.titlebar-actions button:hover:not(:disabled) {
+  background: var(--btn-hover);
+  border-color: var(--accent);
+}
+
+.titlebar-actions button:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .titlebar-drag {
