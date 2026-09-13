@@ -1287,34 +1287,6 @@ fn normalize_goal(goal: Option<&str>, events: &[RecordedEvent]) -> Option<String
 
 pub fn write_skill_dir(root: &Path, mapped: &MappedSkill) -> Result<PathBuf> {
     util::validate_name(&mapped.name, "skill")?;
-    let skills = state::skills_dir(root);
-    fs::create_dir_all(&skills)?;
-    let skills_canon = util::ensure_under_root(root, &skills)?;
-    let dest = skills.join(&mapped.name);
-    // Reject `..` / absolute / symlink escape before create.
-    if mapped.name.contains("..") || mapped.name.contains('/') || mapped.name.contains('\\') {
-        bail!("invalid skill name '{}'", mapped.name);
-    }
-    let dest_check = util::ensure_under_root(root, &dest)?;
-    if !dest_check.starts_with(&skills_canon) {
-        bail!("export destination escapes skills/");
-    }
-    if dest.exists() {
-        let dest_canon = dest
-            .canonicalize()
-            .with_context(|| format!("canonicalize {}", dest.display()))?;
-        if !dest_canon.starts_with(&skills_canon) {
-            bail!("export destination escapes skills/ (symlink)");
-        }
-    }
-    let existing_sj = dest.join("skill.json");
-    if existing_sj.is_file() && !mapped.overwrite {
-        bail!(
-            "Skill already exists: {} (export refused; pick another name or confirm overwrite)",
-            mapped.name
-        );
-    }
-
     let mut skill = json!({
         "schema_version": 1,
         "name": mapped.name,
@@ -1326,54 +1298,18 @@ pub fn write_skill_dir(root: &Path, mapped: &MappedSkill) -> Result<PathBuf> {
         skill["goal"] = json!(g);
     }
     crate::skills::assert_no_plaintext_secrets(&skill)?;
-
-    let created_dir = !dest.exists();
-    fs::create_dir_all(&dest)?;
-    let dest_canon = dest
-        .canonicalize()
-        .with_context(|| format!("canonicalize created {}", dest.display()))?;
-    if !dest_canon.starts_with(&skills_canon) {
-        if created_dir {
-            let _ = fs::remove_dir_all(&dest);
-        }
-        bail!("export destination escaped skills/; refused");
-    }
-
-    let sj = dest_canon.join("skill.json");
-    let _ = util::ensure_under_root(root, &sj)?;
-    let tmp = dest_canon.join(".skill.json.tmp");
-    let _ = util::ensure_under_root(root, &tmp)?;
     let body = format!("{}\n", serde_json::to_string_pretty(&skill)?);
-    if let Err(e) = fs::write(&tmp, &body) {
-        let _ = fs::remove_file(&tmp);
-        if created_dir {
-            let _ = fs::remove_dir_all(&dest);
-        }
-        return Err(e.into());
-    }
-    if let Err(e) = fs::rename(&tmp, &sj) {
-        let _ = fs::remove_file(&tmp);
-        if created_dir && !existing_sj.is_file() {
-            let _ = fs::remove_dir_all(&dest);
-        }
-        return Err(e.into());
-    }
-
-    let readme = dest_canon.join("README.md");
-    let _ = util::ensure_under_root(root, &readme)?;
-    fs::write(&readme, render_readme(mapped))?;
-
-    let gi = dest_canon.join(".gitignore");
-    let _ = util::ensure_under_root(root, &gi)?;
-    fs::write(&gi, "secrets.json\n.env\n*.secret\n")?;
-
-    if let Some(audit) = &mapped.audit_text {
-        let ap = dest_canon.join("AUDIT.md");
-        let _ = util::ensure_under_root(root, &ap)?;
-        let _ = fs::write(&ap, audit);
-    }
-
-    Ok(sj)
+    crate::skills::commit_skill_export(
+        root,
+        &mapped.name,
+        mapped.overwrite,
+        crate::skills::SkillExportFiles {
+            skill_json: body,
+            readme: Some(render_readme(mapped)),
+            gitignore: Some("secrets.json\n.env\n*.secret\n".into()),
+            audit: mapped.audit_text.clone(),
+        },
+    )
 }
 
 /// Teach Chat M4: export merged timeline Playwright steps as a skill.json draft.
@@ -1416,6 +1352,7 @@ pub fn export_chat_draft(
         warnings,
         path: None,
     };
+    audit.path = Some(state::skills_dir(root).join(name).join("skill.json"));
     let mapped = MappedSkill {
         name: name.to_string(),
         goal: goal.clone(),
@@ -1430,10 +1367,6 @@ pub fn export_chat_draft(
     };
     let path = write_skill_dir(root, &mapped)?;
     audit.path = Some(path.clone());
-    // Rewrite AUDIT.md now that the path is known.
-    if let Some(parent) = path.parent() {
-        let _ = fs::write(parent.join("AUDIT.md"), audit.summary_text());
-    }
     let skill: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
     crate::skills::assert_no_plaintext_secrets(&skill)?;
     Ok(ChatExportResult {
@@ -1869,6 +1802,63 @@ mod tests {
         let gi = path.parent().unwrap().join(".gitignore");
         let gi_text = fs::read_to_string(gi).unwrap();
         assert!(gi_text.contains("secrets.json"));
+        assert!(path.parent().unwrap().join("README.md").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_skill_dir_sidecar_failure_leaves_no_skill_json() {
+        let root = tmp_root();
+        let mapped = map_events_to_skill(
+            "halfskill",
+            Some("do it"),
+            &[ev_nav("https://example.com/")],
+            false,
+        )
+        .unwrap();
+        let skills = state::skills_dir(&root);
+        {
+            let _fail = crate::skills::fail_export_write("README.md");
+            let err = write_skill_dir(&root, &mapped).unwrap_err().to_string();
+            assert!(
+                err.contains("README.md") || err.contains("simulated"),
+                "{err}"
+            );
+        }
+        assert!(
+            !skills.join("halfskill").join("skill.json").exists(),
+            "sidecar failure must not leave final skill.json"
+        );
+        assert!(
+            !skills.join("halfskill").exists(),
+            "failed new export must not leave dest dir"
+        );
+        for e in fs::read_dir(&skills).unwrap() {
+            let name = e.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(".tmp-export-"),
+                "leftover staging {name}"
+            );
+        }
+
+        let path = write_skill_dir(&root, &mapped).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let mut mapped_ow = mapped.clone();
+        mapped_ow.overwrite = true;
+        mapped_ow.audit_text = Some("# audit\n".into());
+        {
+            let _fail = crate::skills::fail_export_write("AUDIT.md");
+            let err = write_skill_dir(&root, &mapped_ow)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("AUDIT.md") || err.contains("simulated"),
+                "{err}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.parent().unwrap().join("AUDIT.md").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1988,6 +1978,9 @@ mod tests {
         assert!(!blob.contains("hunter2"));
         assert!(!blob.contains("leakme"));
         assert!(!blob.contains("pairing"));
+        let parent = out.path.parent().unwrap();
+        assert!(parent.join("AUDIT.md").is_file());
+        assert!(parent.join("README.md").is_file());
         let err = export_chat_draft(
             &root,
             "taught-login",
@@ -2018,6 +2011,32 @@ mod tests {
             "{err}"
         );
         assert!(!state::skills_dir(&root).join("evil").join("skill.json").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chat_export_audit_failure_is_not_success() {
+        let root = tmp_root();
+        {
+            let _fail = crate::skills::fail_export_write("AUDIT.md");
+            let err = export_chat_draft(
+                &root,
+                "noaudit",
+                Some("g"),
+                &[json!({"action":"goto","url":"https://example.com/","source":"agent"})],
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("AUDIT.md") || err.contains("simulated"),
+                "{err}"
+            );
+        }
+        assert!(!state::skills_dir(&root)
+            .join("noaudit")
+            .join("skill.json")
+            .exists());
         let _ = fs::remove_dir_all(&root);
     }
 

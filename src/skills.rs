@@ -661,15 +661,102 @@ fn looks_like_secret_literal(s: &str) -> bool {
         || s.contains("sk-")
 }
 
-/// Root-bound draft write used by Teach Chat. Never overwrites skill.json
-/// unless `overwrite` is true. Failed validation writes nothing.
-#[allow(dead_code)]
-pub fn write_teach_draft(
+/// Files that constitute one teach skill export. Written to a staging directory
+/// then promoted into `skills/<name>/` all-or-nothing.
+pub(crate) struct SkillExportFiles {
+    pub skill_json: String,
+    pub readme: Option<String>,
+    pub gitignore: Option<String>,
+    pub audit: Option<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_EXPORT_FILE: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test helper: next export write of `file_name` (e.g. `README.md`, `AUDIT.md`)
+/// fails. Bind the guard for the duration of the call (`let _fail = ...`).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn fail_export_write(file_name: &'static str) -> FailExportWriteGuard {
+    FAIL_EXPORT_FILE.with(|c| c.set(Some(file_name)));
+    FailExportWriteGuard
+}
+
+#[cfg(test)]
+pub(crate) struct FailExportWriteGuard;
+
+#[cfg(test)]
+impl Drop for FailExportWriteGuard {
+    fn drop(&mut self) {
+        FAIL_EXPORT_FILE.with(|c| c.set(None));
+    }
+}
+
+fn write_export_file(path: &Path, contents: &str) -> Result<()> {
+    #[cfg(test)]
+    {
+        if let Some(fail) = FAIL_EXPORT_FILE.with(|c| c.get()) {
+            if path.file_name().and_then(|s| s.to_str()) == Some(fail) {
+                bail!("simulated write failure for {fail}");
+            }
+        }
+    }
+    fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+struct StagingGuard {
+    path: PathBuf,
+    disarm: bool,
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if !self.disarm {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+struct PromoteGuard {
+    /// (backup path, original dest path) for files that existed before promote.
+    backups: Vec<(PathBuf, PathBuf)>,
+    /// Dest paths that did not exist before this promote.
+    installed: Vec<PathBuf>,
+    disarm: bool,
+}
+
+impl Drop for PromoteGuard {
+    fn drop(&mut self) {
+        if self.disarm {
+            for (bak, _) in &self.backups {
+                let _ = fs::remove_file(bak);
+                let _ = fs::remove_dir_all(bak);
+            }
+            return;
+        }
+        for p in &self.installed {
+            let _ = fs::remove_file(p);
+            let _ = fs::remove_dir_all(p);
+        }
+        for (bak, orig) in &self.backups {
+            let _ = fs::rename(bak, orig);
+        }
+    }
+}
+
+/// Root-bound all-or-nothing skill-dir commit. Writes every file into a staging
+/// dir under `skills/`, then promotes into `skills/<name>/`. A sidecar write
+/// failure leaves no final `skill.json` (staging is discarded; existing dest
+/// is rolled back). Never reports success if README/AUDIT/.gitignore failed.
+pub(crate) fn commit_skill_export(
     root: &Path,
     name: &str,
-    skill: &Value,
     overwrite: bool,
-    audit: Option<&str>,
+    files: SkillExportFiles,
 ) -> Result<PathBuf> {
     util::validate_name(name, "skill")?;
     let skills = state::skills_dir(root);
@@ -695,46 +782,134 @@ pub fn write_teach_draft(
             bail!("export destination escapes skills/ (symlink)");
         }
     }
-    assert_no_plaintext_secrets(skill)?;
 
-    let created_dir = !dest.exists();
-    fs::create_dir_all(&dest)?;
+    let staging = skills.join(format!(
+        ".tmp-export-{name}-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let staging_check = util::ensure_under_root(root, &staging)?;
+    if !staging_check.starts_with(&skills_canon) {
+        bail!("export staging escapes skills/");
+    }
+
+    fs::create_dir_all(&staging)?;
+    let mut staging_guard = StagingGuard {
+        path: staging.clone(),
+        disarm: false,
+    };
+    let staging_canon = staging
+        .canonicalize()
+        .with_context(|| format!("canonicalize staging {}", staging.display()))?;
+    if !staging_canon.starts_with(&skills_canon) {
+        bail!("export staging escaped skills/; refused");
+    }
+
+    // skill.json first so a later sidecar failure exercises rollback of it.
+    let mut planned: Vec<(&str, &str)> = vec![("skill.json", files.skill_json.as_str())];
+    if let Some(text) = &files.readme {
+        planned.push(("README.md", text.as_str()));
+    }
+    if let Some(text) = &files.gitignore {
+        planned.push((".gitignore", text.as_str()));
+    }
+    if let Some(text) = &files.audit {
+        planned.push(("AUDIT.md", text.as_str()));
+    }
+
+    for (fname, body) in &planned {
+        let p = staging_canon.join(fname);
+        let _ = util::ensure_under_root(root, &p)?;
+        write_export_file(&p, body)?;
+    }
+
+    let dest_existed = dest.exists();
+    if !dest_existed {
+        fs::rename(&staging_canon, &dest).with_context(|| {
+            format!(
+                "promote staging {} → {}",
+                staging_canon.display(),
+                dest.display()
+            )
+        })?;
+        staging_guard.disarm = true;
+    } else {
+        promote_into_existing(root, &staging_canon, &dest, &planned)?;
+        let _ = fs::remove_dir_all(&staging_canon);
+        staging_guard.disarm = true;
+    }
+
     let dest_canon = dest
         .canonicalize()
-        .with_context(|| format!("canonicalize created {}", dest.display()))?;
+        .with_context(|| format!("canonicalize promoted {}", dest.display()))?;
     if !dest_canon.starts_with(&skills_canon) {
-        if created_dir {
+        if !dest_existed {
             let _ = fs::remove_dir_all(&dest);
         }
         bail!("export destination escaped skills/; refused");
     }
-
     let sj = dest_canon.join("skill.json");
     let _ = util::ensure_under_root(root, &sj)?;
-    let tmp = dest_canon.join(".skill.json.tmp");
-    let _ = util::ensure_under_root(root, &tmp)?;
-    let body = format!("{}\n", serde_json::to_string_pretty(skill)?);
-    if let Err(e) = fs::write(&tmp, &body) {
-        let _ = fs::remove_file(&tmp);
-        if created_dir {
-            let _ = fs::remove_dir_all(&dest);
-        }
-        return Err(e.into());
-    }
-    if let Err(e) = fs::rename(&tmp, &sj) {
-        let _ = fs::remove_file(&tmp);
-        if created_dir && !sj_existing.is_file() {
-            let _ = fs::remove_dir_all(&dest);
-        }
-        return Err(e.into());
-    }
-
-    if let Some(text) = audit {
-        let ap = dest_canon.join("AUDIT.md");
-        let _ = util::ensure_under_root(root, &ap)?;
-        let _ = fs::write(&ap, text);
-    }
     Ok(sj)
+}
+
+fn promote_into_existing(
+    root: &Path,
+    staging: &Path,
+    dest: &Path,
+    planned: &[(&str, &str)],
+) -> Result<()> {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let mut guard = PromoteGuard {
+        backups: Vec::new(),
+        installed: Vec::new(),
+        disarm: false,
+    };
+    for (fname, _) in planned {
+        let src = staging.join(fname);
+        let dst = dest.join(fname);
+        let _ = util::ensure_under_root(root, &dst)?;
+        if dst.exists() {
+            let bak = dest.join(format!(".export-bak-{token}-{fname}"));
+            let _ = util::ensure_under_root(root, &bak)?;
+            fs::rename(&dst, &bak).with_context(|| {
+                format!("backup {} → {}", dst.display(), bak.display())
+            })?;
+            guard.backups.push((bak, dst.clone()));
+        } else {
+            guard.installed.push(dst.clone());
+        }
+        fs::rename(&src, &dst)
+            .with_context(|| format!("install {} → {}", src.display(), dst.display()))?;
+    }
+    guard.disarm = true;
+    Ok(())
+}
+
+/// Root-bound draft write used by Teach Chat. Never overwrites skill.json
+/// unless `overwrite` is true. Failed validation writes nothing. Sidecar
+/// (AUDIT) write failure does not leave a final skill.json.
+#[allow(dead_code)]
+pub fn write_teach_draft(
+    root: &Path,
+    name: &str,
+    skill: &Value,
+    overwrite: bool,
+    audit: Option<&str>,
+) -> Result<PathBuf> {
+    util::validate_name(name, "skill")?;
+    assert_no_plaintext_secrets(skill)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(skill)?);
+    commit_skill_export(
+        root,
+        name,
+        overwrite,
+        SkillExportFiles {
+            skill_json: body,
+            readme: None,
+            gitignore: None,
+            audit: audit.map(|s| s.to_string()),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -857,6 +1032,63 @@ mod tests {
         assert!(err.contains("Invalid") || err.contains("invalid"), "{err}");
         assert_eq!(fs::read_to_string(&p).unwrap(), original);
         write_teach_draft(&root, "demo-draft", &skill, true, None).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_teach_draft_sidecar_failure_leaves_no_skill_json() {
+        let root = tmp_root();
+        let skill = json!({
+            "schema_version": 1,
+            "name": "half-draft",
+            "steps": [{"action":"goto","url":"https://example.com/","source":"agent"}]
+        });
+        let skills = state::skills_dir(&root);
+        {
+            let _fail = fail_export_write("AUDIT.md");
+            let err = write_teach_draft(&root, "half-draft", &skill, false, Some("# audit\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("AUDIT.md") || err.contains("simulated"),
+                "{err}"
+            );
+        }
+        assert!(
+            !skills.join("half-draft").join("skill.json").exists(),
+            "sidecar failure must not leave final skill.json"
+        );
+        assert!(
+            !skills.join("half-draft").exists(),
+            "failed new export must not leave dest dir"
+        );
+        for e in fs::read_dir(&skills).unwrap() {
+            let name = e.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(".tmp-export-"),
+                "leftover staging {name}"
+            );
+        }
+
+        let p = write_teach_draft(&root, "half-draft", &skill, false, Some("# audit\n")).unwrap();
+        let original = fs::read_to_string(&p).unwrap();
+        assert!(p.parent().unwrap().join("AUDIT.md").is_file());
+        {
+            let _fail = fail_export_write("AUDIT.md");
+            let err = write_teach_draft(&root, "half-draft", &skill, true, Some("# audit2\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("AUDIT.md") || err.contains("simulated"),
+                "{err}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&p).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(p.parent().unwrap().join("AUDIT.md")).unwrap(),
+            "# audit\n"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
