@@ -1,7 +1,7 @@
-"""Thin Teach Hub client (M1): JSONL Envelope over loopback TCP.
+"""Thin Teach Hub client: JSONL Envelope over loopback TCP.
 
-Pairs with a short code, heartbeats, and reconnects without creating a
-new session. Does not log tokens, cookies, or passwords.
+M1: pairing, heartbeats, reconnect, page_state.
+M2: action_request / action_result / cancel. Does not log tokens, cookies, or passwords.
 """
 
 from __future__ import annotations
@@ -24,6 +24,12 @@ TYPE_PAIRING_RESULT = "pairing_result"
 TYPE_PAGE_STATE = "page_state"
 TYPE_HEARTBEAT = "heartbeat"
 TYPE_ERROR = "error"
+TYPE_CANCEL = "cancel"
+TYPE_ACTION_REQUEST = "action_request"
+TYPE_ACTION_RESULT = "action_result"
+TYPE_CHAT_MESSAGE = "chat_message"
+TYPE_LLM_STREAM = "llm_stream"
+TYPE_HUMAN_CONFIRM = "human_confirm"
 
 
 def selector_from_obj(obj: dict[str, Any] | None) -> str | None:
@@ -166,6 +172,8 @@ class TeachHubClient:
         pairing_code: str,
         role: str = "worker",
         on_page_state: Callable[[dict[str, Any]], None] | None = None,
+        on_action_request: Callable[[dict[str, Any]], None] | None = None,
+        on_cancel: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.host = host
         self.port = int(port)
@@ -173,6 +181,8 @@ class TeachHubClient:
         self.pairing_code = pairing_code
         self.role = role
         self.on_page_state = on_page_state
+        self.on_action_request = on_action_request
+        self.on_cancel = on_cancel
         self.session_id: str | None = None
         self.session_token: str | None = None
         self.paired = threading.Event()
@@ -180,6 +190,11 @@ class TeachHubClient:
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
         self.last_error: str | None = None
+        self._cancel = threading.Event()
+        self._current_request_id: str | None = None
+        # M3: takeover_start must set this so the agent cannot race the human
+        # on the same Playwright page. M2 only exposes the hook/flag.
+        self.executor_paused = False
 
     def stop(self) -> None:
         self._stop.set()
@@ -217,9 +232,25 @@ class TeachHubClient:
             time.sleep(backoff)
             backoff = min(backoff * 2, 15.0)
 
-    def send(self, msg_type: str, data: dict[str, Any] | None = None) -> None:
+    def send(
+        self,
+        msg_type: str,
+        data: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> None:
         env = envelope(msg_type, data, self.session_id)
+        if request_id:
+            env["request_id"] = request_id
         self._write(env)
+
+    def cancel_requested(self) -> bool:
+        return self._cancel.is_set() or self._stop.is_set()
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+
+    def clear_cancel(self) -> None:
+        self._cancel.clear()
 
     def _session(self, _backoff: float) -> None:
         sock = socket.create_connection((self.host, self.port), timeout=5)
@@ -311,6 +342,40 @@ class TeachHubClient:
                 if data.get("session_token"):
                     self.session_token = str(data["session_token"])
                 self.paired.set()
+        elif t == TYPE_CANCEL:
+            self._cancel.set()
+            if self.on_cancel:
+                try:
+                    self.on_cancel(env)
+                except Exception:
+                    pass
+        elif t == TYPE_ACTION_REQUEST:
+            if self.executor_paused:
+                self.send(
+                    TYPE_ACTION_RESULT,
+                    {
+                        "ok": False,
+                        "error": "executor_paused",
+                        "results": [],
+                    },
+                    request_id=env.get("request_id"),
+                )
+                return
+            if self.on_action_request:
+                self._current_request_id = env.get("request_id")
+                self._cancel.clear()
+                try:
+                    self.on_action_request(env)
+                except Exception as e:
+                    self.send(
+                        TYPE_ACTION_RESULT,
+                        {
+                            "ok": False,
+                            "error": type(e).__name__,
+                            "results": [],
+                        },
+                        request_id=env.get("request_id"),
+                    )
 
     def _write(self, env: dict[str, Any], sock: socket.socket | None = None) -> None:
         raw = (json.dumps(env, ensure_ascii=False) + "\n").encode("utf-8")

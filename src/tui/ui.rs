@@ -334,6 +334,12 @@ fn draw_main(f: &mut Frame, area: Rect, app: &mut App) {
     match app.tab {
         Tab::Config => draw_config(f, area, app),
         Tab::Logs => draw_logs(f, area, app),
+        Tab::Chat => {
+            let profile = app
+                .selected_profile_name()
+                .unwrap_or_else(|| "(none)".into());
+            super::chat::draw(f, area, &app.chat, &profile, "");
+        }
         _ => draw_split_list_detail(f, area, app),
     }
 }
@@ -992,7 +998,7 @@ fn help_bits(pairs: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
 
 fn context_help(tab: Tab) -> Vec<Span<'static>> {
     let common = help_bits(&[
-        ("Tab/1-6", "panes"),
+        ("Tab/1-7", "panes"),
         ("jk/↑↓", ""),
         ("h", "headed"),
         ("c/[ ]", "conc"),
@@ -1028,6 +1034,12 @@ fn context_help(tab: Tab) -> Vec<Span<'static>> {
             s.extend(help_bits(&[("r", "reload lists")]));
             s
         }
+        Tab::Chat => help_bits(&[
+            ("Enter", "send"),
+            ("Ctrl-C", "cancel"),
+            ("Y/N", "confirm nav"),
+            ("Ctrl-T/R/E", "M3/M4 stub"),
+        ]),
     };
     spans.push(Span::styled("  │  ", style_desc()));
     spans.extend(common);

@@ -12,6 +12,12 @@ class ActionSchemaTests(unittest.TestCase):
         a = validate_action({"schema_version": 1, "action": "click", "css": "a"})
         self.assertEqual(a.type, "click")
         self.assertEqual(a.css, "a")
+        self.assertEqual(a.selector, "a")
+
+    def test_click_selector_canonical(self):
+        a = validate_action({"schema_version": 1, "action": "click", "selector": "#ok", "css": "#legacy"})
+        self.assertEqual(a.selector, "#ok")
+        self.assertEqual(a.css, "#ok")
 
     def test_click_coords_ok(self):
         a = validate_action({"action": "click", "x": 10, "y": 20, "screenshot_id": "obs-001"})

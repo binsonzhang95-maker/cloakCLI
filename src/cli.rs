@@ -212,6 +212,31 @@ pub enum TeachCmd {
         #[arg(long)]
         no_smart_optimize: bool,
     },
+    /// Headed Teach Chat TUI (M2): dialogue → validated actions → worker
+    Chat {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        url: Option<String>,
+        /// Mock model JSON (skip network). Env CLOAKCLI_TEACH_CHAT_MOCK also works.
+        #[arg(long)]
+        mock_json: Option<String>,
+    },
+    /// One-shot chat turn: parse/validate (and optionally execute via a live hub)
+    Turn {
+        /// User goal (required unless --mock-json is a full turn fixture)
+        #[arg(long)]
+        goal: Option<String>,
+        /// Mock model JSON instead of calling the LLM
+        #[arg(long)]
+        mock_json: Option<String>,
+        /// Origin allowlist entries (repeatable), e.g. https://example.com
+        #[arg(long = "allow-origin")]
+        allow_origins: Vec<String>,
+        /// Current page origin for high-risk nav detection
+        #[arg(long)]
+        current_origin: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1129,6 +1154,52 @@ pub async fn handle_teach(root: &Path, action: TeachCmd) -> Result<()> {
                 },
             )
             .await
+        }
+        TeachCmd::Chat {
+            profile,
+            url,
+            mock_json,
+        } => {
+            crate::teach::start_chat(
+                root,
+                crate::teach::TeachStartOpts {
+                    profile,
+                    url,
+                    allow_secrets: false,
+                    smart_optimize: false,
+                },
+                mock_json,
+            )
+            .await
+        }
+        TeachCmd::Turn {
+            goal,
+            mock_json,
+            allow_origins,
+            current_origin,
+        } => {
+            let mock = mock_json.as_deref();
+            let goal = goal.unwrap_or_default();
+            if mock.is_none() && goal.trim().is_empty() {
+                anyhow::bail!("teach turn requires --goal or --mock-json");
+            }
+            let text = if let Some(m) = mock {
+                m.to_string()
+            } else {
+                let llm = crate::teach_chat::live_llm_from_root(root)?;
+                let messages = crate::teach_chat::build_messages(&goal, None, &allow_origins);
+                crate::teach_chat::TeachLlm::complete(&llm, &messages)?
+            };
+            let planned = crate::teach_chat::plan_turn(
+                &text,
+                &allow_origins,
+                current_origin.as_deref(),
+            );
+            print!("{}", crate::teach_chat::format_plan(&planned));
+            if !planned.errors.is_empty() {
+                anyhow::bail!("validate failed");
+            }
+            Ok(())
         }
     }
 }

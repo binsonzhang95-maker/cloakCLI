@@ -51,6 +51,94 @@ fn help_lists_teach_start() {
     assert!(start.status.success(), "{}", combined(&start));
     let s = combined(&start);
     assert!(s.contains("profile"), "{s}");
+    let chat = bin()
+        .args(["teach", "chat", "--help"])
+        .output()
+        .expect("run");
+    assert!(chat.status.success(), "{}", combined(&chat));
+    let c = combined(&chat);
+    assert!(c.contains("mock-json") || c.contains("mock_json") || c.contains("Chat"), "{c}");
+    let turn = bin()
+        .args(["teach", "turn", "--help"])
+        .output()
+        .expect("run");
+    assert!(turn.status.success(), "{}", combined(&turn));
+    let t = combined(&turn);
+    assert!(t.contains("goal") && t.contains("mock-json"), "{t}");
+}
+
+#[test]
+fn turn_validates_mock_json_and_rejects_danger() {
+    let home = tmp_home();
+    let ok = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "turn",
+            "--goal",
+            "click the link",
+            "--mock-json",
+            r#"{"schema_version":1,"actions":[{"action":"click","selector":"a"},{"action":"done","reason":"ok"}]}"#,
+        ])
+        .output()
+        .expect("run");
+    assert!(ok.status.success(), "{}", combined(&ok));
+    let t = combined(&ok);
+    assert!(t.contains("VALIDATE_OK"), "{t}");
+    assert!(t.contains("click"), "{t}");
+
+    let bad = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "turn",
+            "--goal",
+            "pwn",
+            "--mock-json",
+            r#"{"schema_version":1,"actions":[{"action":"shell","cmd":"id"}]}"#,
+        ])
+        .output()
+        .expect("run");
+    assert!(!bad.status.success(), "{}", combined(&bad));
+    let t = combined(&bad);
+    assert!(t.contains("VALIDATE_FAIL") || t.contains("forbidden"), "{t}");
+
+    let over = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "turn",
+            "--goal",
+            "many",
+            "--mock-json",
+            r#"{"schema_version":1,"actions":[{"action":"wait","ms":1},{"action":"wait","ms":1},{"action":"wait","ms":1},{"action":"done","reason":"x"}]}"#,
+        ])
+        .output()
+        .expect("run");
+    assert!(!over.status.success(), "{}", combined(&over));
+
+    let cross = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "turn",
+            "--goal",
+            "go elsewhere",
+            "--allow-origin",
+            "https://example.com",
+            "--allow-origin",
+            "https://other.example",
+            "--current-origin",
+            "https://example.com",
+            "--mock-json",
+            r#"{"schema_version":1,"actions":[{"action":"goto","url":"https://other.example/login"}]}"#,
+        ])
+        .output()
+        .expect("run");
+    assert!(cross.status.success(), "{}", combined(&cross));
+    let t = combined(&cross);
+    assert!(t.contains("NEEDS_CONFIRM"), "{t}");
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]

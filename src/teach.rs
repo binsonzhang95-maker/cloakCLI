@@ -360,6 +360,108 @@ pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
     result
 }
 
+/// M2: headed browser + Teach Chat TUI in the same process as the hub.
+pub async fn start_chat(
+    root: &Path,
+    opts: TeachStartOpts,
+    mock_json: Option<String>,
+) -> Result<()> {
+    require_headed(true)?;
+    util::validate_name(&opts.profile, "profile")?;
+    let prof = profiles::get(root, &opts.profile)?;
+    let ext_src = resolve_extension_dir(root)?;
+    if manifest_has_all_urls(&ext_src)? {
+        bail!("teach extension manifest must not use <all_urls>");
+    }
+    if !ext_src.join("background.js").is_file() || !ext_src.join("content.js").is_file() {
+        bail!("teach extension at {} is incomplete", ext_src.display());
+    }
+
+    let udir = PathBuf::from(&prof.user_data_dir);
+    let _ = util::ensure_under_root(root, &udir)?;
+    fs::create_dir_all(&udir)?;
+    let _lock = acquire_teach_lock(root, &prof.name).await?;
+    let py = python_bin()?;
+    preflight_browser_binary(&py)?;
+
+    let mut allow_origins = Vec::new();
+    if let Some(ref u) = opts.url {
+        if let Some(o) = http_origin(u) {
+            allow_origins.push(o);
+        }
+    }
+
+    let hub = crate::teach_hub::spawn(crate::teach_hub::TeachHubOpts {
+        allow_origins: allow_origins.clone(),
+    })
+    .await
+    .context("start teach hub on 127.0.0.1")?;
+    let hub_url = format!("ws://127.0.0.1:{}", hub.port());
+
+    let staged = stage_extension(
+        root,
+        &ext_src,
+        &ExtConfig {
+            export_origin: "http://127.0.0.1:0".into(),
+            token: uuid::Uuid::new_v4().simple().to_string(),
+            allow_origins,
+            allow_secrets: false,
+            smart_optimize: false,
+            profile: prof.name.clone(),
+            hub_url: Some(hub_url.clone()),
+            pairing_code: Some(hub.pairing_code().to_string()),
+            pairing_id: Some(hub.pairing_id().to_string()),
+        },
+    )?;
+
+    let mut cmd = teach_browser_command(
+        root,
+        &prof.user_data_dir,
+        &staged,
+        opts.url.as_deref(),
+        prof.proxy.as_deref(),
+        Some(HubConnect {
+            addr: format!("127.0.0.1:{}", hub.port()),
+            pairing_id: hub.pairing_id().to_string(),
+            pairing_code: hub.pairing_code().to_string(),
+        }),
+    )?;
+    let log_path = state::data_dir(root).join("teach").join("chat-worker.log");
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::File::create(&log_path) {
+        Ok(f) => {
+            cmd.stdout(Stdio::from(f.try_clone()?));
+            cmd.stderr(Stdio::from(f));
+        }
+        Err(_) => {
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
+    }
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| "spawn teach browser for chat")?;
+
+    let profile = prof.name.clone();
+    let chat_result = crate::tui::chat::run_dedicated(
+        root,
+        hub,
+        crate::tui::chat::DedicatedOpts {
+            profile,
+            mock_json,
+        },
+    )
+    .await;
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = fs::remove_dir_all(&staged);
+    chat_result
+}
+
 async fn acquire_teach_lock(root: &Path, profile: &str) -> Result<ProfileLock> {
     match ProfileLock::acquire(root, profile, Duration::from_secs(2)).await {
         Ok(lock) => Ok(lock),
@@ -416,14 +518,14 @@ struct HubConnect {
     pairing_code: String,
 }
 
-async fn run_browser(
+fn teach_browser_command(
     root: &Path,
     user_data_dir: &str,
     extension: &Path,
     url: Option<&str>,
     proxy: Option<&str>,
     hub: Option<HubConnect>,
-) -> Result<()> {
+) -> Result<Command> {
     let py = python_bin()?;
     let mut cmd = Command::new(&py);
     cmd.arg("-m")
@@ -474,12 +576,24 @@ async fn run_browser(
     cmd.env("PYTHONUNBUFFERED", "1");
     cmd.current_dir(root);
     cmd.stdin(Stdio::null());
+    Ok(cmd)
+}
+
+async fn run_browser(
+    root: &Path,
+    user_data_dir: &str,
+    extension: &Path,
+    url: Option<&str>,
+    proxy: Option<&str>,
+    hub: Option<HubConnect>,
+) -> Result<()> {
+    let mut cmd = teach_browser_command(root, user_data_dir, extension, url, proxy, hub)?;
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn {py} -m cloakcli_worker.teach"))?;
+        .context("spawn python -m cloakcli_worker.teach")?;
 
     tokio::select! {
         status = child.wait() => {

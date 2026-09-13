@@ -157,6 +157,52 @@ impl MsgType {
                 | Self::AllowlistUpdate
         )
     }
+
+    pub fn is_m2(self) -> bool {
+        matches!(
+            self,
+            Self::ChatMessage
+                | Self::LlmStream
+                | Self::ActionRequest
+                | Self::ActionResult
+                | Self::HumanConfirm
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn is_m3(self) -> bool {
+        matches!(
+            self,
+            Self::TakeoverStart | Self::TakeoverEvent | Self::TakeoverStop | Self::NormalizeResult | Self::Resume
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn is_m4(self) -> bool {
+        matches!(self, Self::Export | Self::ExportResult)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeachMachine {
+    Chat,
+    AgentActing,
+    AwaitingConfirm,
+    Cancel,
+    Error,
+}
+
+impl TeachMachine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::AgentActing => "agent_acting",
+            Self::AwaitingConfirm => "awaiting_confirm",
+            Self::Cancel => "cancel",
+            Self::Error => "error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -947,6 +993,9 @@ mod tests {
             Some(MsgType::ActionRequest)
         );
         assert!(!MsgType::ActionRequest.is_m1());
+        assert!(MsgType::ActionRequest.is_m2());
         assert!(MsgType::PageState.is_m1());
+        assert!(!MsgType::TakeoverStart.is_m1());
+        assert!(!MsgType::Export.is_m1());
     }
 }

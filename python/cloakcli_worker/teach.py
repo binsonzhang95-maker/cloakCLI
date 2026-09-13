@@ -13,10 +13,12 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from .browser import launch_context
 from .paths import PathTrustError, ensure_under_root, set_root
-from .teach_hub import TeachHubClient
+from .redact import redact_any, redact_text
+from .teach_hub import TeachHubClient, TYPE_ACTION_RESULT
 
 
 def _require_headed(headed: bool) -> None:
@@ -124,10 +126,6 @@ def main(argv: list[str] | None = None) -> int:
 
     hub_client = _maybe_hub_client(args)
     hub_thread: threading.Thread | None = None
-    if hub_client is not None:
-        hub_thread = threading.Thread(target=hub_client.run, name="teach-hub", daemon=True)
-        hub_thread.start()
-        hub_client.wait_paired(timeout=5.0)
 
     m1_smoke = os.environ.get("CLOAKCLI_TEACH_M1_SMOKE", "").strip().lower() in (
         "1",
@@ -146,6 +144,13 @@ def main(argv: list[str] | None = None) -> int:
         from .browser import get_page
 
         page = get_page(ctx)
+        if hub_client is not None:
+            hub_client.on_action_request = lambda env: _handle_action_request(
+                page, hub_client, env
+            )
+            hub_thread = threading.Thread(target=hub_client.run, name="teach-hub", daemon=True)
+            hub_thread.start()
+            hub_client.wait_paired(timeout=5.0)
         if m1_smoke:
             from .teach_m1_smoke import run_headed_smoke
 
@@ -166,6 +171,68 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
     return 0
+
+
+def _handle_action_request(page: Any, client: TeachHubClient, env: dict) -> None:
+    """Validate then execute schema actions. Never runs raw model text."""
+    from .actions import execute_actions, parse_actions_payload
+
+    request_id = env.get("request_id")
+    data = env.get("data") if isinstance(env.get("data"), dict) else {}
+    # Refuse a raw LLM string even if a caller stuffed it into data.text.
+    parsed = parse_actions_payload(data)
+    if parsed.errors and not parsed.actions:
+        client.send(
+            TYPE_ACTION_RESULT,
+            redact_any(
+                {
+                    "ok": False,
+                    "error": "; ".join(parsed.errors)[:300],
+                    "results": [],
+                }
+            ),
+            request_id=request_id,
+        )
+        return
+
+    allow = data.get("allow_origins") if isinstance(data.get("allow_origins"), list) else []
+    allow = [str(o) for o in allow if isinstance(o, str)]
+    confirmed = bool(data.get("confirmed"))
+    results = execute_actions(
+        page,
+        parsed.actions,
+        allow_origins=allow,
+        cancel_check=client.cancel_requested,
+        confirmed=confirmed,
+        executor_paused=client.executor_paused,
+    )
+    payload_results = []
+    page_out = None
+    ok = True
+    for r in results:
+        rec = {
+            "status": r.status,
+            "reason": redact_text(r.reason or ""),
+            "action": r.action,
+            "page": r.page,
+        }
+        payload_results.append(rec)
+        if r.page:
+            page_out = r.page
+        if r.status not in ("ok", "done"):
+            ok = False
+    client.send(
+        TYPE_ACTION_RESULT,
+        redact_any(
+            {
+                "ok": ok,
+                "results": payload_results,
+                "page": page_out,
+                "errors": parsed.errors,
+            }
+        ),
+        request_id=request_id,
+    )
 
 
 def _maybe_hub_client(args: argparse.Namespace) -> TeachHubClient | None:

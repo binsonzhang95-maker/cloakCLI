@@ -2,6 +2,7 @@
 //! Local multi-browser sessions are shown from the node daemon; fleet clients
 //! register via outbound connections to the embedded master hub.
 
+pub mod chat;
 mod ui;
 
 use anyhow::Result;
@@ -36,6 +37,7 @@ enum Tab {
     Clients = 3,
     Config = 4,
     Logs = 5,
+    Chat = 6,
 }
 
 impl Tab {
@@ -46,17 +48,19 @@ impl Tab {
             Tab::Sessions => Tab::Clients,
             Tab::Clients => Tab::Config,
             Tab::Config => Tab::Logs,
-            Tab::Logs => Tab::Profiles,
+            Tab::Logs => Tab::Chat,
+            Tab::Chat => Tab::Profiles,
         }
     }
     fn prev(self) -> Self {
         match self {
-            Tab::Profiles => Tab::Logs,
+            Tab::Profiles => Tab::Chat,
             Tab::Skills => Tab::Profiles,
             Tab::Sessions => Tab::Skills,
             Tab::Clients => Tab::Sessions,
             Tab::Config => Tab::Clients,
             Tab::Logs => Tab::Config,
+            Tab::Chat => Tab::Logs,
         }
     }
     fn title_bilingual(self) -> &'static str {
@@ -67,9 +71,10 @@ impl Tab {
             Tab::Clients => "Clients",
             Tab::Config => "Config",
             Tab::Logs => "Logs",
+            Tab::Chat => "Chat",
         }
     }
-    fn all() -> [Tab; 6] {
+    fn all() -> [Tab; 7] {
         [
             Tab::Profiles,
             Tab::Skills,
@@ -77,6 +82,7 @@ impl Tab {
             Tab::Clients,
             Tab::Config,
             Tab::Logs,
+            Tab::Chat,
         ]
     }
 }
@@ -188,6 +194,7 @@ struct App {
     busy: Option<BusyKind>,
     pending: Option<JoinHandle<PendingDone>>,
     throbber_state: throbber_widgets_tui::ThrobberState,
+    chat: crate::teach_chat::ChatSession,
 }
 
 impl App {
@@ -236,6 +243,7 @@ impl App {
             busy: None,
             pending: None,
             throbber_state: throbber_widgets_tui::ThrobberState::default(),
+            chat: crate::teach_chat::ChatSession::default(),
         };
         app.reload_static()?;
         Ok(app)
@@ -1192,6 +1200,31 @@ impl App {
         }
         Ok(())
     }
+
+    fn chat_send(&mut self) {
+        let goal = self.chat.input.clone();
+        if goal.trim().is_empty() {
+            return;
+        }
+        if let Some(mock) = crate::teach_chat::mock_llm_from_env() {
+            chat::dry_send(&mut self.chat, &mock.text, &[]);
+            return;
+        }
+        match crate::teach_chat::plan_from_mock_or_llm(&self.root, &goal, None) {
+            Ok(p) => {
+                self.chat.input.clear();
+                self.chat.push_user(&goal);
+                crate::teach_chat::apply_plan(&mut self.chat, &p);
+            }
+            Err(e) => {
+                let msg = crate::llm::redact_secrets(&e.to_string(), None);
+                self.chat.push_system(&format!(
+                    "{msg}  (or set CLOAKCLI_TEACH_CHAT_MOCK / cloakcli teach turn --mock-json)"
+                ));
+                self.chat.phase = crate::teach_protocol::TeachMachine::Chat;
+            }
+        }
+    }
 }
 
 async fn list_sessions_async(root: &Path) -> Result<Vec<SessionRow>> {
@@ -1330,6 +1363,37 @@ async fn event_loop(
                     continue;
                 }
 
+                if app.tab == Tab::Chat && app.input_mode.is_none() {
+                    match key.code {
+                        KeyCode::Tab => {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                app.tab = app.tab.prev();
+                            } else {
+                                app.tab = app.tab.next();
+                            }
+                            continue;
+                        }
+                        KeyCode::BackTab => {
+                            app.tab = app.tab.prev();
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let cmd = chat::handle_key(&mut app.chat, key.code, key.modifiers);
+                    if chat::apply_cmd_local(&mut app.chat, cmd) {
+                        break;
+                    }
+                    if cmd == chat::ChatCmd::Send {
+                        app.chat_send();
+                    } else if cmd == chat::ChatCmd::ConfirmYes {
+                        app.chat.status = "confirmed (dry-run — cloakcli teach chat executes)".into();
+                        app.chat.confirm = None;
+                        app.chat.phase = crate::teach_protocol::TeachMachine::Chat;
+                    }
+                    app.status = app.chat.status.clone();
+                    continue;
+                }
+
                 if app.input_mode.is_some() {
                     match key.code {
                         KeyCode::Esc => {
@@ -1371,6 +1435,7 @@ async fn event_loop(
                     KeyCode::Char('4') => app.tab = Tab::Clients,
                     KeyCode::Char('5') => app.tab = Tab::Config,
                     KeyCode::Char('6') => app.tab = Tab::Logs,
+                    KeyCode::Char('7') => app.tab = Tab::Chat,
                     KeyCode::Char('r') => {
                         let _ = app.reload_static();
                         app.log("reloaded");

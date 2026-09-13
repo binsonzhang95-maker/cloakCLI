@@ -1,10 +1,10 @@
-//! Loopback Teach Hub: session, pairing, page_state (M1).
+//! Loopback Teach Hub: session, pairing, page_state (M1) + action routing (M2).
 //!
 //! Listens on 127.0.0.1 only. Speaks WebSocket (MV3 extension) and JSONL
 //! (Python worker) with the same Envelope. Does not log tokens/cookies/passwords.
 //!
-//! M3: takeover_start must pause the LLM/action executor so it cannot race
-//! the human on the same Playwright page. Not implemented in M1.
+//! M3: takeover_start must set `executor_paused` so the LLM/action executor
+//! cannot race the human on the same Playwright page.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -16,17 +16,18 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::teach_protocol::{
     self, pairing_accept_from_data, pairing_offer_data, redact_for_log, ClientRole, Envelope,
-    PageState, ProtocolError, MAX_MESSAGE_BYTES, MAX_PAIRING_FAILURES, TYPE_HEARTBEAT,
-    TYPE_PAGE_STATE, TYPE_PAIRING_OFFER, TYPE_PAIRING_RESULT,
+    PageState, ProtocolError, TeachMachine, MAX_MESSAGE_BYTES, MAX_PAIRING_FAILURES,
+    TYPE_ACTION_REQUEST, TYPE_ACTION_RESULT, TYPE_CANCEL, TYPE_HEARTBEAT, TYPE_PAGE_STATE,
+    TYPE_PAIRING_OFFER, TYPE_PAIRING_RESULT,
 };
 
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
-const TIMELINE_CAP: usize = 64;
+const TIMELINE_CAP: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct TeachHubOpts {
@@ -37,9 +38,7 @@ pub struct TeachHubHandle {
     pub addr: SocketAddr,
     pairing_id: String,
     pairing_code: String,
-    #[allow(dead_code)]
     session_id: String,
-    #[allow(dead_code)]
     inner: SharedHub,
     join: JoinHandle<()>,
 }
@@ -57,13 +56,12 @@ impl TeachHubHandle {
         &self.pairing_code
     }
 
-    pub fn abort(&self) {
-        self.join.abort();
-    }
-
-    #[cfg(test)]
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub fn abort(&self) {
+        self.join.abort();
     }
 
     #[cfg(test)]
@@ -86,6 +84,215 @@ impl TeachHubHandle {
     pub async fn reconnect_count(&self) -> u32 {
         self.inner.read().await.reconnects
     }
+
+    #[allow(dead_code)]
+    pub async fn machine(&self) -> TeachMachine {
+        self.inner.read().await.machine
+    }
+
+    pub async fn set_machine(&self, machine: TeachMachine) {
+        self.inner.write().await.machine = machine;
+    }
+
+    /// M3 hook: pause the action executor so it cannot race a human takeover.
+    #[allow(dead_code)]
+    pub async fn set_executor_paused(&self, paused: bool) {
+        self.inner.write().await.executor_paused = paused;
+    }
+
+    #[allow(dead_code)]
+    pub async fn executor_paused(&self) -> bool {
+        self.inner.read().await.executor_paused
+    }
+
+    pub async fn allow_origins(&self) -> Vec<String> {
+        self.inner.read().await.session.allow_origins.clone()
+    }
+
+    pub async fn connection_status(&self) -> (bool, bool) {
+        let g = self.inner.read().await;
+        let ext = g
+            .slots
+            .get(&ClientRole::Extension)
+            .map(|s| s.connected)
+            .unwrap_or(false);
+        let wrk = g
+            .slots
+            .get(&ClientRole::Worker)
+            .map(|s| s.connected)
+            .unwrap_or(false);
+        (ext, wrk)
+    }
+
+    #[allow(dead_code)]
+    pub async fn timeline_snapshot(&self) -> Vec<Value> {
+        let g = self.inner.read().await;
+        g.timeline
+            .iter()
+            .map(|e| {
+                json!({
+                    "seq": e.seq,
+                    "type": e.env.msg_type,
+                    "request_id": e.env.request_id,
+                    "data": e.env.data,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn last_page_brief(&self) -> Option<(String, String, String)> {
+        let ps = self.inner.read().await.session.last_page_state.clone()?;
+        Some((ps.url, ps.origin, ps.title))
+    }
+
+    /// Send validated actions to the paired worker. Raw model text must already
+    /// have been parsed; this method only forwards schema JSON.
+    pub async fn dispatch_action_request(
+        &self,
+        request_id: &str,
+        actions: Vec<Value>,
+        confirmed: bool,
+    ) -> Result<oneshot::Receiver<Envelope>> {
+        if actions.is_empty() {
+            anyhow::bail!("no actions");
+        }
+        if actions.len() > 3 {
+            anyhow::bail!("too many actions (max 3)");
+        }
+        let (tx, rx) = oneshot::channel();
+        let mut g = self.inner.write().await;
+        if g.executor_paused {
+            anyhow::bail!("executor_paused");
+        }
+        g.waiters.insert(request_id.to_string(), tx);
+        g.machine = TeachMachine::AgentActing;
+        g.seq += 1;
+        let seq = g.seq;
+        let page = g.session.last_page_state.as_ref().map(|p| {
+            json!({
+                "url": p.url,
+                "origin": p.origin,
+                "title": p.title,
+            })
+        });
+        let env = Envelope::new(TYPE_ACTION_REQUEST)
+            .with_session(&g.session.session_id)
+            .with_request(request_id)
+            .with_seq(seq)
+            .with_data(json!({
+                "schema_version": 1,
+                "actions": actions,
+                "allow_origins": g.session.allow_origins,
+                "confirmed": confirmed,
+                "page": page,
+                "state": g.machine.as_str(),
+                "origin": "llm",
+                "event": "action_request",
+            }));
+        g.timeline.push(StoredEvent {
+            seq,
+            env: env.clone(),
+        });
+        trim_timeline(&mut g.timeline);
+        let worker = g.outbound.get(&ClientRole::Worker).cloned();
+        drop(g);
+        emit_event(
+            "action_request",
+            json!({
+                "request_id": request_id,
+                "seq": seq,
+                "n": actions.len(),
+            }),
+        );
+        let Some(worker) = worker else {
+            self.complete_waiter(
+                request_id,
+                Envelope::new(TYPE_ACTION_RESULT)
+                    .with_request(request_id)
+                    .with_data(json!({"ok": false, "error": "worker_not_connected", "results": []})),
+            )
+            .await;
+            anyhow::bail!("worker not connected");
+        };
+        worker
+            .send(env)
+            .map_err(|_| anyhow::anyhow!("worker outbound closed"))?;
+        Ok(rx)
+    }
+
+    pub async fn wait_action_result(
+        &self,
+        rx: oneshot::Receiver<Envelope>,
+        timeout: Duration,
+    ) -> Result<Envelope> {
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(env)) => Ok(env),
+            Ok(Err(_)) => anyhow::bail!("action result waiter dropped"),
+            Err(_) => anyhow::bail!("action result timeout"),
+        }
+    }
+
+    pub async fn cancel_request(&self, request_id: Option<&str>) -> Result<()> {
+        let mut g = self.inner.write().await;
+        g.machine = TeachMachine::Cancel;
+        g.seq += 1;
+        let seq = g.seq;
+        let mut env = Envelope::new(TYPE_CANCEL)
+            .with_session(&g.session.session_id)
+            .with_seq(seq)
+            .with_data(json!({
+                "request_id": request_id,
+                "event": "cancel",
+                "state": "cancel",
+            }));
+        if let Some(id) = request_id {
+            env = env.with_request(id);
+        }
+        g.timeline.push(StoredEvent {
+            seq,
+            env: env.clone(),
+        });
+        trim_timeline(&mut g.timeline);
+        let worker = g.outbound.get(&ClientRole::Worker).cloned();
+        let waiter = request_id.and_then(|id| g.waiters.remove(id));
+        drop(g);
+        if let Some(w) = worker {
+            let _ = w.send(env.clone());
+        }
+        if let Some(tx) = waiter {
+            let _ = tx.send(
+                Envelope::new(TYPE_ACTION_RESULT)
+                    .with_request(request_id.unwrap_or(""))
+                    .with_data(json!({
+                        "ok": false,
+                        "cancelled": true,
+                        "results": [],
+                    })),
+            );
+        }
+        emit_event("cancel", json!({"request_id": request_id}));
+        Ok(())
+    }
+
+    async fn complete_waiter(&self, request_id: &str, env: Envelope) {
+        let mut g = self.inner.write().await;
+        if let Some(tx) = g.waiters.remove(request_id) {
+            let _ = tx.send(env);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn push_llm_stream(&self, request_id: &str, delta: &str, done: bool) {
+        let _ = (request_id, delta, done);
+        // Stream is consumed in-process by the TUI; not forwarded to the extension.
+    }
+}
+
+fn trim_timeline(tl: &mut Vec<StoredEvent>) {
+    if tl.len() > TIMELINE_CAP {
+        let drop_n = tl.len() - TIMELINE_CAP;
+        tl.drain(0..drop_n);
+    }
 }
 
 impl Drop for TeachHubHandle {
@@ -101,6 +308,12 @@ struct HubInner {
     seq: u64,
     timeline: Vec<StoredEvent>,
     reconnects: u32,
+    machine: TeachMachine,
+    /// M3: takeover_start must set this so the agent cannot race the human.
+    executor_paused: bool,
+    outbound: HashMap<ClientRole, mpsc::UnboundedSender<Envelope>>,
+    waiters: HashMap<String, oneshot::Sender<Envelope>>,
+    conn_gen: HashMap<ClientRole, u64>,
 }
 
 struct Session {
@@ -125,6 +338,7 @@ struct PairedSlot {
     token: String,
     connected: bool,
     last_seq: u64,
+    conn_gen: u64,
 }
 
 struct StoredEvent {
@@ -169,6 +383,11 @@ pub async fn spawn(opts: TeachHubOpts) -> Result<TeachHubHandle> {
         seq: 0,
         timeline: Vec::new(),
         reconnects: 0,
+        machine: TeachMachine::Chat,
+        executor_paused: false,
+        outbound: HashMap::new(),
+        waiters: HashMap::new(),
+        conn_gen: HashMap::new(),
     }));
 
     let serve_inner = inner.clone();
@@ -288,10 +507,13 @@ async fn handle_jsonl(
     inner: SharedHub,
     initial: Vec<u8>,
 ) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let (tx, rx) = mpsc::unbounded_channel::<Envelope>();
+    let write_task = tokio::spawn(pump_jsonl_writes(writer, rx));
     let mut reader = BufReader::new(reader);
     let mut leftover = initial;
     let mut authed: Option<ClientRole> = None;
+    let mut my_gen: u64 = 0;
     let mut pending = Vec::new();
 
     loop {
@@ -311,32 +533,67 @@ async fn handle_jsonl(
         for line in pending.drain(..) {
             if line.len() > MAX_MESSAGE_BYTES {
                 let err = ProtocolError::new("message_too_large", "message exceeds limit", false);
-                write_jsonl(&mut writer, &err.to_envelope(None, None)).await?;
+                let _ = tx.send(err.to_envelope(None, None));
                 continue;
             }
             match process_line(&inner, &line, &mut authed).await {
                 Ok(replies) => {
+                    if let Some(role) = authed {
+                        if my_gen == 0 {
+                            my_gen = register_outbound(&inner, role, tx.clone()).await;
+                        }
+                    }
                     for env in replies {
-                        write_jsonl(&mut writer, &env).await?;
+                        let _ = tx.send(env);
                     }
                 }
                 Err(err) => {
-                    write_jsonl(&mut writer, &err.to_envelope(None, None)).await?;
+                    let _ = tx.send(err.to_envelope(None, None));
                 }
             }
         }
         leftover.reserve(256);
         let n = reader.read_until(b'\n', &mut leftover).await?;
         if n == 0 {
-            mark_disconnected(&inner, authed).await;
+            mark_disconnected(&inner, authed, my_gen).await;
+            drop(tx);
+            let _ = write_task.await;
             return Ok(());
         }
         if leftover.len() > MAX_MESSAGE_BYTES {
             let err = ProtocolError::new("message_too_large", "message exceeds limit", false);
-            write_jsonl(&mut writer, &err.to_envelope(None, None)).await?;
+            let _ = tx.send(err.to_envelope(None, None));
             leftover.clear();
         }
     }
+}
+
+async fn pump_jsonl_writes<W: AsyncWriteExt + Unpin>(
+    mut writer: W,
+    mut rx: mpsc::UnboundedReceiver<Envelope>,
+) {
+    while let Some(env) = rx.recv().await {
+        if write_jsonl(&mut writer, &env).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn register_outbound(
+    inner: &SharedHub,
+    role: ClientRole,
+    tx: mpsc::UnboundedSender<Envelope>,
+) -> u64 {
+    let mut g = inner.write().await;
+    let gen = g.conn_gen.entry(role).or_insert(0);
+    *gen = gen.saturating_add(1);
+    let gen = *gen;
+    g.outbound.insert(role, tx);
+    if let Some(slot) = g.slots.get_mut(&role) {
+        slot.conn_gen = gen;
+        slot.connected = true;
+    }
+    gen
 }
 
 async fn write_jsonl<W: AsyncWriteExt + Unpin>(writer: &mut W, env: &Envelope) -> Result<()> {
@@ -435,7 +692,7 @@ async fn handle_websocket(
             }
             Ok(ws::WsMsg::Pong) => {}
             Ok(ws::WsMsg::Close) | Err(_) => {
-                mark_disconnected(&inner, authed).await;
+                mark_disconnected(&inner, authed, 0).await;
                 return Ok(());
             }
         }
@@ -451,11 +708,14 @@ async fn write_ws_text<W: AsyncWriteExt + Unpin>(writer: &mut W, env: &Envelope)
     Ok(())
 }
 
-async fn mark_disconnected(inner: &SharedHub, role: Option<ClientRole>) {
+async fn mark_disconnected(inner: &SharedHub, role: Option<ClientRole>, gen: u64) {
     if let Some(role) = role {
         let mut g = inner.write().await;
-        if let Some(slot) = g.slots.get_mut(&role) {
-            slot.connected = false;
+        if g.conn_gen.get(&role).copied().unwrap_or(0) == gen {
+            g.outbound.remove(&role);
+            if let Some(slot) = g.slots.get_mut(&role) {
+                slot.connected = false;
+            }
         }
     }
 }
@@ -484,30 +744,52 @@ async fn process_line(
             handle_allowlist_update(inner, &env).await
         }
         Some(teach_protocol::MsgType::Cancel) => {
-            Ok(vec![error_env(
-                "canceled",
-                "cancel noted",
-                true,
-                env.session_id.as_deref(),
-                env.request_id.as_deref(),
-            )])
+            require_auth(authed)?;
+            handle_inbound_cancel(inner, &env).await
+        }
+        Some(teach_protocol::MsgType::ActionResult) => {
+            require_auth(authed)?;
+            handle_action_result(inner, &env).await
+        }
+        Some(teach_protocol::MsgType::ChatMessage) => {
+            require_auth(authed)?;
+            handle_chat_message(inner, &env).await
+        }
+        Some(teach_protocol::MsgType::HumanConfirm) => {
+            require_auth(authed)?;
+            handle_human_confirm(inner, &env).await
+        }
+        Some(teach_protocol::MsgType::ActionRequest) | Some(teach_protocol::MsgType::LlmStream) => {
+            // Hub originates these; inbound copies are ignored.
+            Ok(vec![])
         }
         Some(teach_protocol::MsgType::TakeoverStart)
         | Some(teach_protocol::MsgType::TakeoverStop)
-        | Some(teach_protocol::MsgType::TakeoverEvent) => {
-            // M3: pause the LLM/action executor for the whole takeover window
-            // so the agent cannot race the human on the same Playwright page.
+        | Some(teach_protocol::MsgType::TakeoverEvent)
+        | Some(teach_protocol::MsgType::NormalizeResult)
+        | Some(teach_protocol::MsgType::Resume) => {
+            // M3: takeover_start must set executor_paused so the agent cannot
+            // race the human on the same Playwright page.
             Ok(vec![error_env(
                 "not_implemented",
-                "takeover is M3",
+                "takeover/normalize is M3",
                 false,
                 env.session_id.as_deref(),
                 env.request_id.as_deref(),
             )])
         }
-        Some(other) if !other.is_m1() => Ok(vec![error_env(
+        Some(teach_protocol::MsgType::Export) | Some(teach_protocol::MsgType::ExportResult) => {
+            Ok(vec![error_env(
+                "not_implemented",
+                "export is M4",
+                false,
+                env.session_id.as_deref(),
+                env.request_id.as_deref(),
+            )])
+        }
+        Some(other) if !other.is_m1() && !other.is_m2() => Ok(vec![error_env(
             "not_implemented",
-            format!("{} is not available in M1", other.as_str()),
+            format!("{} is not available yet", other.as_str()),
             false,
             env.session_id.as_deref(),
             env.request_id.as_deref(),
@@ -701,6 +983,7 @@ async fn handle_pairing_accept(
             token: token.clone(),
             connected: true,
             last_seq: 0,
+            conn_gen: 0,
         },
     );
     *authed = Some(role);
@@ -875,6 +1158,149 @@ async fn handle_allowlist_update(
     Ok(vec![Envelope::new("allowlist_update")
         .with_session(&g.session.session_id)
         .with_data(json!({"ok": true, "origin": origin}))])
+}
+
+async fn handle_action_result(
+    inner: &SharedHub,
+    env: &Envelope,
+) -> Result<Vec<Envelope>, ProtocolError> {
+    let mut g = inner.write().await;
+    g.seq += 1;
+    let seq = g.seq;
+    let mut stored = Envelope::new(TYPE_ACTION_RESULT)
+        .with_session(&g.session.session_id)
+        .with_seq(seq)
+        .with_data(env.data.clone());
+    if let Some(id) = env.request_id.as_deref() {
+        stored = stored.with_request(id);
+    }
+    g.timeline.push(StoredEvent {
+        seq,
+        env: stored.clone(),
+    });
+    trim_timeline(&mut g.timeline);
+    g.machine = TeachMachine::Chat;
+    let waiter = env
+        .request_id
+        .as_deref()
+        .and_then(|id| g.waiters.remove(id));
+    drop(g);
+    if let Some(tx) = waiter {
+        let _ = tx.send(stored.clone());
+    }
+    emit_event(
+        "action_result",
+        json!({
+            "request_id": env.request_id,
+            "ok": env.data.get("ok"),
+        }),
+    );
+    Ok(vec![stored])
+}
+
+async fn handle_inbound_cancel(
+    inner: &SharedHub,
+    env: &Envelope,
+) -> Result<Vec<Envelope>, ProtocolError> {
+    let mut g = inner.write().await;
+    g.machine = TeachMachine::Cancel;
+    g.seq += 1;
+    let seq = g.seq;
+    let stored = Envelope::new(TYPE_CANCEL)
+        .with_session(&g.session.session_id)
+        .with_seq(seq)
+        .with_request(env.request_id.as_deref().unwrap_or(""))
+        .with_data(json!({"ok": true, "cancelled": true}));
+    g.timeline.push(StoredEvent {
+        seq,
+        env: stored.clone(),
+    });
+    trim_timeline(&mut g.timeline);
+    let worker = g.outbound.get(&ClientRole::Worker).cloned();
+    let waiter = env
+        .request_id
+        .as_deref()
+        .and_then(|id| g.waiters.remove(id));
+    drop(g);
+    if let Some(w) = worker {
+        let _ = w.send(stored.clone());
+    }
+    if let Some(tx) = waiter {
+        let _ = tx.send(
+            Envelope::new(TYPE_ACTION_RESULT)
+                .with_request(env.request_id.as_deref().unwrap_or(""))
+                .with_data(json!({"ok": false, "cancelled": true, "results": []})),
+        );
+    }
+    Ok(vec![stored])
+}
+
+async fn handle_chat_message(
+    inner: &SharedHub,
+    env: &Envelope,
+) -> Result<Vec<Envelope>, ProtocolError> {
+    let text = env
+        .data
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if text.is_empty() {
+        return Err(ProtocolError::new("invalid_data", "empty chat text", false));
+    }
+    let mut g = inner.write().await;
+    g.seq += 1;
+    let seq = g.seq;
+    let stored = Envelope::new(teach_protocol::TYPE_CHAT_MESSAGE)
+        .with_session(&g.session.session_id)
+        .with_seq(seq)
+        .with_data(json!({
+            "text": redact_for_log(text),
+            "event": "chat_message",
+            "origin": "human",
+            "state": g.machine.as_str(),
+        }));
+    g.timeline.push(StoredEvent {
+        seq,
+        env: stored.clone(),
+    });
+    trim_timeline(&mut g.timeline);
+    Ok(vec![stored])
+}
+
+async fn handle_human_confirm(
+    inner: &SharedHub,
+    env: &Envelope,
+) -> Result<Vec<Envelope>, ProtocolError> {
+    let accepted = env
+        .data
+        .get("accepted")
+        .or_else(|| env.data.get("ok"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut g = inner.write().await;
+    g.seq += 1;
+    let seq = g.seq;
+    g.machine = if accepted {
+        TeachMachine::AgentActing
+    } else {
+        TeachMachine::Chat
+    };
+    let stored = Envelope::new(teach_protocol::TYPE_HUMAN_CONFIRM)
+        .with_session(&g.session.session_id)
+        .with_seq(seq)
+        .with_request(env.request_id.as_deref().unwrap_or(""))
+        .with_data(json!({
+            "accepted": accepted,
+            "event": "human_confirm",
+            "state": g.machine.as_str(),
+        }));
+    g.timeline.push(StoredEvent {
+        seq,
+        env: stored.clone(),
+    });
+    trim_timeline(&mut g.timeline);
+    Ok(vec![stored])
 }
 
 /// Minimal RFC 6455 server (text/ping/pong/close). Clients must mask.
@@ -1476,5 +1902,106 @@ mod tests {
         let msg = redact_for_log(r#"paired {"token":"super-secret-token-value","password":"hunter2"}"#);
         assert!(!msg.contains("super-secret-token-value"), "{msg}");
         assert!(!msg.contains("hunter2"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn action_request_reaches_worker_and_result_on_timeline() {
+        let hub = spawn(TeachHubOpts {
+            allow_origins: vec!["https://example.com".into()],
+        })
+        .await
+        .unwrap();
+        let mut wrk = jsonl_client(hub.addr).await;
+        send_line(
+            &mut wrk,
+            &accept_env(hub.pairing_code(), hub.pairing_id(), "worker", "n-act"),
+        )
+        .await;
+        let paired = read_env(&mut wrk).await;
+        assert_eq!(paired.data["ok"], true);
+
+        let actions = vec![json!({"schema_version":1,"action":"click","selector":"a"})];
+        let rx = hub
+            .dispatch_action_request("req-1", actions, false)
+            .await
+            .unwrap();
+        let req = read_env(&mut wrk).await;
+        assert_eq!(req.msg_type, TYPE_ACTION_REQUEST);
+        assert_eq!(req.request_id.as_deref(), Some("req-1"));
+        assert_eq!(req.data["actions"].as_array().unwrap().len(), 1);
+
+        send_line(
+            &mut wrk,
+            &Envelope::new(TYPE_ACTION_RESULT)
+                .with_request("req-1")
+                .with_session(hub.session_id())
+                .with_data(json!({
+                    "ok": true,
+                    "results": [{"status":"ok","action":{"action":"click","selector":"a"},
+                        "page":{"url":"https://example.com/next","origin":"https://example.com"}}]
+                })),
+        )
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.msg_type, TYPE_ACTION_RESULT);
+        assert_eq!(result.data["ok"], true);
+        let snap = hub.timeline_snapshot().await;
+        assert!(snap.iter().any(|e| e["type"] == "action_request"));
+        assert!(snap.iter().any(|e| e["type"] == "action_result"));
+    }
+
+    #[tokio::test]
+    async fn cancel_completes_waiter() {
+        let hub = spawn(TeachHubOpts {
+            allow_origins: vec!["https://example.com".into()],
+        })
+        .await
+        .unwrap();
+        let mut wrk = jsonl_client(hub.addr).await;
+        send_line(
+            &mut wrk,
+            &accept_env(hub.pairing_code(), hub.pairing_id(), "worker", "n-c"),
+        )
+        .await;
+        let _ = read_env(&mut wrk).await;
+        let rx = hub
+            .dispatch_action_request(
+                "req-c",
+                vec![json!({"action":"wait","ms":5000})],
+                false,
+            )
+            .await
+            .unwrap();
+        let _ = read_env(&mut wrk).await;
+        hub.cancel_request(Some("req-c")).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.data["cancelled"], true);
+        let cancel_msg = read_env(&mut wrk).await;
+        assert_eq!(cancel_msg.msg_type, TYPE_CANCEL);
+    }
+
+    #[tokio::test]
+    async fn executor_paused_rejects_dispatch() {
+        let hub = spawn(TeachHubOpts {
+            allow_origins: vec!["https://example.com".into()],
+        })
+        .await
+        .unwrap();
+        hub.set_executor_paused(true).await;
+        let err = hub
+            .dispatch_action_request(
+                "req-p",
+                vec![json!({"action":"click","selector":"a"})],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("executor_paused"), "{err}");
     }
 }
