@@ -1,7 +1,7 @@
 //! Teach Chat TUI (M2): dialogue, tool-call strip, status, input.
 //!
 //! Streaming is minimal (one-shot LLM text shown as assistant).
-//! Ctrl-T toggles human takeover; Ctrl-R resumes the agent; Ctrl-E is M4.
+//! Ctrl-T toggles human takeover; Ctrl-R resumes the agent; Ctrl-E exports a skill draft.
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -19,9 +19,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::teach_chat::{
-    apply_plan, await_cancellable, execute_planned, human_steps_from_values, live_llm_from_root,
-    mock_llm_from_env, plan_turn, run_llm_turn, run_llm_turn_ex, stub_shortcut, ChatSession,
-    MockLlm, NormalizePending, PageBrief, PlannedTurn, TeachLlm,
+    apply_plan, await_cancellable, default_export_name, execute_planned, human_steps_from_values,
+    live_llm_from_root, mock_llm_from_env, plan_turn, record_draft_steps, run_llm_turn,
+    run_llm_turn_ex, ChatSession, MockLlm, NormalizePending, PageBrief, PlannedTurn, TeachLlm,
 };
 use crate::teach_hub::TeachHubHandle;
 use crate::teach_protocol::TeachMachine;
@@ -47,7 +47,10 @@ pub enum ChatCmd {
     ConfirmNo,
     Takeover,
     Resume,
-    StubE,
+    Export,
+    ExportCommit,
+    ExportCancel,
+    ExportOverwrite,
     ScrollUp,
     ScrollDown,
 }
@@ -242,10 +245,14 @@ fn draw_input(f: &mut Frame, area: Rect, session: &ChatSession) {
         " Ctrl-C cancel  Ctrl-T takeover "
     } else if session.recording {
         " Ctrl-T stop recording  Ctrl-C cancel takeover "
+    } else if session.export_overwrite_name.is_some() {
+        " skill exists — Y overwrite  N/Esc cancel  (Enter does not overwrite) "
+    } else if session.export_prompt {
+        " type skill name  Enter export  Esc cancel "
     } else if session.phase == TeachMachine::Resume {
-        " Ctrl-R resume agent  Enter send  Ctrl-T takeover "
+        " Ctrl-R resume agent  Enter send  Ctrl-T takeover  Ctrl-E export "
     } else {
-        " Enter send  Ctrl-C cancel  Ctrl-T takeover  Ctrl-R resume  Ctrl-E export(M4) "
+        " Enter send  Ctrl-C cancel  Ctrl-T takeover  Ctrl-R resume  Ctrl-E export "
     };
     let shown = if session.input.is_empty() {
         hint.to_string()
@@ -264,6 +271,36 @@ pub fn handle_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) -> ChatCmd {
+    if session.export_overwrite_name.is_some() {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => return ChatCmd::ExportOverwrite,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return ChatCmd::ExportCancel,
+            KeyCode::Enter => {
+                session.status = "Enter does not overwrite — press Y".into();
+                return ChatCmd::None;
+            }
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return ChatCmd::Cancel,
+            _ => return ChatCmd::None,
+        }
+    }
+
+    if session.export_prompt {
+        match code {
+            KeyCode::Enter => return ChatCmd::ExportCommit,
+            KeyCode::Esc => return ChatCmd::ExportCancel,
+            KeyCode::Backspace => {
+                session.input.pop();
+                return ChatCmd::None;
+            }
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return ChatCmd::Cancel,
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                session.input.push(c);
+                return ChatCmd::None;
+            }
+            _ => return ChatCmd::None,
+        }
+    }
+
     if session.pending_normalize.is_some() || session.phase == TeachMachine::AwaitingConfirm {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => return ChatCmd::ConfirmYes,
@@ -283,7 +320,7 @@ pub fn handle_key(
             KeyCode::Char('c') => ChatCmd::Cancel,
             KeyCode::Char('t') => ChatCmd::Takeover,
             KeyCode::Char('r') => ChatCmd::Resume,
-            KeyCode::Char('e') => ChatCmd::StubE,
+            KeyCode::Char('e') => ChatCmd::Export,
             KeyCode::Char('q') => ChatCmd::Quit,
             _ => ChatCmd::None,
         };
@@ -354,11 +391,32 @@ pub fn apply_cmd_local(session: &mut ChatSession, cmd: ChatCmd) -> bool {
             session.push_system("Agent resumed from current page + human steps.");
             false
         }
-        ChatCmd::StubE => {
-            session.push_system(stub_shortcut('e'));
-            session.status = stub_shortcut('e').into();
+        ChatCmd::Export => {
+            if session.recording || session.phase == TeachMachine::HumanTakeover {
+                session.status = "stop takeover (Ctrl-T) before export".into();
+                session.push_system("stop takeover before exporting a skill draft");
+                return false;
+            }
+            session.export_prompt = true;
+            session.export_overwrite_name = None;
+            session.phase = TeachMachine::Export;
+            session.input = default_export_name(&session.last_goal);
+            session.status = "export: edit skill name, Enter to write draft".into();
+            session.push_system(
+                "Export skill draft: edit the name and press Enter. Esc cancels. Existing skills are not overwritten without Y.",
+            );
             false
         }
+        ChatCmd::ExportCancel => {
+            session.export_prompt = false;
+            session.export_overwrite_name = None;
+            session.input.clear();
+            session.phase = TeachMachine::Chat;
+            session.status = "export cancelled".into();
+            session.push_system("export cancelled");
+            false
+        }
+        ChatCmd::ExportCommit | ChatCmd::ExportOverwrite => false,
         ChatCmd::Cancel => {
             if session.recording || session.phase == TeachMachine::HumanTakeover {
                 session.recording = false;
@@ -508,6 +566,7 @@ pub async fn run_dedicated(
         &opts.profile,
         mock.as_ref(),
         live.as_ref(),
+        root,
     )
     .await;
 
@@ -524,6 +583,7 @@ async fn dedicated_loop(
     profile: &str,
     mock: Option<&MockLlm>,
     live: Option<&crate::teach_chat::LiveLlm>,
+    root: &Path,
 ) -> Result<()> {
     let mut pending: Option<PlannedTurn> = None;
     loop {
@@ -593,6 +653,7 @@ async fn dedicated_loop(
                     match hub.confirm_normalize(true).await {
                         Ok(steps) => {
                             let acts = human_steps_from_values(&steps);
+                            record_draft_steps(session, &steps, "human");
                             session.set_human_tools(&acts, "ok");
                             session.pending_normalize = None;
                             session.phase = TeachMachine::Resume;
@@ -668,6 +729,15 @@ async fn dedicated_loop(
                     session.recording = false;
                 }
             }
+            ChatCmd::ExportCommit => {
+                run_export(session, hub, root, false).await;
+            }
+            ChatCmd::ExportOverwrite => {
+                if let Some(name) = session.export_overwrite_name.clone() {
+                    session.input = name;
+                }
+                run_export(session, hub, root, true).await;
+            }
             ChatCmd::Cancel => {
                 if let Some(id) = session.last_request_id.clone() {
                     let _ = hub.cancel_request(Some(&id)).await;
@@ -680,6 +750,80 @@ async fn dedicated_loop(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+async fn run_export(
+    session: &mut ChatSession,
+    hub: &TeachHubHandle,
+    root: &Path,
+    overwrite: bool,
+) {
+    let mut name = session.input.trim().to_string();
+    if name.is_empty() {
+        name = default_export_name(&session.last_goal);
+    }
+    let mut steps = hub.exportable_skill_steps().await;
+    if steps.is_empty() {
+        steps = session.draft_steps.clone();
+    }
+    if steps.is_empty() {
+        session.export_prompt = false;
+        session.export_overwrite_name = None;
+        session.phase = TeachMachine::Chat;
+        session.status = "export failed: no Playwright steps".into();
+        session.push_system("no exportable Playwright steps (raw DOM is never exported)");
+        hub.note_export(&name, None, false, &["empty steps".into()])
+            .await;
+        return;
+    }
+    let goal = if session.last_goal.is_empty() {
+        None
+    } else {
+        Some(session.last_goal.as_str())
+    };
+    match crate::teach::export_chat_draft(root, &name, goal, &steps, overwrite) {
+        Ok(r) => {
+            session.export_prompt = false;
+            session.export_overwrite_name = None;
+            session.input.clear();
+            session.phase = TeachMachine::Chat;
+            session.status = format!("exported {}", r.path.display());
+            session.push_system(&format!(
+                "exported {} ({} step(s), agent={}, human={}, params={})",
+                r.path.display(),
+                r.audit.n_steps,
+                r.audit.n_agent,
+                r.audit.n_human,
+                if r.audit.params.is_empty() {
+                    "none".into()
+                } else {
+                    r.audit.params.join(",")
+                }
+            ));
+            hub.note_export(
+                &name,
+                Some(&r.path.display().to_string()),
+                true,
+                &[],
+            )
+            .await;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("already exists") && !overwrite {
+                session.export_overwrite_name = Some(name);
+                session.status = "skill exists — Y overwrite / N cancel".into();
+                session.push_system(&msg);
+            } else {
+                session.export_prompt = false;
+                session.export_overwrite_name = None;
+                session.phase = TeachMachine::Error;
+                session.status = format!("export failed: {msg}");
+                session.push_system(&format!("export failed: {msg}"));
+                hub.note_export(&name, None, false, &[msg]).await;
+            }
         }
     }
 }
@@ -749,6 +893,7 @@ fn apply_normalize(session: &mut ChatSession, data: &serde_json::Value) {
         .map(|a| a.len())
         .unwrap_or(0);
     let acts = human_steps_from_values(&steps);
+    record_draft_steps(session, &steps, "human");
     session.set_human_tools(&acts, "ok");
     session.last_human_summary = data
         .get("summary")
@@ -920,12 +1065,19 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_e_still_m4_stub() {
+    fn ctrl_e_opens_export_prompt() {
         let mut s = ChatSession::default();
+        s.last_goal = "Sign in".into();
         let cmd = handle_key(&mut s, KeyCode::Char('e'), KeyModifiers::CONTROL);
-        assert_eq!(cmd, ChatCmd::StubE);
-        apply_cmd_local(&mut s, ChatCmd::StubE);
-        assert!(s.status.contains("M4"));
+        assert_eq!(cmd, ChatCmd::Export);
+        apply_cmd_local(&mut s, ChatCmd::Export);
+        assert!(s.export_prompt);
+        assert_eq!(s.phase, TeachMachine::Export);
+        assert_eq!(s.input, "sign-in");
+        let cmd = handle_key(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(cmd, ChatCmd::ExportCommit);
+        let cmd = handle_key(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(cmd, ChatCmd::ExportCancel);
     }
 
     #[test]

@@ -169,6 +169,58 @@ pub struct MappedSkill {
     pub steps: Vec<Value>,
     pub vars: Vec<String>,
     pub allow_secrets: bool,
+    /// When false (default), refuse to overwrite an existing skill.json.
+    pub overwrite: bool,
+    pub from_chat: bool,
+    pub audit_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatExportAudit {
+    pub n_steps: usize,
+    pub n_agent: usize,
+    pub n_human: usize,
+    pub n_skipped: usize,
+    pub params: Vec<String>,
+    pub warnings: Vec<String>,
+    pub path: Option<PathBuf>,
+}
+
+impl ChatExportAudit {
+    pub fn summary_text(&self) -> String {
+        let mut s = String::new();
+        s.push_str("# Teach Chat export audit\n\n");
+        s.push_str(&format!(
+            "- steps: {} (agent={}, human={})\n",
+            self.n_steps, self.n_agent, self.n_human
+        ));
+        s.push_str(&format!("- skipped: {}\n", self.n_skipped));
+        if self.params.is_empty() {
+            s.push_str("- params: none\n");
+        } else {
+            s.push_str(&format!("- params: {}\n", self.params.join(", ")));
+        }
+        if let Some(p) = &self.path {
+            s.push_str(&format!("- path: {}\n", p.display()));
+        }
+        if !self.warnings.is_empty() {
+            s.push_str("\n## Warnings\n\n");
+            for w in &self.warnings {
+                s.push_str(&format!("- {w}\n"));
+            }
+        }
+        s.push_str("\nPassword/token/cookie/Authorization values were exported as `{{vars.NAME}}` (not plaintext).\n");
+        s.push_str("Pairing codes and session tokens are never written to skill.json.\n");
+        s.push_str("Existing skill.json is not overwritten unless the operator confirmed overwrite.\n");
+        s
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatExportResult {
+    pub path: PathBuf,
+    pub audit: ChatExportAudit,
+    pub skill: Value,
 }
 
 struct ExportState {
@@ -1094,6 +1146,9 @@ pub fn map_events_to_skill(
         steps,
         vars,
         allow_secrets,
+        overwrite: false,
+        from_chat: false,
+        audit_text: None,
     })
 }
 
@@ -1252,13 +1307,12 @@ pub fn write_skill_dir(root: &Path, mapped: &MappedSkill) -> Result<PathBuf> {
             bail!("export destination escapes skills/ (symlink)");
         }
     }
-    fs::create_dir_all(&dest)?;
-    let dest_canon = dest
-        .canonicalize()
-        .with_context(|| format!("canonicalize created {}", dest.display()))?;
-    if !dest_canon.starts_with(&skills_canon) {
-        let _ = fs::remove_dir_all(&dest);
-        bail!("export destination escaped skills/; refused");
+    let existing_sj = dest.join("skill.json");
+    if existing_sj.is_file() && !mapped.overwrite {
+        bail!(
+            "Skill already exists: {} (export refused; pick another name or confirm overwrite)",
+            mapped.name
+        );
     }
 
     let mut skill = json!({
@@ -1271,10 +1325,39 @@ pub fn write_skill_dir(root: &Path, mapped: &MappedSkill) -> Result<PathBuf> {
     if let Some(g) = &mapped.goal {
         skill["goal"] = json!(g);
     }
+    crate::skills::assert_no_plaintext_secrets(&skill)?;
+
+    let created_dir = !dest.exists();
+    fs::create_dir_all(&dest)?;
+    let dest_canon = dest
+        .canonicalize()
+        .with_context(|| format!("canonicalize created {}", dest.display()))?;
+    if !dest_canon.starts_with(&skills_canon) {
+        if created_dir {
+            let _ = fs::remove_dir_all(&dest);
+        }
+        bail!("export destination escaped skills/; refused");
+    }
 
     let sj = dest_canon.join("skill.json");
     let _ = util::ensure_under_root(root, &sj)?;
-    fs::write(&sj, format!("{}\n", serde_json::to_string_pretty(&skill)?))?;
+    let tmp = dest_canon.join(".skill.json.tmp");
+    let _ = util::ensure_under_root(root, &tmp)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(&skill)?);
+    if let Err(e) = fs::write(&tmp, &body) {
+        let _ = fs::remove_file(&tmp);
+        if created_dir {
+            let _ = fs::remove_dir_all(&dest);
+        }
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(&tmp, &sj) {
+        let _ = fs::remove_file(&tmp);
+        if created_dir && !existing_sj.is_file() {
+            let _ = fs::remove_dir_all(&dest);
+        }
+        return Err(e.into());
+    }
 
     let readme = dest_canon.join("README.md");
     let _ = util::ensure_under_root(root, &readme)?;
@@ -1284,7 +1367,80 @@ pub fn write_skill_dir(root: &Path, mapped: &MappedSkill) -> Result<PathBuf> {
     let _ = util::ensure_under_root(root, &gi)?;
     fs::write(&gi, "secrets.json\n.env\n*.secret\n")?;
 
+    if let Some(audit) = &mapped.audit_text {
+        let ap = dest_canon.join("AUDIT.md");
+        let _ = util::ensure_under_root(root, &ap)?;
+        let _ = fs::write(&ap, audit);
+    }
+
     Ok(sj)
+}
+
+/// Teach Chat M4: export merged timeline Playwright steps as a skill.json draft.
+/// Does not overwrite an existing skill unless `overwrite` is true.
+pub fn export_chat_draft(
+    root: &Path,
+    name: &str,
+    goal: Option<&str>,
+    steps: &[Value],
+    overwrite: bool,
+) -> Result<ChatExportResult> {
+    util::validate_name(name, "skill")?;
+    let prep = crate::skills::prepare_teach_export_steps(steps, "agent")?;
+    if prep.steps.is_empty() {
+        bail!("empty steps: record at least one Playwright action before export");
+    }
+    let goal = goal
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let description = match &goal {
+        Some(g) => format!("Taught skill: {g}"),
+        None => "Taught skill (Teach Chat)".into(),
+    };
+    let params: Vec<Value> = prep
+        .vars
+        .iter()
+        .map(|n| json!({"name": n, "required": true}))
+        .collect();
+    let mut warnings = prep.skipped.clone();
+    if prep.n_human == 0 && prep.n_agent == 0 {
+        warnings.push("no source-tagged steps".into());
+    }
+    let mut audit = ChatExportAudit {
+        n_steps: prep.steps.len(),
+        n_agent: prep.n_agent,
+        n_human: prep.n_human,
+        n_skipped: prep.skipped.len(),
+        params: prep.vars.clone(),
+        warnings,
+        path: None,
+    };
+    let mapped = MappedSkill {
+        name: name.to_string(),
+        goal: goal.clone(),
+        description,
+        params,
+        steps: prep.steps.clone(),
+        vars: prep.vars.clone(),
+        allow_secrets: false,
+        overwrite,
+        from_chat: true,
+        audit_text: Some(audit.summary_text()),
+    };
+    let path = write_skill_dir(root, &mapped)?;
+    audit.path = Some(path.clone());
+    // Rewrite AUDIT.md now that the path is known.
+    if let Some(parent) = path.parent() {
+        let _ = fs::write(parent.join("AUDIT.md"), audit.summary_text());
+    }
+    let skill: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    crate::skills::assert_no_plaintext_secrets(&skill)?;
+    Ok(ChatExportResult {
+        path,
+        audit,
+        skill,
+    })
 }
 
 fn render_readme(mapped: &MappedSkill) -> String {
@@ -1295,7 +1451,11 @@ fn render_readme(mapped: &MappedSkill) -> String {
     } else {
         s.push_str("Goal: (not marked — runner will use per-step fallbacks)\n\n");
     }
-    s.push_str("Taught via `cloakcli teach start`. Compatible with existing skill.json (`goto` / `click` / `fill`).\n\n");
+    if mapped.from_chat {
+        s.push_str("Taught via `cloakcli teach chat` (Ctrl-E). Steps are unified Playwright actions with `source=human|agent`. Raw DOM events are never exported.\n\n");
+    } else {
+        s.push_str("Taught via `cloakcli teach start`. Compatible with existing skill.json (`goto` / `click` / `fill`).\n\n");
+    }
     s.push_str("## Run\n\n```bash\n");
     s.push_str(&format!("cloakcli skill run {} --profile <profile>", mapped.name));
     for v in &mapped.vars {
@@ -1743,6 +1903,122 @@ mod tests {
         assert_eq!(mapped.steps, expected["steps"].as_array().unwrap().clone());
         assert_eq!(mapped.goal.as_deref(), expected["goal"].as_str());
         assert_eq!(mapped.name, expected["name"]);
+    }
+
+    #[test]
+    fn chat_export_matches_expected_skill_fixture() {
+        let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let expected_path = here.join("fixtures/teach/expected-skill.json");
+        let expected: Value =
+            serde_json::from_str(&fs::read_to_string(&expected_path).unwrap()).unwrap();
+        let steps = vec![
+            json!({
+                "action": "goto",
+                "url": "https://example.com/login?token=leakme&next=/app",
+                "source": "llm"
+            }),
+            json!({
+                "action": "fill",
+                "selector": "#user",
+                "text": "alice",
+                "field_name": "username",
+                "selectors": ["#user", "input[name=\"username\"]"],
+                "source": "human"
+            }),
+            json!({
+                "action": "fill",
+                "selector": "#pass",
+                "text": "hunter2",
+                "field_name": "password",
+                "selectors": ["#pass", "input[name=\"password\"]", "input[type=\"password\"]"],
+                "source": "human"
+            }),
+            json!({"action": "click", "selector": "button.submit", "source": "human"}),
+            json!({"kind": "click", "selector": "#raw-dom"}),
+        ];
+        // Raw DOM in the batch must fail the safety gate (not silently dropped
+        // as a skip) when mixed? Spec: no raw-DOM-only steps. A raw event
+        // without `action` is rejected so a bad merge cannot land in skill.json.
+        let err = export_chat_draft(
+            &tmp_root(),
+            "taught-login",
+            expected["goal"].as_str(),
+            &steps,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("raw DOM"), "{err}");
+
+        let clean: Vec<Value> = steps
+            .into_iter()
+            .filter(|s| s.get("action").is_some())
+            .collect();
+        let root = tmp_root();
+        let out = export_chat_draft(
+            &root,
+            "taught-login",
+            expected["goal"].as_str(),
+            &clean,
+            false,
+        )
+        .unwrap();
+        assert!(out.path.ends_with("skill.json"));
+        for (got, exp) in out.skill["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(expected["steps"].as_array().unwrap())
+        {
+            assert_eq!(got["action"], exp["action"]);
+            if exp.get("url").is_some() {
+                assert_eq!(got["url"], exp["url"]);
+            }
+            if exp.get("selector").is_some() {
+                assert_eq!(got["selector"], exp["selector"]);
+            }
+            if exp.get("text").is_some() {
+                assert_eq!(got["text"], exp["text"]);
+            }
+        }
+        assert_eq!(out.skill["steps"][0]["source"], "agent");
+        assert_eq!(out.skill["steps"][1]["source"], "human");
+        assert_eq!(out.skill["params"], expected["params"]);
+        let blob = serde_json::to_string(&out.skill).unwrap();
+        assert!(!blob.contains("hunter2"));
+        assert!(!blob.contains("leakme"));
+        assert!(!blob.contains("pairing"));
+        let err = export_chat_draft(
+            &root,
+            "taught-login",
+            expected["goal"].as_str(),
+            &clean,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already exists"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chat_export_rejects_danger_without_writing() {
+        let root = tmp_root();
+        let err = export_chat_draft(
+            &root,
+            "evil",
+            Some("pwn"),
+            &[json!({"action":"eval","code":"1"})],
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("forbidden") || err.contains("unknown") || err.contains("eval"),
+            "{err}"
+        );
+        assert!(!state::skills_dir(&root).join("evil").join("skill.json").exists());
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn write_exec(path: &Path, body: &str) {

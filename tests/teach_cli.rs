@@ -65,6 +65,14 @@ fn help_lists_teach_start() {
     assert!(turn.status.success(), "{}", combined(&turn));
     let t = combined(&turn);
     assert!(t.contains("goal") && t.contains("mock-json"), "{t}");
+    let export = bin()
+        .args(["teach", "export", "--help"])
+        .output()
+        .expect("run");
+    assert!(export.status.success(), "{}", combined(&export));
+    let e = combined(&export);
+    assert!(e.contains("steps-json") || e.contains("steps_json"), "{e}");
+    assert!(e.contains("overwrite"), "{e}");
 }
 
 #[test]
@@ -172,6 +180,88 @@ fn turn_validates_mock_json_and_rejects_danger() {
     assert!(!js.status.success(), "{}", combined(&js));
     let t = combined(&js);
     assert!(t.contains("VALIDATE_FAIL") || t.contains("javascript"), "{t}");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn export_writes_draft_and_refuses_overwrite() {
+    let home = tmp_home();
+    let steps = r##"[{"action":"goto","url":"https://example.com/login?token=leakme&next=/app","source":"llm"},{"action":"fill","selector":"#user","text":"alice","field_name":"username","source":"human"},{"action":"fill","selector":"#pass","text":"hunter2","field_name":"password","source":"human"},{"action":"click","selector":"button.submit","source":"human"}]"##;
+    let ok = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "export",
+            "--name",
+            "taught-login",
+            "--goal",
+            "Sign in and open the dashboard",
+            "--steps-json",
+            steps,
+        ])
+        .output()
+        .expect("run");
+    assert!(ok.status.success(), "{}", combined(&ok));
+    let t = combined(&ok);
+    assert!(t.contains("EXPORT_OK"), "{t}");
+    let sj = home.join("skills/taught-login/skill.json");
+    assert!(sj.is_file(), "{}", sj.display());
+    let body = fs::read_to_string(&sj).unwrap();
+    assert!(body.contains("\"source\": \"agent\"") || body.contains("\"source\":\"agent\""));
+    assert!(body.contains("human"));
+    assert!(body.contains("{{vars.PASSWORD}}"));
+    assert!(!body.contains("hunter2"));
+    assert!(!body.contains("leakme"));
+    assert!(!body.contains("pairing"));
+    let original = body.clone();
+
+    let dup = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "export",
+            "--name",
+            "taught-login",
+            "--goal",
+            "Sign in and open the dashboard",
+            "--steps-json",
+            steps,
+        ])
+        .output()
+        .expect("run");
+    assert!(!dup.status.success(), "{}", combined(&dup));
+    let t = combined(&dup);
+    assert!(t.contains("already exists"), "{t}");
+    assert_eq!(fs::read_to_string(&sj).unwrap(), original);
+
+    let danger = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "export",
+            "--name",
+            "evil",
+            "--steps-json",
+            r#"[{"action":"shell","cmd":"id"}]"#,
+        ])
+        .output()
+        .expect("run");
+    assert!(!danger.status.success(), "{}", combined(&danger));
+    assert!(!home.join("skills/evil/skill.json").exists());
+
+    let escape = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "export",
+            "--name",
+            "../etc",
+            "--steps-json",
+            r#"[{"action":"goto","url":"https://example.com/"}]"#,
+        ])
+        .output()
+        .expect("run");
+    assert!(!escape.status.success(), "{}", combined(&escape));
     let _ = fs::remove_dir_all(&home);
 }
 

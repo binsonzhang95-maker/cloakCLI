@@ -191,6 +191,7 @@ pub enum TeachMachine {
     AwaitingConfirm,
     HumanTakeover,
     Resume,
+    Export,
     Cancel,
     Error,
 }
@@ -203,6 +204,7 @@ impl TeachMachine {
             Self::AwaitingConfirm => "awaiting_confirm",
             Self::HumanTakeover => "human_takeover",
             Self::Resume => "resume",
+            Self::Export => "export",
             Self::Cancel => "cancel",
             Self::Error => "error",
         }

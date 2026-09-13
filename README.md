@@ -184,9 +184,9 @@ CLOAKCLI_BIN=target/release/cloakcli python3 scripts/teach_m1_headed_smoke.py
 
 Requires a display (`DISPLAY` / `WAYLAND_DISPLAY`) or `xvfb-run`, a built `cloakcli`, and the CloakBrowser Chromium binary. The script starts two loopback origins (allow + deny), runs `cloakcli teach start`, and fails if hub events or worker JSON miss the M1 checks. Non-headed coverage (SW token reuse, worker reconnect, duplicate pairing) lives in `python/tests/test_teach_chat_protocol.py` and `cargo test`.
 
-### Teach Chat M3 — human takeover
+### Teach Chat M1–M4
 
-When the LLM is stuck, take over the headed browser. The extension records click/fill/press/select/navigate; on stop those DOM events are **locally** normalized to the same Playwright action schema as the LLM (`source=human`) and merged onto the timeline. Raw DOM events are never exportable steps. The agent executor is paused for the whole takeover (no concurrent Playwright).
+`cloakcli teach chat` is the Claude-style teaching shell: TUI dialogue → at most 3 validated Playwright actions → optional human takeover → skill draft export.
 
 ```bash
 cloakcli teach chat --profile demo --url https://example.com
@@ -197,8 +197,23 @@ cloakcli teach chat --profile demo --url https://example.com
 #   Ctrl-T    stop → local normalize → Playwright steps source=human
 #   Y / N     accept or drop unstable/coords/iframe selectors
 #   Ctrl-R    resume the agent from the current page + human-step summary
-#   Ctrl-E    export skill draft (M4, not implemented)
+#   Ctrl-E    export a skills/<name>/skill.json draft
+#             type a skill name, Enter to write
+#             if that name exists: Y overwrite / N cancel (Enter does not overwrite)
 ```
+
+After a session, Ctrl-E writes `skills/<name>/skill.json` plus README, `.gitignore`, and `AUDIT.md`. Steps are unified Playwright actions (`goto` / `click` / `fill` / …) with `source=human|agent`. Password/token/cookie fields become `{{vars.PASSWORD}}` (etc.); plaintext secrets are never written. Raw DOM events are never skill steps. Export refuses to overwrite an existing skill unless you confirm with Y. Pairing codes expire and cannot be replayed.
+
+Headless export (tests / recovery):
+
+```bash
+cloakcli teach export --name taught-login --goal "Sign in" \
+  --steps-json '[{"action":"goto","url":"https://example.com/login","source":"agent"}]'
+# failed export does not touch an existing skills/<name>/skill.json
+cloakcli skill run taught-login --profile demo --var PASSWORD=...
+```
+
+If export fails (illegal step, path escape, duplicate name), the previous skill.json is left intact. Start a new session if pairing was consumed or expired.
 
 Password/token fields are stored as type + length + `redacted` only; fills become `{{vars.PASSWORD}}` (or similar). Any `http(s)` goto is recorded even off the teach allowlist; `javascript:` / `file:` / `data:` are rejected. Selectors prefer `id` → `data-testid` → `name` → aria/role → text → CSS path → coords (re-checked unique on the page). Shadow DOM and missing selectors are non-exportable (never silent-saved as raw events).
 

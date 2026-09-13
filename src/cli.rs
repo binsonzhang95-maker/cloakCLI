@@ -222,6 +222,21 @@ pub enum TeachCmd {
         #[arg(long)]
         mock_json: Option<String>,
     },
+    /// Export a Teach Chat skill.json draft from unified Playwright steps (M4)
+    Export {
+        /// Skill directory name under skills/
+        #[arg(long)]
+        name: String,
+        /// Skill-level goal
+        #[arg(long)]
+        goal: Option<String>,
+        /// JSON array of unified Playwright actions (source=human|agent)
+        #[arg(long)]
+        steps_json: String,
+        /// Replace an existing skills/<name>/skill.json (default: refuse)
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// One-shot chat turn: parse/validate (and optionally execute via a live hub)
     Turn {
         /// User goal (required unless --mock-json is a full turn fixture)
@@ -1171,6 +1186,34 @@ pub async fn handle_teach(root: &Path, action: TeachCmd) -> Result<()> {
                 mock_json,
             )
             .await
+        }
+        TeachCmd::Export {
+            name,
+            goal,
+            steps_json,
+            overwrite,
+        } => {
+            let steps: Vec<serde_json::Value> = serde_json::from_str(&steps_json)
+                .context("parse --steps-json (expected a JSON array of actions)")?;
+            let out = crate::teach::export_chat_draft(
+                root,
+                &name,
+                goal.as_deref(),
+                &steps,
+                overwrite,
+            )?;
+            println!("EXPORT_OK {}", out.path.display());
+            println!(
+                "AUDIT steps={} agent={} human={} params={}",
+                out.audit.n_steps,
+                out.audit.n_agent,
+                out.audit.n_human,
+                out.audit.params.join(",")
+            );
+            for w in &out.audit.warnings {
+                println!("WARN {w}");
+            }
+            Ok(())
         }
         TeachCmd::Turn {
             goal,

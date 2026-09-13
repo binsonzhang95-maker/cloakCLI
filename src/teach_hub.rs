@@ -24,8 +24,8 @@ use crate::teach_protocol::{
     self, is_raw_dom_event, pairing_accept_from_data, pairing_offer_data, redact_action_payload,
     redact_for_log, redact_takeover_event, ClientRole, Envelope, PageState, ProtocolError,
     TeachMachine, MAX_MESSAGE_BYTES, MAX_PAIRING_FAILURES, TYPE_ACTION_REQUEST, TYPE_ACTION_RESULT,
-    TYPE_CANCEL, TYPE_HEARTBEAT, TYPE_NORMALIZE_RESULT, TYPE_PAGE_STATE, TYPE_PAIRING_OFFER,
-    TYPE_PAIRING_RESULT, TYPE_RESUME, TYPE_TAKEOVER_START, TYPE_TAKEOVER_STOP,
+    TYPE_CANCEL, TYPE_EXPORT_RESULT, TYPE_HEARTBEAT, TYPE_NORMALIZE_RESULT, TYPE_PAGE_STATE,
+    TYPE_PAIRING_OFFER, TYPE_PAIRING_RESULT, TYPE_RESUME, TYPE_TAKEOVER_START, TYPE_TAKEOVER_STOP,
 };
 
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
@@ -171,6 +171,7 @@ impl TeachHubHandle {
         }
         let wire_actions: Vec<Value> = validated.iter().map(|a| a.to_value()).collect();
         let timeline_actions: Vec<Value> = validated.iter().map(|a| a.to_event_value()).collect();
+        let export_batch: Vec<Value> = validated.iter().map(|a| a.to_value()).collect();
         let (tx, rx) = oneshot::channel();
         let mut g = self.inner.write().await;
         if g.executor_paused {
@@ -218,6 +219,9 @@ impl TeachHubHandle {
             env: env_timeline,
         });
         trim_timeline(&mut g.timeline);
+        if let Ok(prep) = crate::skills::prepare_teach_export_steps(&export_batch, "agent") {
+            g.export_steps.extend(prep.steps);
+        }
         let worker = g.outbound.get(&ClientRole::Worker).cloned();
         drop(g);
         emit_event(
@@ -333,23 +337,54 @@ impl TeachHubHandle {
     /// Exportable Playwright steps only (no raw DOM). Used by tests / M4 stub.
     #[allow(dead_code)]
     pub async fn exportable_actions(&self) -> Vec<Value> {
-        let g = self.inner.read().await;
-        g.timeline
-            .iter()
-            .filter(|e| {
-                e.env.msg_type == TYPE_ACTION_REQUEST
-                    || e.env.data.get("event").and_then(|v| v.as_str()) == Some("human_action")
-            })
-            .flat_map(|e| {
-                e.env
-                    .data
-                    .get("actions")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .filter(|a| a.get("action").is_some() && !is_raw_dom_event(a))
-            .collect()
+        self.exportable_skill_steps().await
+    }
+
+    /// Canonical skill-draft steps (source=human|agent, secrets parameterized).
+    pub async fn exportable_skill_steps(&self) -> Vec<Value> {
+        self.inner.read().await.export_steps.clone()
+    }
+
+    pub async fn note_export(
+        &self,
+        name: &str,
+        path: Option<&str>,
+        ok: bool,
+        errors: &[String],
+    ) {
+        let mut g = self.inner.write().await;
+        g.seq += 1;
+        let seq = g.seq;
+        g.machine = if ok {
+            TeachMachine::Chat
+        } else {
+            TeachMachine::Error
+        };
+        let env = Envelope::new(TYPE_EXPORT_RESULT)
+            .with_session(&g.session.session_id)
+            .with_seq(seq)
+            .with_data(json!({
+                "ok": ok,
+                "name": name,
+                "path": path,
+                "errors": errors,
+                "n_steps": g.export_steps.len(),
+                "event": "export_result",
+            }));
+        g.timeline.push(StoredEvent {
+            seq,
+            env,
+        });
+        trim_timeline(&mut g.timeline);
+        drop(g);
+        emit_event(
+            "export_result",
+            json!({
+                "ok": ok,
+                "name": name,
+                "n_errors": errors.len(),
+            }),
+        );
     }
 
     /// Pause the agent executor and tell the extension to start recording.
@@ -573,6 +608,21 @@ impl TeachHubHandle {
             g.timeline.push(StoredEvent { seq, env });
             trim_timeline(&mut g.timeline);
         }
+        let mut export_merged = pending.export_steps;
+        if accept {
+            for item in &pending.needs_confirm {
+                if let Some(proposed) = item.get("proposed") {
+                    if proposed.get("action").is_some() && !is_raw_dom_event(proposed) {
+                        if let Ok(prep) =
+                            crate::skills::prepare_teach_export_steps(&[proposed.clone()], "human")
+                        {
+                            export_merged.extend(prep.steps);
+                        }
+                    }
+                }
+            }
+        }
+        g.export_steps.extend(export_merged);
         g.last_human_summary = human_summary_from_actions(&redacted);
         g.machine = TeachMachine::Resume;
         drop(g);
@@ -652,6 +702,8 @@ struct HubInner {
     takeover_request_id: Option<String>,
     pending_normalize: Option<PendingNormalize>,
     last_human_summary: String,
+    /// Parameterized Playwright steps for Ctrl-E skill draft (not the redacted log timeline).
+    export_steps: Vec<Value>,
     outbound: HashMap<ClientRole, mpsc::UnboundedSender<Envelope>>,
     waiters: HashMap<String, oneshot::Sender<Envelope>>,
     normalize_waiters: HashMap<String, oneshot::Sender<Envelope>>,
@@ -661,6 +713,7 @@ struct HubInner {
 struct PendingNormalize {
     request_id: String,
     steps: Vec<Value>,
+    export_steps: Vec<Value>,
     needs_confirm: Vec<Value>,
     #[allow(dead_code)]
     non_exportable: Vec<Value>,
@@ -740,6 +793,7 @@ pub async fn spawn(opts: TeachHubOpts) -> Result<TeachHubHandle> {
         takeover_request_id: None,
         pending_normalize: None,
         last_human_summary: String::new(),
+        export_steps: Vec::new(),
         outbound: HashMap::new(),
         waiters: HashMap::new(),
         normalize_waiters: HashMap::new(),
@@ -1658,11 +1712,35 @@ async fn handle_normalize_result(
     inner: &SharedHub,
     env: &Envelope,
 ) -> Result<Vec<Envelope>, ProtocolError> {
-    let data = redact_action_payload(&env.data);
     let request_id = env
         .request_id
         .clone()
         .unwrap_or_else(|| "normalize".to_string());
+    let raw_steps: Vec<Value> = env
+        .data
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.get("action").is_some() && !is_raw_dom_event(s))
+        .map(|mut s| {
+            if let Some(obj) = s.as_object_mut() {
+                obj.insert("source".into(), json!("human"));
+                obj.remove("kind");
+            }
+            s
+        })
+        .collect();
+    let mut export_ready = Vec::new();
+    for s in &raw_steps {
+        if let crate::skills::ExportStepClass::Keep(v) =
+            crate::skills::classify_teach_export_step(s, "human")
+        {
+            export_ready.push(v);
+        }
+    }
+    let data = redact_action_payload(&env.data);
     let steps: Vec<Value> = data
         .get("steps")
         .and_then(|v| v.as_array())
@@ -1738,12 +1816,14 @@ async fn handle_normalize_result(
         g.pending_normalize = Some(PendingNormalize {
             request_id: request_id.clone(),
             steps: steps.clone(),
+            export_steps: export_ready,
             needs_confirm,
             non_exportable,
         });
         g.machine = TeachMachine::HumanTakeover;
     } else {
         g.pending_normalize = None;
+        g.export_steps.extend(export_ready);
         g.machine = TeachMachine::Resume;
     }
     let waiter_key = g.takeover_request_id.clone().unwrap_or_else(|| request_id.clone());
@@ -2741,5 +2821,89 @@ mod tests {
         let snap = hub.timeline_snapshot().await;
         let blob = serde_json::to_string(&snap).unwrap();
         assert!(!blob.contains("hunter2-secret"), "{blob}");
+    }
+
+    #[tokio::test]
+    async fn export_steps_tag_source_and_hide_secrets() {
+        let hub = spawn(TeachHubOpts {
+            allow_origins: vec!["https://example.com".into()],
+        })
+        .await
+        .unwrap();
+        let mut wrk = jsonl_client(hub.addr).await;
+        send_line(
+            &mut wrk,
+            &accept_env(hub.pairing_code(), hub.pairing_id(), "worker", "n-ex"),
+        )
+        .await;
+        let paired = read_env(&mut wrk).await;
+        let token = paired.data["session_token"].as_str().unwrap_or("");
+        assert!(!token.is_empty());
+
+        let _rx = hub
+            .dispatch_action_request(
+                "req-export",
+                vec![
+                    json!({"action":"goto","url":"https://example.com/login"}),
+                    json!({
+                        "action":"fill",
+                        "selector":"#pass",
+                        "text":"hunter2",
+                        "field_name":"password"
+                    }),
+                ],
+                false,
+            )
+            .await
+            .unwrap();
+        let _ = read_env(&mut wrk).await; // action_request
+
+        hub.start_takeover("exp").await.unwrap();
+        let _ = read_env(&mut wrk).await; // takeover_start
+        let rx = hub.stop_takeover().await.unwrap();
+        let stop = read_env(&mut wrk).await;
+        send_line(
+            &mut wrk,
+            &Envelope::new(TYPE_NORMALIZE_RESULT)
+                .with_request(stop.request_id.as_deref().unwrap_or(""))
+                .with_session(hub.session_id())
+                .with_data(json!({
+                    "ok": true,
+                    "steps": [{
+                        "action": "click",
+                        "selector": "button.submit",
+                        "source": "human"
+                    }],
+                    "needs_confirm": [],
+                    "non_exportable": [{"kind":"click","selector":"#raw"}],
+                    "summary": "click button.submit"
+                })),
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+
+        let steps = hub.exportable_skill_steps().await;
+        let blob = serde_json::to_string(&steps).unwrap();
+        assert!(!blob.contains("hunter2"), "{blob}");
+        assert!(!blob.contains(token), "{blob}");
+        assert!(!blob.contains(hub.pairing_code()), "{blob}");
+        assert!(
+            steps.iter().any(|s| s["action"] == "goto" && s["source"] == "agent"),
+            "{steps:?}"
+        );
+        assert!(
+            steps.iter().any(|s| s["action"] == "fill" && s["text"] == "{{vars.PASSWORD}}"),
+            "{steps:?}"
+        );
+        assert!(
+            steps.iter().any(|s| s["action"] == "click" && s["source"] == "human"),
+            "{steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|s| s.get("kind").is_some() && s.get("action").is_none()),
+            "{steps:?}"
+        );
+        hub.note_export("taught-login", Some("skills/taught-login/skill.json"), true, &[])
+            .await;
     }
 }

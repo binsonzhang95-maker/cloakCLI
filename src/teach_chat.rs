@@ -227,6 +227,10 @@ pub struct ChatSession {
     pub takeover_event_count: u32,
     pub last_human_summary: String,
     pub pending_normalize: Option<NormalizePending>,
+    pub export_prompt: bool,
+    pub export_overwrite_name: Option<String>,
+    pub last_goal: String,
+    pub draft_steps: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,7 +250,7 @@ impl Default for ChatSession {
             phase: TeachMachine::Chat,
             messages: vec![ChatLine {
                 role: "system".into(),
-                text: "Teach Chat — send a goal with Enter. Ctrl-C cancels. Ctrl-T takeover, Ctrl-R resume. Ctrl-E export is M4."
+                text: "Teach Chat — send a goal with Enter. Ctrl-C cancels. Ctrl-T takeover, Ctrl-R resume. Ctrl-E exports a skill.json draft."
                     .into(),
             }],
             tools: Vec::new(),
@@ -269,15 +273,23 @@ impl Default for ChatSession {
             takeover_event_count: 0,
             last_human_summary: String::new(),
             pending_normalize: None,
+            export_prompt: false,
+            export_overwrite_name: None,
+            last_goal: String::new(),
+            draft_steps: Vec::new(),
         }
     }
 }
 
 impl ChatSession {
     pub fn push_user(&mut self, text: &str) {
+        let red = redact_for_log(text);
+        if !red.trim().is_empty() {
+            self.last_goal = red.clone();
+        }
         self.messages.push(ChatLine {
             role: "user".into(),
-            text: redact_for_log(text),
+            text: red,
         });
     }
 
@@ -959,10 +971,40 @@ where
     }
 }
 
-pub fn stub_shortcut(key: char) -> &'static str {
-    match key {
-        'e' | 'E' => "export is M4 (not implemented)",
-        _ => "not implemented",
+pub fn default_export_name(goal: &str) -> String {
+    let mut s: String = goal
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while s.contains("--") {
+        s = s.replace("--", "-");
+    }
+    s = s.trim_matches('-').to_string();
+    if s.is_empty() {
+        return "taught-skill".into();
+    }
+    if s.len() > 40 {
+        s.truncate(40);
+    }
+    if s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        s.insert(0, 's');
+    }
+    s
+}
+
+pub fn record_draft_steps(session: &mut ChatSession, steps: &[Value], source: &str) {
+    for s in steps {
+        if let crate::skills::ExportStepClass::Keep(v) =
+            crate::skills::classify_teach_export_step(s, source)
+        {
+            session.draft_steps.push(v);
+        }
     }
 }
 
@@ -1009,6 +1051,8 @@ pub fn apply_plan(session: &mut ChatSession, planned: &PlannedTurn) {
         return;
     }
     session.set_tools_from_actions(&planned.actions, "validated");
+    let vals: Vec<Value> = planned.actions.iter().map(|a| a.to_value()).collect();
+    record_draft_steps(session, &vals, "agent");
     session.phase = TeachMachine::Chat;
     session.status = format!("{} action(s) validated", planned.actions.len());
 }
@@ -1191,8 +1235,11 @@ mod tests {
     }
 
     #[test]
-    fn stubs_point_at_later_milestones() {
-        assert!(stub_shortcut('e').contains("M4"));
+    fn default_export_name_is_safe() {
+        assert_eq!(default_export_name("Sign in and open dashboard"), "sign-in-and-open-dashboard");
+        assert_eq!(default_export_name(""), "taught-skill");
+        assert_eq!(default_export_name("../etc/passwd"), "etc-passwd");
+        assert!(crate::util::validate_name(&default_export_name("Hello World"), "skill").is_ok());
     }
 
     #[test]

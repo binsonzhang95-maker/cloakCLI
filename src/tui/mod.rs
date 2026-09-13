@@ -1389,6 +1389,58 @@ async fn event_loop(
                         app.chat.status = "confirmed (dry-run — cloakcli teach chat executes)".into();
                         app.chat.confirm = None;
                         app.chat.phase = crate::teach_protocol::TeachMachine::Chat;
+                    } else if cmd == chat::ChatCmd::ExportCommit
+                        || cmd == chat::ChatCmd::ExportOverwrite
+                    {
+                        let overwrite = cmd == chat::ChatCmd::ExportOverwrite;
+                        if let Some(name) = app.chat.export_overwrite_name.clone() {
+                            if overwrite {
+                                app.chat.input = name;
+                            }
+                        }
+                        let mut name = app.chat.input.trim().to_string();
+                        if name.is_empty() {
+                            name = crate::teach_chat::default_export_name(&app.chat.last_goal);
+                        }
+                        let steps = app.chat.draft_steps.clone();
+                        let goal = if app.chat.last_goal.is_empty() {
+                            None
+                        } else {
+                            Some(app.chat.last_goal.as_str())
+                        };
+                        match crate::teach::export_chat_draft(
+                            &app.root,
+                            &name,
+                            goal,
+                            &steps,
+                            overwrite,
+                        ) {
+                            Ok(r) => {
+                                app.chat.export_prompt = false;
+                                app.chat.export_overwrite_name = None;
+                                app.chat.input.clear();
+                                app.chat.phase = crate::teach_protocol::TeachMachine::Chat;
+                                app.chat.status = format!("exported {}", r.path.display());
+                                app.chat.push_system(&format!(
+                                    "exported {} ({} steps)",
+                                    r.path.display(),
+                                    r.audit.n_steps
+                                ));
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if msg.contains("already exists") && !overwrite {
+                                    app.chat.export_overwrite_name = Some(name);
+                                    app.chat.status =
+                                        "skill exists — Y overwrite / N cancel".into();
+                                } else {
+                                    app.chat.export_prompt = false;
+                                    app.chat.export_overwrite_name = None;
+                                    app.chat.status = format!("export failed: {msg}");
+                                }
+                                app.chat.push_system(&msg);
+                            }
+                        }
                     }
                     app.status = app.chat.status.clone();
                     continue;
