@@ -16,10 +16,18 @@ use crate::state;
 use crate::util;
 use url::Url;
 
-pub const DEFAULT_RECOVER_TIMEOUT_SEC: u64 = 300;
+/// Recover wall-clock default (~90s form budget). 60–120 is the intended
+/// form range; 300 remains a valid advanced override (`ADVANCED_RECOVER_TIMEOUT_SEC`).
+pub const DEFAULT_RECOVER_TIMEOUT_SEC: u64 = 90;
+/// Documented advanced recover budget (not the default).
+pub const ADVANCED_RECOVER_TIMEOUT_SEC: u64 = 300;
 pub const DEFAULT_MAX_ACTIONS: u32 = 120;
 pub const DEFAULT_MAX_LOOPS: u32 = 60;
 pub const DEFAULT_MAX_TOKENS: u32 = 200_000;
+/// RECOVER PATH: max chat/completions rounds per stall (local tries do not count).
+pub const DEFAULT_MAX_MODEL_ROUNDS: u32 = 3;
+/// TEACH PATH (not recover): one-shot smart optimize after export, default ON.
+pub const DEFAULT_TEACH_SMART_OPTIMIZE: bool = true;
 pub const DEFAULT_API_KEY_ENV: &str = "CLOAKCLI_LLM_API_KEY";
 pub const COMPAT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -54,6 +62,12 @@ pub struct LlmConfig {
     pub max_loops: u32,
     #[serde(default = "default_max_tokens")]
     pub max_tokens_per_recover: u32,
+    /// RECOVER PATH: max model rounds (default 3). Local selector tries do not count.
+    #[serde(default = "default_max_model_rounds")]
+    pub max_model_rounds: u32,
+    /// TEACH PATH (not recover): one-shot LLM optimize on export. Default ON.
+    #[serde(default = "default_teach_smart_optimize")]
+    pub teach_smart_optimize: bool,
 }
 
 fn default_schema() -> u32 {
@@ -71,6 +85,12 @@ fn default_max_loops() -> u32 {
 fn default_max_tokens() -> u32 {
     DEFAULT_MAX_TOKENS
 }
+fn default_max_model_rounds() -> u32 {
+    DEFAULT_MAX_MODEL_ROUNDS
+}
+fn default_teach_smart_optimize() -> bool {
+    DEFAULT_TEACH_SMART_OPTIMIZE
+}
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -85,6 +105,8 @@ impl Default for LlmConfig {
             max_actions: DEFAULT_MAX_ACTIONS,
             max_loops: DEFAULT_MAX_LOOPS,
             max_tokens_per_recover: DEFAULT_MAX_TOKENS,
+            max_model_rounds: DEFAULT_MAX_MODEL_ROUNDS,
+            teach_smart_optimize: DEFAULT_TEACH_SMART_OPTIMIZE,
         }
     }
 }
@@ -102,6 +124,8 @@ pub struct LlmView {
     pub allow_hosts: Vec<String>,
     pub max_actions: u32,
     pub max_loops: u32,
+    pub max_model_rounds: u32,
+    pub teach_smart_optimize: bool,
     pub path: String,
 }
 
@@ -116,6 +140,8 @@ pub struct LlmSetArgs {
     pub max_actions: Option<u32>,
     pub max_loops: Option<u32>,
     pub max_tokens_per_recover: Option<u32>,
+    pub max_model_rounds: Option<u32>,
+    pub teach_smart_optimize: Option<bool>,
 }
 
 pub fn config_path(root: &Path) -> std::path::PathBuf {
@@ -179,6 +205,10 @@ fn sanitize_loaded(cfg: &mut LlmConfig) -> Result<()> {
     if cfg.max_tokens_per_recover == 0 {
         cfg.max_tokens_per_recover = DEFAULT_MAX_TOKENS;
     }
+    if cfg.max_model_rounds == 0 {
+        cfg.max_model_rounds = DEFAULT_MAX_MODEL_ROUNDS;
+    }
+    cfg.max_model_rounds = cfg.max_model_rounds.clamp(1, 8);
     let mut hosts = Vec::new();
     for h in cfg.allow_hosts.drain(..) {
         if let Ok(n) = normalize_host(&h) {
@@ -520,6 +550,15 @@ pub fn apply_set(root: &Path, args: LlmSetArgs) -> Result<LlmConfig> {
     if let Some(n) = args.max_tokens_per_recover {
         cfg.max_tokens_per_recover = n.max(1000);
     }
+    if let Some(n) = args.max_model_rounds {
+        if !(1..=8).contains(&n) {
+            bail!("max_model_rounds must be 1..=8 (got {n})");
+        }
+        cfg.max_model_rounds = n;
+    }
+    if let Some(v) = args.teach_smart_optimize {
+        cfg.teach_smart_optimize = v;
+    }
 
     if cfg.base_url.is_empty() || cfg.model.is_empty() || cfg.api_key_env.is_empty() {
         bail!("llm set requires --base-url, --model, and --api-key-env (env var name only)");
@@ -542,6 +581,9 @@ pub fn view(root: &Path) -> LlmView {
         Ok(cfg) => view_of(root, cfg.as_ref()),
         Err(_) => LlmView {
             configured: false,
+            recover_timeout_sec: DEFAULT_RECOVER_TIMEOUT_SEC,
+            max_model_rounds: DEFAULT_MAX_MODEL_ROUNDS,
+            teach_smart_optimize: DEFAULT_TEACH_SMART_OPTIMIZE,
             path: config_path(root).display().to_string(),
             ..Default::default()
         },
@@ -554,6 +596,8 @@ fn view_of(root: &Path, cfg: Option<&LlmConfig>) -> LlmView {
         None => LlmView {
             configured: false,
             recover_timeout_sec: DEFAULT_RECOVER_TIMEOUT_SEC,
+            max_model_rounds: DEFAULT_MAX_MODEL_ROUNDS,
+            teach_smart_optimize: DEFAULT_TEACH_SMART_OPTIMIZE,
             path,
             ..Default::default()
         },
@@ -568,6 +612,8 @@ fn view_of(root: &Path, cfg: Option<&LlmConfig>) -> LlmView {
             allow_hosts: c.allow_hosts.clone(),
             max_actions: c.max_actions,
             max_loops: c.max_loops,
+            max_model_rounds: c.max_model_rounds,
+            teach_smart_optimize: c.teach_smart_optimize,
             path,
         },
     }
@@ -1199,7 +1245,9 @@ pub fn format_show(view: &LlmView) -> String {
          model:                {}\n\
          base_url:             {}\n\
          api_key_env:          {} ({key})\n\
-         recover_timeout_sec:  {}\n\
+         recover_timeout_sec:  {} (default {}; {} is an advanced override)\n\
+         max_model_rounds:     {}\n\
+         teach_smart_optimize: {} (teach export; not recover)\n\
          allow_hosts:          {hosts}\n\
          max_actions:          {}\n\
          max_loops:            {}\n\
@@ -1209,6 +1257,10 @@ pub fn format_show(view: &LlmView) -> String {
         view.base_url,
         view.api_key_env,
         view.recover_timeout_sec,
+        DEFAULT_RECOVER_TIMEOUT_SEC,
+        ADVANCED_RECOVER_TIMEOUT_SEC,
+        view.max_model_rounds,
+        view.teach_smart_optimize,
         view.max_actions,
         view.max_loops,
         view.path
@@ -1317,10 +1369,13 @@ mod tests {
     }
 
     #[test]
-    fn default_timeout_is_300() {
-        assert_eq!(DEFAULT_RECOVER_TIMEOUT_SEC, 300);
+    fn default_timeout_is_90_advanced_override_300() {
+        assert_eq!(DEFAULT_RECOVER_TIMEOUT_SEC, 90);
+        assert_eq!(ADVANCED_RECOVER_TIMEOUT_SEC, 300);
         let c = LlmConfig::default();
-        assert_eq!(c.recover_timeout_sec, 300);
+        assert_eq!(c.recover_timeout_sec, 90);
+        assert_eq!(c.max_model_rounds, 3);
+        assert!(c.teach_smart_optimize);
     }
 
     #[test]

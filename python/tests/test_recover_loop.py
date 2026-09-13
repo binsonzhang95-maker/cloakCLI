@@ -108,7 +108,7 @@ class RecoverLoopTests(unittest.TestCase):
             artifacts_dir=artifacts,
             skill_name="demo",
             task_origin="https://example.com",
-            cfg=_cfg(),
+            cfg=_cfg(max_model_rounds=8),
             root=root,
             provider=provider,
         )
@@ -327,6 +327,8 @@ class RecoverLoopTests(unittest.TestCase):
         page = FakePage()
         provider = ScriptedProvider(
             [
+                # text stage: coord is rejected (no image) and escalates to vision
+                '{"schema_version":1,"action":"click","x":10,"y":10,"screenshot_id":"obs-001"}',
                 '{"schema_version":1,"action":"click","x":10,"y":10,"screenshot_id":"obs-001"}',
                 '{"schema_version":1,"action":"done","reason":"clicked"}',
             ]
@@ -467,3 +469,162 @@ class RecoverLoopTests(unittest.TestCase):
             screenshot_id="obs-001", width=1280, height=720, url=page.url, valid=False
         )
         self.assertFalse(binding_still_valid(page, dead))
+
+    def test_local_backup_selector_skips_llm(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        page.elements["#alt"] = {"text": "Go"}
+        provider = ScriptedProvider(
+            ['{"schema_version":1,"action":"done","reason":"should not be called"}']
+        )
+        out = run_recover(
+            page=page,
+            goal="click go",
+            stall={"action": "click", "selector": "#missing", "selectors": ["#missing", "#alt"]},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "done")
+        self.assertEqual(out.stage, "local")
+        self.assertEqual(provider.calls, 0)
+        self.assertIn("#alt", page.clicked)
+        traj = json.loads(Path(out.trajectory_path).read_text(encoding="utf-8"))
+        self.assertEqual(traj["telemetry"]["model_rounds"], 0)
+        self.assertEqual(traj["telemetry"]["status"], "done")
+
+    def test_text_stage_does_not_attach_image(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        provider = ScriptedProvider(
+            ['{"schema_version":1,"action":"click","css":"a"}', '{"schema_version":1,"action":"done","reason":"ok"}']
+        )
+        out = run_recover(
+            page=page,
+            goal="g",
+            stall={"error": "x", "action": "click", "selector": "#nope"},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "done")
+        self.assertTrue(provider.images)
+        self.assertFalse(provider.images[0], "text stage must not attach a screenshot")
+        self.assertFalse(any(c.get("full_page") for c in page.screenshot_calls))
+
+    def test_vision_attaches_one_compressed_not_full_page(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        provider = ScriptedProvider(
+            [
+                '{"schema_version":1,"action":"fail","reason":"need vision"}',
+                '{"schema_version":1,"action":"click","css":"a"}',
+                '{"schema_version":1,"action":"done","reason":"ok"}',
+            ]
+        )
+        out = run_recover(
+            page=page,
+            goal="g",
+            stall={"error": "x", "action": "click", "selector": "#nope"},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "done")
+        self.assertGreaterEqual(len(provider.images), 2)
+        self.assertFalse(provider.images[0])
+        self.assertTrue(provider.images[1])
+        self.assertTrue(any(not c.get("full_page") for c in page.screenshot_calls))
+        self.assertFalse(any(c.get("full_page") for c in page.screenshot_calls))
+        traj = json.loads(Path(out.trajectory_path).read_text(encoding="utf-8"))
+        self.assertGreaterEqual(traj["telemetry"]["screenshot_bytes"], 0)
+        self.assertGreaterEqual(traj["telemetry"]["model_rounds"], 2)
+
+    def test_max_three_model_rounds(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        provider = ScriptedProvider(
+            ['{"schema_version":1,"action":"wait","ms":1}'] * 6
+        )
+        out = run_recover(
+            page=page,
+            goal="g",
+            stall={"error": "x"},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(max_model_rounds=3, recover_timeout_sec=30),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "failed")
+        self.assertEqual(out.model_rounds, 3)
+        self.assertLessEqual(provider.calls, 3)
+
+    def test_press_and_select_execute(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        page.elements["select#n"] = {"text": ""}
+        provider = ScriptedProvider(
+            [
+                '{"schema_version":1,"action":"select","css":"select#n","value":"CA"}',
+                '{"schema_version":1,"action":"press","key":"Enter"}',
+                '{"schema_version":1,"action":"done","reason":"ok"}',
+            ]
+        )
+        out = run_recover(
+            page=page,
+            goal="g",
+            stall={"error": "x"},
+            artifacts_dir=artifacts,
+            skill_name="demo",
+            task_origin="https://example.com",
+            cfg=_cfg(),
+            root=root,
+            provider=provider,
+        )
+        self.assertEqual(out.status, "done")
+        self.assertEqual(page.selected, [("select#n", "CA")])
+        self.assertEqual(page.pressed, ["Enter"])
+
+    def test_runner_tries_backup_selectors(self):
+        root = _root()
+        artifacts = root / "data" / "artifacts" / "demo"
+        page = FakePage()
+        page.elements["#alt"] = {"text": "ok"}
+        skill = {
+            "name": "demo",
+            "steps": [
+                {
+                    "action": "click",
+                    "selector": "#missing",
+                    "selectors": ["#missing", "#alt"],
+                    "timeout": 50,
+                }
+            ],
+        }
+        result = execute_skill(
+            page=page,
+            skill=skill,
+            skill_name="demo",
+            variables={},
+            artifacts_dir=artifacts,
+            project_root=root,
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertIn("#alt", page.clicked)
+        self.assertFalse(result.get("recover"))

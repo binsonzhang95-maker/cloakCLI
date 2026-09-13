@@ -1,4 +1,9 @@
-"""Recover state machine: observe → model → whitelist actions on the current page."""
+"""RECOVER PATH (not teach): local selectors → text+DOM → one compressed vision shot.
+
+Teach recording/export is the Rust CLI + extensions/teach/. This module only
+runs after a skill step stalls. Success at any stage stops the cascade.
+Default wall-clock ~90s, max 3 model rounds. Telemetry is observational.
+"""
 
 from __future__ import annotations
 
@@ -14,30 +19,59 @@ from ..llm_config import LlmConfig
 from ..paths import ensure_under_root
 from ..redact import redact_any, redact_text
 from .actions import ActionError, RecoverAction, parse_model_output
-from .observe import CoordBinding, Observation, binding_still_valid, capture_observation
+from .local import try_local_recover
+from .observe import (
+    CoordBinding,
+    Observation,
+    binding_still_valid,
+    capture_observation,
+    clip_around_selector,
+)
 from .origin import origin_of, url_allowed
 from .provider import OpenAICompatProvider, ProviderError
 
+TEXT_PROMPT = """You recover a stalled browser automation skill on the EXISTING page.
+This is the TEXT stage: you get URL, failed action, and a structured clickable DOM summary.
+NO screenshot is attached. Prefer css from the clickable list.
+Form whitelist: click, fill, press, select, small scroll. type is fill-like.
+You CANNOT read local files, run shell/host code, or execute arbitrary JavaScript.
+Return JSON only, schema_version 1:
+{"schema_version":1,"action":"click|type|fill|press|select|scroll|wait|goto|done|fail|ask_human"}
+click: {"css":"..."}
+press: {"key":"Enter|Tab|Escape|ArrowDown|..."}
+select: {"css":"...","value":"..."}
+fill/type: {"css":"...","text":"..."}  login passwords are allowed; never API keys/Authorization/cookies.
+scroll: {"delta_y":int} small only (|delta|<=800) or {"css":"..."}
+wait: {"ms":int}
+goto: {"url":"..."} same origin unless allow_hosts; never file:/javascript:/data:
+done/fail/ask_human: {"reason":"..."}
+If you cannot decide from the DOM, return {"action":"fail","reason":"need vision"}.
+"""
+
 SYSTEM_PROMPT = """You recover a stalled browser automation skill on the EXISTING page.
-You may click, type/fill, scroll, wait, or goto (policy-limited). Observation screenshots are provided each turn.
+This is the VISION stage: ONE compressed/crop screenshot is attached (never a full-page original).
+Form whitelist: click, fill, press, select, small scroll. type is fill-like.
 You CANNOT read local files, run shell/host code, or execute arbitrary JavaScript.
 Return a JSON object only, schema_version 1, one action:
-{"schema_version":1,"action":"click|type|fill|scroll|wait|goto|done|fail|ask_human"}
+{"schema_version":1,"action":"click|type|fill|press|select|scroll|wait|goto|done|fail|ask_human"}
 click: {"css":"..."} OR {"x":int,"y":int,"screenshot_id":"<current screenshot_id>"}
   Coordinate clicks REQUIRE screenshot_id equal to this observation's screenshot_id.
   Omitting it, or using a previous id after navigation/viewport change, is rejected.
   Coords are CSS pixels of the CURRENT screenshot.
+press: {"key":"Enter|Tab|Escape|ArrowDown|..."}
+select: {"css":"...","value":"..."}
 type: {"css":"...","text":"..."}  click the field then keyboard.type
 fill: {"css":"...","text":"..."}  Playwright page.fill (replace the input value)
   You MAY type into username/password form fields when the goal requires login.
   Do not invent API keys or paste Authorization headers / cookie values.
-scroll: {"delta_y":int} optional delta_x or css
+scroll: {"delta_y":int} small only (|delta|<=800) or css
 wait: {"ms":int}
 goto: {"url":"..."} same origin unless allow_hosts; never file:/javascript:/data:
 done: {"reason":"..."} when the goal is achieved
 fail: {"reason":"..."} when the goal cannot be achieved
 ask_human: {"reason":"..."} when a human must decide
 Prefer css selectors from the clickable list over coordinates.
+Do not ask for another screenshot.
 """
 
 
@@ -49,6 +83,11 @@ class RecoverResult:
     run_id: str
     loops: int = 0
     actions: int = 0
+    tokens: int = 0
+    model_rounds: int = 0
+    screenshot_bytes: int = 0
+    latency_ms: int = 0
+    stage: str = ""
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,6 +120,14 @@ class _State:
     last_feedback: str = ""
     consecutive_rejects: int = 0
     binding: CoordBinding | None = None
+    model_rounds: int = 0
+    screenshot_bytes: int = 0
+    screenshot_count: int = 0
+    screenshot_index: int = 0
+    latency_ms: int = 0
+    stage: str = "local"
+    need_vision: bool = False
+    vision_attached: bool = False
 
 
 def run_recover(
@@ -121,6 +168,11 @@ def run_recover(
             run_id=run_id,
             loops=st.loops,
             actions=st.actions,
+            tokens=st.tokens,
+            model_rounds=st.model_rounds,
+            screenshot_bytes=st.screenshot_bytes,
+            latency_ms=st.latency_ms,
+            stage=st.stage,
         )
         body = {
             "schema_version": 1,
@@ -140,6 +192,15 @@ def run_recover(
             "model": cfg.model,
             "base_url": cfg.base_url,
             "ended_at": datetime.now(timezone.utc).isoformat(),
+            "telemetry": {
+                "tokens": st.tokens,
+                "latency_ms": st.latency_ms,
+                "model_rounds": st.model_rounds,
+                "screenshot_bytes": st.screenshot_bytes,
+                "screenshot_count": st.screenshot_count,
+                "stage": st.stage,
+                "status": status,
+            },
         }
         traj_path.write_text(
             json.dumps(redact_any(body), indent=2, ensure_ascii=False) + "\n",
@@ -171,9 +232,20 @@ def run_recover(
         task_origin=task_origin,
         model=cfg.model,
         base_url=cfg.base_url,
+        max_model_rounds=int(getattr(cfg, "max_model_rounds", 3) or 3),
     )
 
     try:
+        local_ok, local_detail = try_local_recover(page, stall)
+        audit("local_attempt", **local_detail)
+        if local_ok:
+            st.stage = "local"
+            st.actions += 1
+            audit("recover_end", status="done", stage="local")
+            return write_traj("done", "local selectors recovered the stall")
+
+        max_rounds = int(getattr(cfg, "max_model_rounds", 3) or 3)
+
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -194,15 +266,40 @@ def run_recover(
             if st.tokens >= int(cfg.max_tokens_per_recover):
                 audit("recover_end", status="failed")
                 return write_traj("failed", "token soft cap exceeded")
+            if st.model_rounds >= max_rounds:
+                audit("recover_end", status="failed")
+                return write_traj("failed", "max model rounds exceeded")
 
             st.loops += 1
+            stage = "vision" if st.need_vision else "text"
+            st.stage = stage
+            attach = stage == "vision"
+            clip = None
+            if attach:
+                sel = stall.get("selector") if isinstance(stall, dict) else None
+                clip = clip_around_selector(page, sel if isinstance(sel, str) else None)
+                st.screenshot_index += 1
+                obs_index = st.screenshot_index
+            else:
+                obs_index = st.loops
             try:
-                obs = capture_observation(page, traj_dir, st.loops, root)
+                obs = capture_observation(
+                    page,
+                    traj_dir,
+                    obs_index,
+                    root,
+                    attach_image=attach,
+                    clip=clip,
+                )
             except Exception as e:
                 audit("observe_error", error=type(e).__name__)
                 return write_traj("failed", f"observe failed: {type(e).__name__}")
             st.binding = obs.binding
-            st.screenshots.append(obs.screenshot_path)
+            if attach:
+                st.screenshots.append(obs.screenshot_path)
+                st.screenshot_bytes += int(obs.screenshot_bytes or 0)
+                st.screenshot_count += 1
+                st.vision_attached = True
             audit(
                 "observe",
                 screenshot_id=obs.screenshot_id,
@@ -210,6 +307,11 @@ def run_recover(
                 url=obs.url_safe,
                 viewport={"width": obs.viewport[0], "height": obs.viewport[1]},
                 clickable_count=len(obs.clickables),
+                stage=stage,
+                image_attached=attach,
+                screenshot_bytes=obs.screenshot_bytes,
+                compressed=obs.compressed,
+                full_page=False,
             )
 
             messages = _build_messages(
@@ -220,13 +322,15 @@ def run_recover(
                 remaining=remaining,
                 allow_hosts=cfg.allow_hosts,
                 task_origin=task_origin,
+                stage=stage,
             )
-            audit("model_request", loop=st.loops, model=cfg.model)
+            audit("model_request", loop=st.loops, model=cfg.model, stage=stage, image=attach)
+            t_req = time.monotonic()
             try:
                 raw, usage = provider.complete(
                     cfg,
                     messages,
-                    image_b64=obs.image_b64,
+                    image_b64=obs.image_b64 if attach else None,
                     timeout_sec=min(60.0, max(8.0, remaining)),
                 )
             except ProviderError as e:
@@ -235,6 +339,8 @@ def run_recover(
             except Exception as e:
                 audit("model_error", error=type(e).__name__)
                 return write_traj("failed", f"model error: {type(e).__name__}")
+            st.latency_ms += int((time.monotonic() - t_req) * 1000)
+            st.model_rounds += 1
 
             st.tokens += int(usage or 0)
             parsed = parse_model_output(raw)
@@ -243,12 +349,20 @@ def run_recover(
                 actions=[a.public_dict() for a in parsed.actions],
                 errors=parsed.errors,
                 tokens=st.tokens,
+                stage=stage,
             )
+            if _should_escalate(parsed, stage):
+                st.need_vision = True
+                st.last_feedback = "escalating to vision (text stage could not resolve)"
+                audit("escalate_vision", round=st.model_rounds)
+                continue
             if not parsed.actions:
                 st.consecutive_rejects += 1
                 st.last_feedback = "rejected: " + ("; ".join(parsed.errors) or "no actions")
                 if st.consecutive_rejects >= 5:
                     return write_traj("failed", "too many invalid model outputs")
+                if stage == "text":
+                    st.need_vision = True
                 continue
 
             stop: RecoverResult | None = None
@@ -272,6 +386,10 @@ def run_recover(
                 )
                 if outcome == "rejected":
                     st.consecutive_rejects += 1
+                    if stage == "text" and (
+                        action.x is not None or (action.reason or "").find("vision") >= 0
+                    ):
+                        st.need_vision = True
                     if st.consecutive_rejects >= 8:
                         stop = write_traj("failed", "too many rejected actions")
                         break
@@ -303,6 +421,25 @@ def run_recover(
         return write_traj("failed", f"recover crashed: {type(e).__name__}")
 
 
+def _should_escalate(parsed: Any, stage: str) -> bool:
+    """Text stage → vision when the model says it cannot act from DOM alone.
+
+    Coordinate clicks still execute (and reject) in text so tests/audit see the
+    reject; vision is requested via the rejected-action path.
+    """
+    if stage != "text":
+        return False
+    if not parsed.actions:
+        return True
+    for a in parsed.actions:
+        reason = (a.reason or "").lower()
+        if a.type == "fail" and any(
+            w in reason for w in ("vision", "screenshot", "can't see", "cannot see")
+        ):
+            return True
+    return False
+
+
 def _build_messages(
     *,
     goal: str,
@@ -312,23 +449,27 @@ def _build_messages(
     remaining: float,
     allow_hosts: list[str],
     task_origin: str | None,
+    stage: str = "text",
 ) -> list[dict[str, Any]]:
-    clickable_brief = obs.clickables[:40]
+    clickable_brief = obs.clickables[:12] if stage == "vision" else obs.clickables[:40]
     user = {
         "goal": goal,
         "stall": stall,
         "url": obs.url_safe,
         "title": obs.title,
         "viewport": {"width": obs.viewport[0], "height": obs.viewport[1]},
-        "screenshot_id": obs.screenshot_id,
+        "screenshot_id": obs.screenshot_id if stage == "vision" else None,
         "clickables": clickable_brief,
         "task_origin": task_origin,
         "allow_hosts": allow_hosts,
         "seconds_left": int(max(0, remaining)),
         "previous_feedback": feedback or None,
+        "stage": stage,
+        "image_attached": stage == "vision",
     }
+    prompt = SYSTEM_PROMPT if stage == "vision" else TEXT_PROMPT
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": prompt},
         {
             "role": "user",
             "content": json.dumps(redact_any(user), ensure_ascii=False),
@@ -404,6 +545,27 @@ def _execute_action(
             page.mouse.click(x, y)
             audit("action_execute", action=action.public_dict())
             st.last_feedback = f"ok click coords=({x},{y})"
+            return "ok"
+
+        if action.type == "press":
+            key = action.key or "Enter"
+            page.keyboard.press(key)
+            audit("action_execute", action=action.public_dict())
+            st.last_feedback = f"ok press {key}"
+            return "ok"
+
+        if action.type == "select":
+            if not action.css:
+                st.last_feedback = "rejected select: css required"
+                audit("action_reject", action="select", reason="css required")
+                return "rejected"
+            value = action.value if action.value is not None else (action.text or "")
+            if hasattr(page, "select_option"):
+                page.select_option(action.css, value, timeout=timeout)
+            else:
+                page.fill(action.css, value, timeout=timeout)
+            audit("action_execute", action=action.public_dict())
+            st.last_feedback = "ok select"
             return "ok"
 
         if action.type in ("type", "fill"):

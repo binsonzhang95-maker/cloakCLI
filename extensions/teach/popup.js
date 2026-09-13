@@ -107,7 +107,8 @@ $("export").addEventListener("click", async () => {
   const name = $("name").value.trim();
   const goal = $("goal").value.trim();
   if (goal) await send({ type: "goal", text: goal });
-  const r = await send({ type: "export", name, goal });
+  const smart = $("smart") ? $("smart").checked : true;
+  const r = await send({ type: "export", name, goal, smartOptimize: smart });
   if (r.ok) {
     setMsg("exported " + (r.path || ""), "ok");
   } else {

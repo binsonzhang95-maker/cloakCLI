@@ -7,9 +7,24 @@
     { "name": "PASSWORD", "required": true }
   ],
   "steps": [
-    { "action": "goto", "url": "https://example.com/login?next=/app" },
-    { "action": "fill", "selector": "#user", "text": "alice" },
-    { "action": "fill", "selector": "#pass", "text": "{{vars.PASSWORD}}" },
+    {
+      "action": "goto",
+      "url": "https://example.com/login?next=/app"
+    },
+    {
+      "action": "fill",
+      "selector": "#user",
+      "text": "alice",
+      "field_name": "username",
+      "selectors": ["#user", "input[name=\"username\"]"]
+    },
+    {
+      "action": "fill",
+      "selector": "#pass",
+      "text": "{{vars.PASSWORD}}",
+      "field_name": "password",
+      "selectors": ["#pass", "input[name=\"password\"]", "input[type=\"password\"]"]
+    },
     { "action": "click", "selector": "button.submit" }
   ]
 }

@@ -126,6 +126,7 @@ fn no_extension_path_cli_flag() {
     assert!(!t.contains("--extension"), "{t}");
     assert!(!t.contains("--headless"), "{t}");
     assert!(t.contains("allow-secrets"), "{t}");
+    assert!(t.contains("no-smart-optimize"), "{t}");
 }
 
 #[test]

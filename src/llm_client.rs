@@ -1,17 +1,22 @@
-//! Shared OpenAI-compatible HTTP client for `GET {base}/models`.
+//! Shared OpenAI-compatible HTTP client (`GET {base}/models`, `POST chat/completions`).
 //!
 //! Timeouts, Bearer auth, body/count/id/pagination caps, strict `data[].id`
 //! parse. Errors never include the API key or the raw response body.
+//! Used by TEACH PATH (export optimize / assist) and by `llm models`.
+//! Recover uses the Python worker client; do not mix the two call sites.
 
 use anyhow::{bail, Context, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::Read;
 use std::time::Duration;
 
 use crate::llm::{
-    models_url, redact_secrets, MAX_MODELS, MAX_MODELS_BODY, MAX_MODELS_PAGES,
-    MAX_MODEL_ID_LEN, MODELS_CONNECT_TIMEOUT_SEC, MODELS_READ_TIMEOUT_SEC,
+    chat_completions_url, models_url, redact_secrets, MAX_MODELS, MAX_MODELS_BODY,
+    MAX_MODELS_PAGES, MAX_MODEL_ID_LEN, MODELS_CONNECT_TIMEOUT_SEC, MODELS_READ_TIMEOUT_SEC,
 };
+
+/// Cap for a single chat/completions response body (teach optimize is one shot).
+pub const MAX_CHAT_BODY: usize = 262_144;
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelsList {
@@ -121,6 +126,153 @@ pub fn fetch_models(base_url: &str, api_key: &str) -> Result<ModelsList> {
     })
 }
 
+/// One-shot chat/completions (no images). Shared by TEACH PATH optimize/assist.
+#[derive(Debug, Clone, Default)]
+pub struct ChatCompletion {
+    pub text: String,
+    pub tokens: u32,
+}
+
+pub fn chat_complete(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Value],
+    timeout_sec: u64,
+) -> Result<ChatCompletion> {
+    if api_key.is_empty() {
+        bail!("API key is empty (set the env var named in api_key_env; never pass --api-key)");
+    }
+    let url = chat_completions_url(base_url)?;
+    let model = crate::llm::accept_model_id(model, Some(api_key))?;
+    if messages.is_empty() {
+        bail!("chat/completions requires messages");
+    }
+
+    let payload = json!({
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": 1024,
+    });
+    let body = serde_json::to_vec(&payload).context("serialize chat payload")?;
+
+    let read_timeout = timeout_sec.clamp(5, 60);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(MODELS_CONNECT_TIMEOUT_SEC))
+        .timeout_read(Duration::from_secs(read_timeout))
+        .timeout_write(Duration::from_secs(MODELS_CONNECT_TIMEOUT_SEC))
+        .redirects(3)
+        .user_agent("cloakcli/0.1")
+        .build();
+
+    let req = agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {api_key}"))
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json")
+        .set("Connection", "close");
+
+    let (status, raw, trunc) = match req.send_bytes(&body) {
+        Ok(resp) => {
+            let status = resp.status();
+            let (raw, trunc) = read_capped_n(resp.into_reader(), MAX_CHAT_BODY)?;
+            (status, raw, trunc)
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let _ = read_capped_n(resp.into_reader(), 400);
+            (code, Vec::new(), false)
+        }
+        Err(ureq::Error::Transport(t)) => {
+            let msg = redact_secrets(
+                &format!("POST chat/completions network error: {t}"),
+                Some(api_key),
+            );
+            bail!("{msg}")
+        }
+    };
+
+    if !(200..300).contains(&status) {
+        bail!(
+            "{}",
+            redact_secrets(
+                &format!("POST chat/completions HTTP {status}"),
+                Some(api_key)
+            )
+        );
+    }
+    if trunc {
+        bail!("POST chat/completions response exceeded size cap");
+    }
+    let parsed: Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(_) => bail!("POST chat/completions returned non-JSON"),
+    };
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("POST chat/completions returned non-object JSON"))?;
+    if let Some(err) = obj.get("error") {
+        bail!(
+            "{}",
+            redact_secrets(&format!("chat/completions error: {err}"), Some(api_key))
+        );
+    }
+    let text = extract_assistant_text(&parsed).unwrap_or_default();
+    if text.trim().is_empty() {
+        bail!("POST chat/completions returned empty content");
+    }
+    let tokens = obj
+        .get("usage")
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0) as u32;
+    Ok(ChatCompletion { text, tokens })
+}
+
+fn extract_assistant_text(parsed: &Value) -> Option<String> {
+    let choice = parsed.get("choices")?.as_array()?.first()?;
+    let content = choice.get("message")?.get("content")?;
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+                    out.push_str(t);
+                } else if let Some(s) = p.as_str() {
+                    out.push_str(s);
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn read_capped_n<R: Read>(mut r: R, cap: usize) -> Result<(Vec<u8>, bool)> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let n = r.read(&mut tmp).context("read HTTP body")?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() >= cap {
+            truncated = true;
+            break;
+        }
+        let room = cap - buf.len();
+        if n > room {
+            buf.extend_from_slice(&tmp[..room]);
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    Ok((buf, truncated))
+}
+
 fn get_models(agent: &ureq::Agent, url: &str, api_key: &str) -> Result<(u16, Vec<u8>, bool)> {
     let req = agent
         .get(url)
@@ -145,28 +297,8 @@ fn get_models(agent: &ureq::Agent, url: &str, api_key: &str) -> Result<(u16, Vec
     }
 }
 
-fn read_capped<R: Read>(mut r: R) -> Result<(Vec<u8>, bool)> {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 8192];
-    let mut truncated = false;
-    loop {
-        let n = r.read(&mut tmp).context("read /models body")?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() >= MAX_MODELS_BODY {
-            truncated = true;
-            break;
-        }
-        let room = MAX_MODELS_BODY - buf.len();
-        if n > room {
-            buf.extend_from_slice(&tmp[..room]);
-            truncated = true;
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    Ok((buf, truncated))
+fn read_capped<R: Read>(r: R) -> Result<(Vec<u8>, bool)> {
+    read_capped_n(r, MAX_MODELS_BODY)
 }
 
 /// Strict parse: object with `data` array; each element an object with string `id`.
@@ -564,6 +696,52 @@ mod tests {
         let _ = join.join();
         assert!(err.contains("no model ids") || err.contains("empty"), "{err}");
         assert!(!err.contains(key), "{err}");
+    }
+
+    #[test]
+    fn chat_complete_returns_text_and_tokens() {
+        let (base, auths, join) = spawn_n(1, |_i, path, _h| {
+            assert!(path.contains("chat/completions"), "path={path}");
+            (
+                200,
+                json!({
+                    "choices":[{"message":{"content":"{\"ok\":true}"}}],
+                    "usage":{"total_tokens": 12}
+                })
+                .to_string(),
+            )
+        });
+        let out = chat_complete(
+            &base,
+            "sk-chat-secret",
+            "gpt-test",
+            &[json!({"role":"user","content":"ping"})],
+            8,
+        )
+        .unwrap();
+        let _ = join.join();
+        assert_eq!(out.text, "{\"ok\":true}");
+        assert_eq!(out.tokens, 12);
+        assert_eq!(auths.lock().unwrap()[0], "Bearer sk-chat-secret");
+    }
+
+    #[test]
+    fn chat_complete_http_error_redacts_key() {
+        let (base, _a, join) = spawn_n(1, |_i, _p, _h| {
+            (401, json!({"error":"invalid_api_key sk-chat-leak"}).to_string())
+        });
+        let err = chat_complete(
+            &base,
+            "sk-chat-leak",
+            "m",
+            &[json!({"role":"user","content":"x"})],
+            8,
+        )
+        .unwrap_err()
+        .to_string();
+        let _ = join.join();
+        assert!(err.contains("401"), "{err}");
+        assert!(!err.contains("sk-chat-leak"), "{err}");
     }
 
 }

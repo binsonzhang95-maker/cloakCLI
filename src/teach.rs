@@ -1,7 +1,12 @@
-//! Headed CloakCLI Teach launcher and skill export.
+//! TEACH PATH (not recover): headed recorder + skill export.
 //!
-//! Records via the MV3 extension at `extensions/teach/`. This module is a
-//! launcher + exporter only — it does not implement a teaching state machine.
+//! Records via the MV3 extension at `extensions/teach/` with **no per-step LLM**.
+//! On export, local post-process (merge fills, denoise, backup selector chains)
+//! always runs. A default-ON one-shot "smart optimize" may then call the model
+//! once for a structured patch; the patch is validated locally before save.
+//! Optional mid-record assist is capped at 2 LLM calls and deferred when not cheap.
+//!
+//! Stall-recovery lives in `python/cloakcli_worker/recover/` — do not mix the paths.
 //! Master/fleet never teach; they consume exported `skills/<name>/skill.json`.
 
 use anyhow::{bail, Context, Result};
@@ -61,6 +66,8 @@ pub struct TeachStartOpts {
     pub profile: String,
     pub url: Option<String>,
     pub allow_secrets: bool,
+    /// TEACH PATH: one-shot LLM optimize after export (default ON).
+    pub smart_optimize: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,7 +79,13 @@ struct ExtConfig {
     allow_origins: Vec<String>,
     #[serde(rename = "allowSecrets")]
     allow_secrets: bool,
+    #[serde(rename = "smartOptimize", default = "default_true")]
+    smart_optimize: bool,
     profile: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,21 +95,35 @@ struct ExportBody {
     goal: Option<String>,
     #[serde(default)]
     events: Vec<RecordedEvent>,
+    /// Popup/CLI toggle; default ON when omitted.
+    #[serde(default, rename = "smartOptimize")]
+    smart_optimize: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RecordedEvent {
+    #[serde(default)]
     pub kind: String,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
     pub selector: Option<String>,
+    /// Backup selector chain from the extension (id/name/testid/…).
+    #[serde(default)]
+    pub selectors: Vec<String>,
     #[serde(default)]
     pub value: Option<String>,
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
     pub field: Option<FieldHint>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub unstable: bool,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -111,6 +138,20 @@ pub struct FieldHint {
     pub autocomplete: Option<String>,
     #[serde(default)]
     pub tag: Option<String>,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    #[serde(default)]
+    pub testid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssistBody {
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default)]
+    selectors: Vec<String>,
+    #[serde(default)]
+    field: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +169,10 @@ struct ExportState {
     root: PathBuf,
     token: String,
     allow_secrets: bool,
+    smart_optimize: bool,
     last: Mutex<Option<PathBuf>>,
+    assist_calls: Mutex<u8>,
+    last_assist_ms: Mutex<u64>,
 }
 
 /// Headed is a hard requirement. Headless teach is rejected before launch.
@@ -242,6 +286,7 @@ pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
             token: token.clone(),
             allow_origins,
             allow_secrets: opts.allow_secrets,
+            smart_optimize: opts.smart_optimize,
             profile: prof.name.clone(),
         },
     )?;
@@ -250,7 +295,10 @@ pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
         root: root.to_path_buf(),
         token,
         allow_secrets: opts.allow_secrets,
+        smart_optimize: opts.smart_optimize,
         last: Mutex::new(None),
+        assist_calls: Mutex::new(0),
+        last_assist_ms: Mutex::new(0),
     });
     let server_state = state.clone();
     let server = tokio::spawn(async move {
@@ -262,6 +310,11 @@ pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
     println!("  extension: {}", staged.display());
     println!("  export:    {export_origin}/export");
     println!("Record with the extension popup: record → mark goal → stop → export.");
+    if opts.smart_optimize {
+        println!("Smart optimize: ON (one LLM call after export; --no-smart-optimize to skip).");
+    } else {
+        println!("Smart optimize: OFF (local post-process only).");
+    }
     println!("Close the browser window when finished (Ctrl-C also stops and releases the profile lock).");
 
     let result = run_browser(
@@ -534,7 +587,7 @@ async fn handle_http(mut stream: TcpStream, state: Arc<ExportState>) -> Result<(
         return Ok(());
     }
 
-    if method != "POST" || path != "/export" {
+    if method != "POST" || (path != "/export" && path != "/assist") {
         write_http(
             &mut stream,
             404,
@@ -572,6 +625,10 @@ async fn handle_http(mut stream: TcpStream, state: Arc<ExportState>) -> Result<(
         return Ok(());
     }
 
+    if path == "/assist" {
+        return handle_assist_body(&mut stream, &state, body).await;
+    }
+
     let parsed: ExportBody = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
@@ -581,12 +638,14 @@ async fn handle_http(mut stream: TcpStream, state: Arc<ExportState>) -> Result<(
         }
     };
 
+    let smart = parsed.smart_optimize.unwrap_or(state.smart_optimize);
     match export_recorded(
         &state.root,
         &parsed.name,
         parsed.goal.as_deref(),
         &parsed.events,
         state.allow_secrets,
+        smart,
     ) {
         Ok(path) => {
             if let Ok(mut g) = state.last.lock() {
@@ -606,6 +665,90 @@ async fn handle_http(mut stream: TcpStream, state: Arc<ExportState>) -> Result<(
         }
     }
     Ok(())
+}
+
+async fn handle_assist_body(
+    stream: &mut TcpStream,
+    state: &ExportState,
+    body: &[u8],
+) -> Result<()> {
+    let parsed: AssistBody = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = json!({"ok": false, "error": format!("invalid json: {e}")});
+            write_http(stream, 400, &msg.to_string()).await?;
+            return Ok(());
+        }
+    };
+    let primary = parsed.selector.as_deref().unwrap_or("").trim();
+    let local = crate::teach_optimize::local_backup_chain(
+        primary,
+        &parsed.selectors,
+        parsed.field.as_ref(),
+    );
+
+    let calls = state.assist_calls.lock().map(|g| *g).unwrap_or(ASSIST_MAX);
+    let last_ms = state.last_assist_ms.lock().map(|g| *g).unwrap_or(0);
+    let cheap = calls < crate::teach_optimize::ASSIST_MAX_LLM_CALLS
+        && (calls == 0 || last_ms <= crate::teach_optimize::ASSIST_CHEAP_MS);
+    let unstable = selector_looks_unstable(primary);
+    let allow_llm = cheap && unstable && !primary.is_empty();
+
+    let out = if allow_llm {
+        let r = crate::teach_optimize::assist_selectors(
+            &state.root,
+            primary,
+            &parsed.selectors,
+            parsed.field.as_ref(),
+            true,
+        );
+        if r.used_llm {
+            if let Ok(mut g) = state.assist_calls.lock() {
+                *g = g.saturating_add(1);
+            }
+            if let Ok(mut g) = state.last_assist_ms.lock() {
+                *g = r.latency_ms;
+            }
+        }
+        r
+    } else {
+        crate::teach_optimize::AssistOutcome {
+            selectors: local,
+            deferred: true,
+            reason: if !unstable {
+                "stable selector".into()
+            } else if calls >= crate::teach_optimize::ASSIST_MAX_LLM_CALLS {
+                "assist cap".into()
+            } else {
+                "deferred (not cheap)".into()
+            },
+            ..Default::default()
+        }
+    };
+
+    let msg = json!({
+        "ok": true,
+        "selectors": out.selectors,
+        "deferred": out.deferred,
+        "used_llm": out.used_llm,
+        "calls_used": state.assist_calls.lock().map(|g| *g).unwrap_or(0),
+        "tokens": out.tokens,
+        "reason": out.reason,
+    });
+    write_http(stream, 200, &msg.to_string()).await?;
+    Ok(())
+}
+
+const ASSIST_MAX: u8 = 2;
+
+fn selector_looks_unstable(sel: &str) -> bool {
+    if sel.is_empty() {
+        return true;
+    }
+    let lower = sel.to_ascii_lowercase();
+    lower.contains(":nth-")
+        || lower.matches('>').count() >= 3
+        || sel.len() > 80
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -640,14 +783,37 @@ async fn write_http(stream: &mut TcpStream, status: u16, body: &str) -> Result<(
 }
 
 /// Map recorded events → existing skill.json schema and write under `skills/<name>/`.
+/// Local post-process always runs. Smart optimize is a single optional LLM call.
 pub fn export_recorded(
     root: &Path,
     name: &str,
     goal: Option<&str>,
     events: &[RecordedEvent],
     allow_secrets: bool,
+    smart_optimize: bool,
 ) -> Result<PathBuf> {
     let mapped = map_events_to_skill(name, goal, events, allow_secrets)?;
+    let mapped = if smart_optimize {
+        match crate::teach_optimize::maybe_optimize(root, &mapped, true) {
+            Ok(out) => {
+                if let Some(skip) = &out.skipped {
+                    eprintln!("teach smart optimize skipped: {skip}");
+                } else if out.applied {
+                    eprintln!(
+                        "teach smart optimize applied tokens={} latency_ms={}",
+                        out.tokens, out.latency_ms
+                    );
+                }
+                out.mapped
+            }
+            Err(e) => {
+                eprintln!("teach smart optimize failed: {e}");
+                mapped
+            }
+        }
+    } else {
+        mapped
+    };
     write_skill_dir(root, &mapped)
 }
 
@@ -664,8 +830,8 @@ pub fn map_events_to_skill(
     let mut var_counts: HashMap<String, usize> = HashMap::new();
     let mut last_nav: Option<String> = None;
 
-    // Coalesce consecutive inputs on the same selector (keep last value).
-    let coalesced = coalesce_events(events);
+    // Local post-process (TEACH PATH, 0 tokens): denoise then merge consecutive fills.
+    let coalesced = coalesce_events(&denoise_events(events));
 
     for (i, ev) in coalesced.iter().enumerate() {
         let kind = ev.kind.trim().to_ascii_lowercase();
@@ -697,7 +863,15 @@ pub fn map_events_to_skill(
                         continue;
                     }
                 }
-                steps.push(json!({"action": "click", "selector": sel}));
+                let mut step = json!({"action": "click", "selector": sel});
+                let chain = backup_selectors(ev);
+                if chain.len() > 1 {
+                    step["selectors"] = json!(chain);
+                }
+                if let Some(name) = semantic_field_name(ev) {
+                    step["field_name"] = json!(name);
+                }
+                steps.push(step);
             }
             "input" | "fill" | "type" => {
                 let Some(sel) = ev.selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
@@ -724,7 +898,15 @@ pub fn map_events_to_skill(
                 } else {
                     strip_secretish_value(&raw_val)
                 };
-                steps.push(json!({"action": "fill", "selector": sel, "text": text}));
+                let mut step = json!({"action": "fill", "selector": sel, "text": text});
+                let chain = backup_selectors(ev);
+                if chain.len() > 1 {
+                    step["selectors"] = json!(chain);
+                }
+                if let Some(name) = semantic_field_name(ev) {
+                    step["field_name"] = json!(name);
+                }
+                steps.push(step);
             }
             _ => continue,
         }
@@ -752,6 +934,101 @@ pub fn map_events_to_skill(
         vars,
         allow_secrets,
     })
+}
+
+fn denoise_events(events: &[RecordedEvent]) -> Vec<RecordedEvent> {
+    let mut out: Vec<RecordedEvent> = Vec::new();
+    for ev in events {
+        let kind = ev.kind.trim().to_ascii_lowercase();
+        if matches!(
+            kind.as_str(),
+            "hover"
+                | "blur"
+                | "focus"
+                | "mouseover"
+                | "mouseout"
+                | "mousemove"
+                | "pointermove"
+                | "scroll"
+                | "keydown"
+                | "keyup"
+                | "keypress"
+        ) {
+            continue;
+        }
+        if kind == "click" {
+            if let Some(last) = out.last() {
+                if last.kind.trim().eq_ignore_ascii_case("click") && last.selector == ev.selector {
+                    continue;
+                }
+            }
+        }
+        out.push(ev.clone());
+    }
+    out
+}
+
+fn backup_selectors(ev: &RecordedEvent) -> Vec<String> {
+    let mut field_json = None;
+    let owned;
+    if let Some(f) = ev.field.as_ref() {
+        owned = json!({
+            "id": f.id,
+            "name": f.name,
+            "tag": f.tag,
+            "autocomplete": f.autocomplete,
+            "testid": f.testid,
+            "type": f.input_type,
+        });
+        field_json = Some(&owned);
+    }
+    let mut extra = ev.selectors.clone();
+    if let Some(label) = ev.label.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        extra.push(format!("[aria-label=\"{}\"]", css_attr(label)));
+    }
+    crate::teach_optimize::local_backup_chain(
+        ev.selector.as_deref().unwrap_or(""),
+        &extra,
+        field_json,
+    )
+}
+
+fn css_attr(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn semantic_field_name(ev: &RecordedEvent) -> Option<String> {
+    let f = ev.field.as_ref();
+    let hay = [
+        f.and_then(|x| x.autocomplete.as_deref()).unwrap_or(""),
+        f.and_then(|x| x.name.as_deref()).unwrap_or(""),
+        f.and_then(|x| x.id.as_deref()).unwrap_or(""),
+        f.and_then(|x| x.input_type.as_deref()).unwrap_or(""),
+        f.and_then(|x| x.placeholder.as_deref()).unwrap_or(""),
+        ev.label.as_deref().unwrap_or(""),
+        ev.role.as_deref().unwrap_or(""),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+    if hay.contains("email") || hay.contains("e-mail") {
+        return Some("email".into());
+    }
+    if hay.contains("user") || hay.contains("login") {
+        return Some("username".into());
+    }
+    if hay.contains("pass") {
+        return Some("password".into());
+    }
+    if hay.contains("phone") || hay.contains("tel") || hay.contains("mobile") {
+        return Some("phone".into());
+    }
+    if hay.contains("address") || hay.contains("shipping") {
+        return Some("shipping_address".into());
+    }
+    if hay.contains("search") {
+        return Some("search".into());
+    }
+    None
 }
 
 fn coalesce_events(events: &[RecordedEvent]) -> Vec<RecordedEvent> {
@@ -1037,30 +1314,23 @@ mod tests {
         RecordedEvent {
             kind: "navigation".into(),
             url: Some(url.into()),
-            selector: None,
-            value: None,
-            text: None,
-            field: None,
+            ..Default::default()
         }
     }
     fn ev_click(sel: &str) -> RecordedEvent {
         RecordedEvent {
             kind: "click".into(),
-            url: None,
             selector: Some(sel.into()),
-            value: None,
-            text: None,
-            field: None,
+            ..Default::default()
         }
     }
     fn ev_input(sel: &str, value: &str, field: FieldHint) -> RecordedEvent {
         RecordedEvent {
             kind: "input".into(),
-            url: None,
             selector: Some(sel.into()),
             value: Some(value.into()),
-            text: None,
             field: Some(field),
+            ..Default::default()
         }
     }
 
@@ -1099,11 +1369,8 @@ mod tests {
             ev_click("button.submit"),
             RecordedEvent {
                 kind: "goal".into(),
-                url: None,
-                selector: None,
-                value: None,
                 text: Some("Sign in and open the dashboard".into()),
-                field: None,
+                ..Default::default()
             },
         ];
         let m = map_events_to_skill("taught-login", None, &events, false).unwrap();
@@ -1114,6 +1381,12 @@ mod tests {
         assert_eq!(m.steps[1]["action"], "fill");
         assert_eq!(m.steps[1]["selector"], "#user");
         assert_eq!(m.steps[1]["text"], "alice");
+        assert_eq!(m.steps[1]["field_name"], "username");
+        assert!(m.steps[1]["selectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("input[name=\"username\"]")));
         assert_eq!(m.steps[2]["action"], "fill");
         assert_eq!(m.steps[2]["selector"], "#pass");
         assert_eq!(m.steps[2]["text"], "{{vars.PASSWORD}}");
@@ -1140,6 +1413,54 @@ mod tests {
     }
 
     #[test]
+    fn denoise_drops_hover_and_duplicate_clicks() {
+        let events = vec![
+            ev_click("#go"),
+            RecordedEvent {
+                kind: "hover".into(),
+                selector: Some("#go".into()),
+                ..Default::default()
+            },
+            ev_click("#go"),
+            ev_nav("https://example.com/"),
+        ];
+        let m = map_events_to_skill("s", None, &events, false).unwrap();
+        let clicks: Vec<_> = m
+            .steps
+            .iter()
+            .filter(|s| s["action"] == "click")
+            .collect();
+        assert_eq!(clicks.len(), 1, "{:?}", m.steps);
+    }
+
+    #[test]
+    fn coalesce_consecutive_fills_keeps_last() {
+        let events = vec![
+            ev_input(
+                "#user",
+                "a",
+                FieldHint {
+                    name: Some("username".into()),
+                    id: Some("user".into()),
+                    ..Default::default()
+                },
+            ),
+            ev_input(
+                "#user",
+                "alice",
+                FieldHint {
+                    name: Some("username".into()),
+                    id: Some("user".into()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let m = map_events_to_skill("s", None, &events, false).unwrap();
+        assert_eq!(m.steps.len(), 1);
+        assert_eq!(m.steps[0]["text"], "alice");
+    }
+
+    #[test]
     fn empty_steps_rejected() {
         let err = map_events_to_skill("s", Some("g"), &[], false)
             .unwrap_err()
@@ -1154,18 +1475,12 @@ mod tests {
             RecordedEvent {
                 kind: "goal".into(),
                 text: Some("first".into()),
-                url: None,
-                selector: None,
-                value: None,
-                field: None,
+                ..Default::default()
             },
             RecordedEvent {
                 kind: "goal".into(),
                 text: Some("second".into()),
-                url: None,
-                selector: None,
-                value: None,
-                field: None,
+                ..Default::default()
             },
         ];
         let m = map_events_to_skill("g", None, &events, false).unwrap();

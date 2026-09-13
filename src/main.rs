@@ -14,6 +14,7 @@ mod protocol;
 mod skills;
 mod state;
 mod teach;
+mod teach_optimize;
 mod tui;
 mod util;
 mod worker;

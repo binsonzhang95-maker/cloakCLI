@@ -32,6 +32,41 @@
     }
   }
 
+  function isUnstable(sel) {
+    if (!sel) return true;
+    if (/:nth-(?:child|of-type)/i.test(sel)) return true;
+    if ((sel.match(/>/g) || []).length >= 3) return true;
+    if (sel.length > 80) return true;
+    return false;
+  }
+
+  function selectorBundle(el) {
+    const selectors = [];
+    const add = (s) => {
+      if (s && unique(s) && !selectors.includes(s)) selectors.push(s);
+    };
+    if (el.id) add("#" + CSS.escape(el.id));
+    const testid = el.getAttribute("data-testid") || el.getAttribute("data-test");
+    if (testid) {
+      const key = el.hasAttribute("data-testid") ? "data-testid" : "data-test";
+      add(`[${key}="${cssAttr(testid)}"]`);
+    }
+    if (el.getAttribute("name")) {
+      add(`${el.tagName.toLowerCase()}[name="${cssAttr(el.getAttribute("name"))}"]`);
+    }
+    const ac = el.getAttribute("autocomplete");
+    if (ac && ac !== "off") add(`[autocomplete="${cssAttr(ac)}"]`);
+    const aria = el.getAttribute("aria-label");
+    if (aria) add(`${el.tagName.toLowerCase()}[aria-label="${cssAttr(aria)}"]`);
+    const primary = selectors[0] || cssPath(el);
+    if (primary && !selectors.includes(primary)) selectors.unshift(primary);
+    return {
+      selector: primary,
+      selectors,
+      unstable: isUnstable(primary),
+    };
+  }
+
   function cssPath(el) {
     if (!(el instanceof Element)) return "";
     if (el.id && unique("#" + CSS.escape(el.id))) {
@@ -85,6 +120,8 @@
       name: el.getAttribute("name") || "",
       id: el.id || "",
       autocomplete: el.getAttribute("autocomplete") || "",
+      placeholder: el.getAttribute("placeholder") || "",
+      testid: el.getAttribute("data-testid") || el.getAttribute("data-test") || "",
     };
   }
 
@@ -103,9 +140,17 @@
     const el = ev.target && ev.target.closest ? ev.target.closest("a,button,input,select,textarea,[role='button']") : ev.target;
     if (!(el instanceof Element)) return;
     if (!isTypingField(el)) {
+      const bundle = selectorBundle(el);
       chrome.runtime.sendMessage({
         type: "record",
-        event: { kind: "click", selector: cssPath(el) },
+        event: {
+          kind: "click",
+          selector: bundle.selector,
+          selectors: bundle.selectors,
+          unstable: bundle.unstable,
+          role: el.getAttribute("role") || "",
+          label: el.getAttribute("aria-label") || (el.innerText || "").trim().slice(0, 80),
+        },
       });
     }
   }
@@ -115,13 +160,17 @@
     if (!(el instanceof Element) || !isTypingField(el)) return;
     let value = "";
     if ("value" in el) value = String(el.value);
+    const bundle = selectorBundle(el);
     chrome.runtime.sendMessage({
       type: "record",
       event: {
         kind: "input",
-        selector: cssPath(el),
+        selector: bundle.selector,
+        selectors: bundle.selectors,
+        unstable: bundle.unstable,
         value,
         field: fieldHint(el),
+        label: el.getAttribute("aria-label") || "",
       },
     });
   }

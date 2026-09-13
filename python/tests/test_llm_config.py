@@ -25,7 +25,7 @@ from cloakcli_worker.recover.provider import (
 
 
 class LlmConfigTests(unittest.TestCase):
-    def test_parse_defaults_timeout_300(self):
+    def test_parse_defaults_timeout_90_and_three_rounds(self):
         cfg = parse_llm_config(
             {
                 "enabled": True,
@@ -34,7 +34,9 @@ class LlmConfigTests(unittest.TestCase):
                 "api_key_env": "OPENAI_API_KEY",
             }
         )
-        self.assertEqual(cfg.recover_timeout_sec, 300)
+        self.assertEqual(cfg.recover_timeout_sec, 90)
+        self.assertEqual(cfg.max_model_rounds, 3)
+        self.assertTrue(cfg.teach_smart_optimize)
         self.assertEqual(cfg.max_actions, 120)
         self.assertEqual(cfg.max_loops, 60)
 

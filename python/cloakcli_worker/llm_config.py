@@ -11,10 +11,13 @@ from urllib.parse import urlparse, urlunparse
 
 from .paths import get_root
 
-DEFAULT_RECOVER_TIMEOUT_SEC = 300
+DEFAULT_RECOVER_TIMEOUT_SEC = 90
+ADVANCED_RECOVER_TIMEOUT_SEC = 300
 DEFAULT_MAX_ACTIONS = 120
 DEFAULT_MAX_LOOPS = 60
 DEFAULT_MAX_TOKENS = 200_000
+DEFAULT_MAX_MODEL_ROUNDS = 3
+DEFAULT_TEACH_SMART_OPTIMIZE = True
 DEFAULT_API_KEY_ENV = "CLOAKCLI_LLM_API_KEY"
 COMPAT_API_KEY_ENV = "OPENAI_API_KEY"
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -37,6 +40,8 @@ class LlmConfig:
     max_actions: int = DEFAULT_MAX_ACTIONS
     max_loops: int = DEFAULT_MAX_LOOPS
     max_tokens_per_recover: int = DEFAULT_MAX_TOKENS
+    max_model_rounds: int = DEFAULT_MAX_MODEL_ROUNDS
+    teach_smart_optimize: bool = DEFAULT_TEACH_SMART_OPTIMIZE
     path: str = ""
 
     def public_dict(self) -> dict[str, Any]:
@@ -52,6 +57,8 @@ class LlmConfig:
             "max_actions": self.max_actions,
             "max_loops": self.max_loops,
             "max_tokens_per_recover": self.max_tokens_per_recover,
+            "max_model_rounds": self.max_model_rounds,
+            "teach_smart_optimize": self.teach_smart_optimize,
         }
 
 
@@ -114,6 +121,14 @@ def parse_llm_config(data: dict[str, Any], *, path: str = "") -> LlmConfig:
         max_loops=_int("max_loops", DEFAULT_MAX_LOOPS, 1, 200),
         max_tokens_per_recover=_int(
             "max_tokens_per_recover", DEFAULT_MAX_TOKENS, 1000, 5_000_000
+        ),
+        max_model_rounds=_int(
+            "max_model_rounds", DEFAULT_MAX_MODEL_ROUNDS, 1, 8
+        ),
+        teach_smart_optimize=bool(
+            data["teach_smart_optimize"]
+            if "teach_smart_optimize" in data
+            else DEFAULT_TEACH_SMART_OPTIMIZE
         ),
         path=path,
     )

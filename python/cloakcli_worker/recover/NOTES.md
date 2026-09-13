@@ -1,43 +1,40 @@
-# Recover notes
+# Recover notes (RECOVER PATH — not teach)
 
-Astra code review of `50ff373` was a **conditional pass** (`astra-ai-recover-code.md`).
-This records the user decisions for re-approval. Default `recover_timeout_sec` remains **300**.
+Teach recording/export is the Rust CLI + `extensions/teach/`. This directory
+only runs after a skill step stalls.
 
-## Coordinate clicks (Astra #1 — accepted)
+Balanced LLM-assist MVP (`astra-teach-llm-assist.md`, not the ultra-frugal
+token plan):
 
-`x`/`y` clicks **must** include `screenshot_id` equal to the current observation.
-Omitting it is illegal. A mismatched id is rejected. Coordinate bindings invalidate
-after navigation, viewport change, or any non-`wait` recover action.
+## Cascade (success stops)
 
-CSS-selector clicks do not need `screenshot_id`.
+1. **Local** (0 tokens): recorded selector → backup `selectors[]` → unique
+   role/text/label match on the clickable DOM summary.
+2. **Text + DOM**: URL, failed action, structured clickable list. **No screenshot.**
+3. **Vision**: attach **one** compressed/crop screenshot (viewport JPEG, never a
+   full-page original). Vision only if text cannot decide.
 
-## `fill` is kept (Astra #2 — request re-approval)
+Default wall-clock **90s** (form range 60–120). **300s remains an advanced
+override** (`recover_timeout_sec`). Max **3** model rounds (`max_model_rounds`).
+Token counts, latency, rounds, screenshot bytes, and success/fail are telemetry
+only — no hard min-token goal.
 
-The incremental plan listed `click/type/scroll/wait/goto/done/fail/ask_human`.
-CloakCLI also allows **`fill`**: Playwright `page.fill` on the **existing** page
-(replace an input's value). This is in-browser control, not host filesystem/shell.
+## Form whitelist
 
-`type` clicks the field then `keyboard.type`. Both stay on the whitelist.
+`click` / `fill` / `press` / `select` / small scroll (`|delta|<=800`).
+`type` stays as in-browser typing. `wait` / `done` / `fail` / `ask_human` are
+control. `goto` is same-origin unless `allow_hosts`.
 
-## Form credentials (Astra #3 — rejected as a hard block)
+## Coordinate clicks
 
-Recover **may** type into username/password form fields when the skill needs login.
-Do **not** hard-block `type`/`fill` on `input[type=password]`.
+`x`/`y` clicks **must** include `screenshot_id` equal to the current **vision**
+observation. Text-stage coords are rejected (no image) and may escalate.
 
-Still **never** log or persist:
+## `fill` is kept
 
-- API keys
-- Authorization headers
-- raw `llm.json` secrets (config stores `api_key_env` only, default `CLOAKCLI_LLM_API_KEY`; never `--api-key` argv)
-- cookie **values**
+Playwright `page.fill` on the existing page. Not host I/O.
 
-## Tests (Astra #4)
+## Form credentials
 
-Deterministic FakePage + scripted LLM cover control-flow (no live model / heavy browser):
-
-- selector-fail → recover path, then skill continues
-- coordinate click rejected without `screenshot_id`
-- coordinate click rejected with mismatched `screenshot_id`
-- coords invalidated after navigation (and viewport change)
-- `ask_human` pause status
-- illegal model action (`shell` / `read_file` / `file:` / cross-origin) rejected
+Recover **may** type into username/password form fields. Never log API keys,
+Authorization headers, raw `llm.json` secrets, or cookie **values**.

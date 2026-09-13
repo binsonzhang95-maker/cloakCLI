@@ -343,6 +343,19 @@ _DUMPED_VALUE_RE = re.compile(
 )
 
 
+def _selector_chain(step: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    primary = step.get("selector") or step.get("css")
+    if isinstance(primary, str) and primary.strip():
+        out.append(primary.strip())
+    alts = step.get("selectors") or []
+    if isinstance(alts, list):
+        for s in alts:
+            if isinstance(s, str) and s.strip() and s.strip() not in out:
+                out.append(s.strip())
+    return out
+
+
 def _stall_payload(index: int, action: str, step: dict[str, Any], exc: BaseException) -> dict[str, Any]:
     sel = step.get("selector") or step.get("css")
     payload: dict[str, Any] = {
@@ -353,6 +366,11 @@ def _stall_payload(index: int, action: str, step: dict[str, Any], exc: BaseExcep
     }
     if sel:
         payload["selector"] = sel
+    chain = _selector_chain(step)
+    if chain:
+        payload["selectors"] = chain
+    if step.get("field_name"):
+        payload["field_name"] = step.get("field_name")
     intended = step.get("text", step.get("value"))
     if intended is not None:
         # Username/password form values may be needed so recover can finish login.
@@ -395,23 +413,43 @@ def _run_step(
         return
 
     if action == "click":
-        sel = step.get("selector") or step.get("css")
-        if not sel:
+        sels = _selector_chain(step)
+        if not sels:
             raise ValueError("click requires selector/css")
-        page.click(sel, timeout=step.get("timeout", 30000))
-        return
+        timeout = step.get("timeout", 30000)
+        last = None
+        for i, sel in enumerate(sels):
+            t = timeout if i == 0 else min(3000, int(timeout) if timeout else 3000)
+            try:
+                page.click(sel, timeout=t)
+                return
+            except Exception as e:
+                last = e
+        if last:
+            raise last
+        raise ValueError("click requires selector/css")
 
     if action in ("type", "fill"):
-        sel = step.get("selector") or step.get("css")
+        sels = _selector_chain(step)
         text = step.get("text", step.get("value", ""))
-        if not sel:
+        if not sels:
             raise ValueError(f"{action} requires selector/css")
-        if action == "fill":
-            page.fill(sel, str(text), timeout=step.get("timeout", 30000))
-        else:
-            page.click(sel, timeout=step.get("timeout", 30000))
-            page.keyboard.type(str(text), delay=step.get("delay", 20))
-        return
+        timeout = step.get("timeout", 30000)
+        last = None
+        for i, sel in enumerate(sels):
+            t = timeout if i == 0 else min(3000, int(timeout) if timeout else 3000)
+            try:
+                if action == "fill":
+                    page.fill(sel, str(text), timeout=t)
+                else:
+                    page.click(sel, timeout=t)
+                    page.keyboard.type(str(text), delay=step.get("delay", 20))
+                return
+            except Exception as e:
+                last = e
+        if last:
+            raise last
+        raise ValueError(f"{action} requires selector/css")
 
     if action == "wait":
         ms = int(step.get("ms", step.get("timeout", 1000)))

@@ -9,16 +9,36 @@ from typing import Any
 
 # fill is Playwright page.fill on the existing page (in-browser replace).
 # Kept alongside type: see recover/NOTES.md. Not host-side I/O.
+# Form whitelist (RECOVER PATH): click/fill/press/select/small scroll.
+# type stays as fill-like in-browser typing. wait/done/fail/ask_human are control.
+# goto is policy-limited (same origin / allow_hosts) — not a default form action.
 ALLOWED_ACTIONS = {
     "click",
     "type",
     "fill",
+    "press",
+    "select",
     "scroll",
     "wait",
     "goto",
     "done",
     "fail",
     "ask_human",
+}
+
+ALLOWED_PRESS_KEYS = {
+    "enter",
+    "tab",
+    "escape",
+    "esc",
+    "space",
+    "backspace",
+    "arrowup",
+    "arrowdown",
+    "arrowleft",
+    "arrowright",
+    "home",
+    "end",
 }
 
 # Explicitly rejected (defense in depth — never execute).
@@ -43,7 +63,7 @@ FORBIDDEN_ACTIONS = {
 SCHEMA_VERSION = 1
 MAX_TEXT_LEN = 4000
 MAX_WAIT_MS = 30_000
-MAX_SCROLL_DELTA = 20_000
+MAX_SCROLL_DELTA = 800  # form: small scroll only
 MAX_ACTIONS_PER_TURN = 4
 MAX_CSS_LEN = 500
 MAX_URL_LEN = 2048
@@ -69,6 +89,8 @@ class RecoverAction:
     ms: int = 0
     url: str | None = None
     reason: str = ""
+    key: str | None = None
+    value: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     def public_dict(self) -> dict[str, Any]:
@@ -90,6 +112,10 @@ class RecoverAction:
             d["ms"] = self.ms
         if self.url:
             d["url"] = self.url
+        if self.key:
+            d["key"] = self.key
+        if self.value is not None:
+            d["value"] = self.value if len(self.value) <= 80 else self.value[:77] + "..."
         if self.reason:
             d["reason"] = self.reason[:MAX_REASON_LEN]
         return d
@@ -206,6 +232,7 @@ def validate_action(item: Any) -> RecoverAction:
     if not isinstance(reason, str):
         reason = str(reason)
     reason = reason[:MAX_REASON_LEN]
+    key = None
 
     if atype == "click":
         if css:
@@ -228,9 +255,19 @@ def validate_action(item: Any) -> RecoverAction:
     elif atype == "goto":
         if not url:
             raise ActionError("goto requires url")
+    elif atype == "press":
+        key = _normalize_press_key(item.get("key") or item.get("name") or text or "Enter")
+    elif atype == "select":
+        if not css:
+            raise ActionError("select requires css/selector")
+        if text is None:
+            raise ActionError("select requires value/text")
     elif atype in ("done", "fail", "ask_human"):
         if not reason:
             reason = atype
+
+    key_out = key if atype == "press" else None
+    value_out = text if atype == "select" else None
 
     return RecoverAction(
         type=atype,
@@ -244,8 +281,32 @@ def validate_action(item: Any) -> RecoverAction:
         ms=ms,
         url=url,
         reason=reason,
+        key=key_out,
+        value=value_out,
         raw={k: v for k, v in item.items() if k not in ("text", "value")},
     )
+
+
+def _normalize_press_key(raw: Any) -> str:
+    key = str(raw or "Enter").strip()
+    low = key.lower()
+    if low not in ALLOWED_PRESS_KEYS:
+        raise ActionError(f"press key not allowed: {key[:32]}")
+    mapping = {
+        "enter": "Enter",
+        "tab": "Tab",
+        "escape": "Escape",
+        "esc": "Escape",
+        "space": "Space",
+        "backspace": "Backspace",
+        "arrowup": "ArrowUp",
+        "arrowdown": "ArrowDown",
+        "arrowleft": "ArrowLeft",
+        "arrowright": "ArrowRight",
+        "home": "Home",
+        "end": "End",
+    }
+    return mapping[low]
 
 
 def _extract_json(text: str) -> Any | None:

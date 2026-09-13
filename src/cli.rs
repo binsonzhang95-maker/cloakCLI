@@ -208,6 +208,9 @@ pub enum TeachCmd {
         /// Export password/token/secret fields as plaintext (default: {{vars.NAME}})
         #[arg(long)]
         allow_secrets: bool,
+        /// TEACH PATH: skip the default-on one-shot LLM optimize after export
+        #[arg(long)]
+        no_smart_optimize: bool,
     },
 }
 
@@ -266,9 +269,18 @@ pub enum LlmCmd {
         enabled: bool,
         #[arg(long, group = "en")]
         disabled: bool,
-        /// Recover wall-clock budget in seconds (default 300)
+        /// Recover wall-clock budget in seconds (default 90; 60–120 form; 300 advanced)
         #[arg(long)]
         recover_timeout_sec: Option<u64>,
+        /// RECOVER PATH: max chat/completions rounds per stall (default 3)
+        #[arg(long)]
+        max_model_rounds: Option<u32>,
+        /// TEACH PATH: one-shot smart optimize on export (default ON)
+        #[arg(long, group = "teachopt")]
+        teach_smart_optimize: bool,
+        /// TEACH PATH: skip the export-time LLM optimize call
+        #[arg(long, group = "teachopt")]
+        no_teach_smart_optimize: bool,
         /// Comma-separated extra hosts allowed for recover goto (cross-origin)
         #[arg(long)]
         allow_hosts: Option<String>,
@@ -1105,6 +1117,7 @@ pub async fn handle_teach(root: &Path, action: TeachCmd) -> Result<()> {
             profile,
             url,
             allow_secrets,
+            no_smart_optimize,
         } => {
             crate::teach::start(
                 root,
@@ -1112,6 +1125,7 @@ pub async fn handle_teach(root: &Path, action: TeachCmd) -> Result<()> {
                     profile,
                     url,
                     allow_secrets,
+                    smart_optimize: !no_smart_optimize,
                 },
             )
             .await
@@ -1180,6 +1194,9 @@ pub async fn handle_llm(root: &Path, action: LlmCmd) -> Result<()> {
             enabled,
             disabled,
             recover_timeout_sec,
+            max_model_rounds,
+            teach_smart_optimize,
+            no_teach_smart_optimize,
             allow_hosts,
             clear_allow_hosts,
             max_actions,
@@ -1207,6 +1224,13 @@ pub async fn handle_llm(root: &Path, action: LlmCmd) -> Result<()> {
             } else {
                 None
             };
+            let teach_opt = if teach_smart_optimize {
+                Some(true)
+            } else if no_teach_smart_optimize {
+                Some(false)
+            } else {
+                None
+            };
             let cfg = crate::llm::apply_set(
                 root,
                 crate::llm::LlmSetArgs {
@@ -1219,6 +1243,8 @@ pub async fn handle_llm(root: &Path, action: LlmCmd) -> Result<()> {
                     max_actions,
                     max_loops,
                     max_tokens_per_recover: None,
+                    max_model_rounds,
+                    teach_smart_optimize: teach_opt,
                 },
             )?;
             println!("wrote {} (mode 0600)", crate::llm::config_path(root).display());

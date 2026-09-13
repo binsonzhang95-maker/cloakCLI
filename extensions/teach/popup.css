@@ -20,6 +20,15 @@ label {
   margin: 8px 0 4px;
   color: #a0a0a8;
 }
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+label.check input {
+  width: auto;
+}
 input {
   width: 100%;
   box-sizing: border-box;

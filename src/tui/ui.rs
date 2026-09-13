@@ -860,7 +860,21 @@ fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
         ),
         kv(
             "recover_timeout [t]",
-            format!("{}s", app.llm.recover_timeout_sec),
+            format!("{}s (default 90)", app.llm.recover_timeout_sec),
+            Style::default().fg(INFO),
+        ),
+        kv(
+            "max_model_rounds",
+            if app.llm.max_model_rounds == 0 {
+                "3".into()
+            } else {
+                app.llm.max_model_rounds.to_string()
+            },
+            Style::default().fg(INFO),
+        ),
+        kv(
+            "teach_smart_optimize",
+            if app.llm.teach_smart_optimize { "on" } else { "off" },
             Style::default().fg(INFO),
         ),
     ];
@@ -1081,7 +1095,7 @@ fn draw_input_modal(f: &mut Frame, area: Rect, app: &App) {
         ),
         InputMode::LlmTimeout => (
             "LLM recover_timeout_sec",
-            "5..=3600 → Enter · Esc cancel",
+            "default 90 (60–120 form; 300 advanced) · 5..=3600 → Enter · Esc cancel",
         ),
     };
 

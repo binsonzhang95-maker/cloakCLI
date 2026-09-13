@@ -161,9 +161,14 @@ cloakcli skill run <exported-name> --profile demo --var PASSWORD=...
 - Headed CloakBrowser only (headless is a hard error). The extension path is resolved from the install/repo; there is **no** `--extension` / `--load-extension` CLI inject.
 - TUI key `T` calls the same `teach start` path (no second launcher).
 - Export mapping: navigation → `goto`, click → `click` (selector), input → `fill`. Skill-level `goal` is the last marked goal; empty steps are rejected; missing goal is allowed (runner fallbacks).
+- **Local post-process** (no LLM): merge consecutive fills, drop hover/duplicate clicks, attach backup selector chains (`id` / `name` / `autocomplete` / `data-testid`) and semantic `field_name`s.
+- **Smart optimize** (default ON, `--no-smart-optimize` to skip): one LLM call after export returns a structured patch (selectors, goal, merge, field names). Local validation (teach action whitelist, selector syntax, step order) runs before save. Fail-open if the model is down.
+- Recording never calls the model per click/fill. Optional mid-record assist is capped at **2** LLM calls when a selector looks unstable, and is deferred when that is not cheap.
 - Password / token / secret fields export as `{{vars.NAME}}` by default (listed in the generated README). Explicit `--allow-secrets` keeps plaintext and still writes a `.gitignore`.
 - Content script is origin-allowlisted: the CLI `--url` origin plus origins you **Allow** in the extension popup. Navigating to another HTTPS site does not silent-add it. Manifest has no `<all_urls>`.
 - Takes the profile lock for the whole session; conflict with a batch worker prints a clear error.
+
+Teach and recover are separate paths: teach writes `skill.json`; recover only runs later if a step stalls.
 
 Fixture round-trip: `fixtures/teach/recorded-events.json` → `fixtures/teach/expected-skill.json`.
 
@@ -204,16 +209,18 @@ Optional stall-recovery fields (inherit skill → step; default `on_stall` is `f
 }
 ```
 
-On timeout / selector / assertion failure with `on_stall: recover`, the Python worker keeps the **existing** Playwright page, takes a screenshot + compact DOM summary, and asks one OpenAI-compatible vision model (`chat/completions` + `image_url`) for JSON actions on that page. Default recover wall-clock budget is **300 seconds** (`recover_timeout_sec`). No host filesystem read, no shell/code exec. `goto` stays on the task start origin unless `allow_hosts` lists extra hosts; `file:` / `javascript:` / `data:` are rejected.
+On timeout / selector / assertion failure with `on_stall: recover`, the Python worker keeps the **existing** Playwright page and runs a **cascade** (success stops): local selectors / backups → text model + DOM summary (no screenshot) → **one** compressed/crop vision shot (viewport JPEG, never a full-page original). Default recover wall-clock budget is **90 seconds** (`recover_timeout_sec`; form range 60–120). **300 remains an advanced override.** Max **3** model rounds (`max_model_rounds`). Telemetry (tokens, latency, rounds, screenshot bytes, success/fail) is observational — there is no hard min-token goal. No host filesystem read, no shell/code exec. `goto` stays on the task start origin unless `allow_hosts` lists extra hosts; `file:` / `javascript:` / `data:` are rejected.
 
-Recover action whitelist (in-browser only):
+Recover form whitelist (in-browser only):
 
 | Action | Notes |
 |--------|--------|
-| `click` | CSS selector, **or** `x`/`y` **plus** `screenshot_id` equal to the current observation. Coordinate clicks without an id, with a stale id, or after navigation/viewport change are rejected. |
-| `type` | Click the field then `keyboard.type`. |
-| `fill` | Playwright `page.fill` (replace the input value). **Kept on purpose** — full in-browser control, not host I/O. |
-| `scroll` `wait` `goto` | Policy-limited `goto` (same origin / `allow_hosts`). |
+| `click` | CSS selector, **or** (vision stage) `x`/`y` **plus** `screenshot_id` equal to the current observation. Coordinate clicks without an id, with a stale id, or after navigation/viewport change are rejected. |
+| `fill` / `type` | Playwright `page.fill` or click-then-`keyboard.type`. **Kept on purpose** — full in-browser control, not host I/O. |
+| `press` | Whitelisted keys: Enter, Tab, Escape, arrows, Space, Backspace, Home, End. |
+| `select` | CSS + value on the existing `<select>`. |
+| `scroll` | Small only (`|delta|<=800`) or `css` into-view. |
+| `wait` `goto` | Policy-limited `goto` (same origin / `allow_hosts`). |
 | `done` `fail` `ask_human` | Terminal; `ask_human` pauses the skill (`status=paused`). |
 
 Recover **may** type into username/password form fields when the skill needs login. Trajectories and logs still never persist API keys, Authorization headers, raw `llm.json` secrets, or cookie **values**. Config keys stay env-var-only (`api_key_env`). See [`python/cloakcli_worker/recover/NOTES.md`](python/cloakcli_worker/recover/NOTES.md).

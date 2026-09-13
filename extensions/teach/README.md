@@ -7,7 +7,8 @@ Do not pass an arbitrary `--load-extension` path on the CLI.
 
 1. `cloakcli teach start --profile NAME [--url URL]`
 2. Use the toolbar popup: **Record** → browse (click / input / navigation) → **Allow this origin** if you leave the `--url` site → **Mark goal** → **Stop** → **Export**
-3. Skill lands at `skills/<name>/skill.json` (existing schema: `goal` + `goto` / `click` / `fill`)
+3. Skill lands at `skills/<name>/skill.json` (existing schema: `goal` + `goto` / `click` / `fill`, plus backup `selectors` / `field_name` from local post-process)
+4. **Smart optimize** is on by default (one LLM call after export; uncheck in the popup or pass `--no-smart-optimize`). Recording does not call the model per step.
 
 ## Safety
 

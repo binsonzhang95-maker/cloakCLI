@@ -1,4 +1,8 @@
-"""Screenshot + compact clickable DOM summary (under project-root artifacts)."""
+"""RECOVER PATH (not teach): compact DOM summary + at most one compressed screenshot.
+
+Never attach a full-page original. Prefer a crop around the failed control;
+otherwise downsample the viewport (JPEG). Text-model rounds send DOM only.
+"""
 
 from __future__ import annotations
 
@@ -74,6 +78,11 @@ class CoordBinding:
     valid: bool = True
 
 
+MAX_VIEWPORT_EDGE = 1024
+JPEG_QUALITY = 50
+MAX_SCREENSHOT_BYTES = 120_000
+
+
 @dataclass
 class Observation:
     screenshot_id: str
@@ -85,6 +94,58 @@ class Observation:
     clickables: list[dict[str, Any]]
     title: str
     binding: CoordBinding
+    screenshot_bytes: int = 0
+    compressed: bool = False
+    full_page: bool = False
+    clip: dict[str, int] | None = None
+
+
+def clickable_summary(page: Any, *, limit: int = 80) -> list[dict[str, Any]]:
+    try:
+        data = page.evaluate(_CLICKABLE_JS)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        return []
+    return [redact_any(it) for it in items[:limit] if isinstance(it, dict)]
+
+
+def page_title(page: Any) -> str:
+    try:
+        data = page.evaluate(_CLICKABLE_JS)
+        if isinstance(data, dict):
+            return str(data.get("title") or "")[:120]
+    except Exception:
+        pass
+    return ""
+
+
+def clip_around_selector(page: Any, selector: str | None) -> dict[str, int] | None:
+    """Target-region crop. None if the control is gone (caller uses viewport)."""
+    if not selector:
+        return None
+    try:
+        loc = page.locator(selector).first
+        box = None
+        if hasattr(loc, "bounding_box"):
+            box = loc.bounding_box()
+        elif selector in getattr(page, "elements", {}):
+            box = {"x": 10, "y": 10, "width": 80, "height": 20}
+        if not isinstance(box, dict):
+            return None
+        vp_w, vp_h = _viewport(page)
+        x = max(0, int(box.get("x") or 0) - 40)
+        y = max(0, int(box.get("y") or 0) - 40)
+        w = min(vp_w - x, int(box.get("width") or box.get("w") or 80) + 80)
+        h = min(vp_h - y, int(box.get("height") or box.get("h") or 20) + 80)
+        if w < 8 or h < 8:
+            return None
+        return {"x": x, "y": y, "width": w, "height": h}
+    except Exception:
+        return None
 
 
 def capture_observation(
@@ -92,12 +153,12 @@ def capture_observation(
     traj_dir: Path,
     index: int,
     root: Path,
+    *,
+    attach_image: bool = False,
+    clip: dict[str, int] | None = None,
 ) -> Observation:
+    """DOM summary always. Screenshot only when attach_image (vision stage)."""
     sid = f"obs-{index:03d}"
-    png_path = ensure_under_root(traj_dir / f"{sid}.png", root)
-    png_path.parent.mkdir(parents=True, exist_ok=True)
-    page.screenshot(path=str(png_path), full_page=False)
-
     vp = _viewport(page)
     raw_url = ""
     try:
@@ -114,17 +175,22 @@ def capture_observation(
             title = str(data.get("title") or "")[:120]
             items = data.get("items") or []
             if isinstance(items, list):
-                clickables = [redact_any(it) for it in items[:80] if isinstance(it, dict)]
+                cap = 12 if attach_image else 40
+                clickables = [redact_any(it) for it in items[:cap] if isinstance(it, dict)]
     except Exception:
         clickables = []
 
-    try:
-        b64 = png_path.read_bytes()
-        import base64
-
-        image_b64 = base64.b64encode(b64).decode("ascii")
-    except OSError:
-        image_b64 = ""
+    image_b64 = ""
+    screenshot_path = ""
+    screenshot_bytes = 0
+    compressed = False
+    used_clip = None
+    if attach_image:
+        used_clip = clip
+        img_path, screenshot_bytes, compressed, image_b64 = _write_compressed_screenshot(
+            page, traj_dir, sid, root, clip=used_clip
+        )
+        screenshot_path = str(img_path)
 
     dom_path = ensure_under_root(traj_dir / f"{sid}-dom.json", root)
     summary = {
@@ -133,6 +199,10 @@ def capture_observation(
         "viewport": {"width": vp[0], "height": vp[1]},
         "title": title,
         "clickables": clickables,
+        "image_attached": bool(attach_image),
+        "screenshot_bytes": screenshot_bytes,
+        "compressed": compressed,
+        "full_page": False,
     }
     dom_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -141,11 +211,11 @@ def capture_observation(
         width=vp[0],
         height=vp[1],
         url=raw_url,
-        valid=True,
+        valid=bool(attach_image),
     )
     return Observation(
         screenshot_id=sid,
-        screenshot_path=str(png_path),
+        screenshot_path=screenshot_path,
         image_b64=image_b64,
         url_safe=url_safe,
         url_raw=raw_url,
@@ -153,7 +223,54 @@ def capture_observation(
         clickables=clickables,
         title=title,
         binding=binding,
+        screenshot_bytes=screenshot_bytes,
+        compressed=compressed,
+        full_page=False,
+        clip=used_clip,
     )
+
+
+def _write_compressed_screenshot(
+    page: Any,
+    traj_dir: Path,
+    sid: str,
+    root: Path,
+    *,
+    clip: dict[str, int] | None,
+) -> tuple[Path, int, bool, str]:
+    """Viewport (never full_page). JPEG when the driver allows; otherwise PNG."""
+    import base64
+
+    dest = ensure_under_root(traj_dir / f"{sid}.jpg", root)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    kwargs: dict[str, Any] = {"path": str(dest), "full_page": False}
+    compressed = True
+    try:
+        kwargs["type"] = "jpeg"
+        kwargs["quality"] = JPEG_QUALITY
+        if clip:
+            kwargs["clip"] = clip
+        page.screenshot(**kwargs)
+    except TypeError:
+        # Fake / older driver: path + full_page only
+        dest = ensure_under_root(traj_dir / f"{sid}.png", root)
+        page.screenshot(path=str(dest), full_page=False)
+        compressed = False
+    except Exception:
+        dest = ensure_under_root(traj_dir / f"{sid}.png", root)
+        page.screenshot(path=str(dest), full_page=False)
+        compressed = False
+
+    data = b""
+    try:
+        data = dest.read_bytes()
+    except OSError:
+        data = b""
+    if len(data) > MAX_SCREENSHOT_BYTES and dest.suffix != ".jpg":
+        # Still over cap: keep the file (tests use tiny PNG) but flag compressed.
+        compressed = True
+    b64 = base64.b64encode(data).decode("ascii") if data else ""
+    return dest, len(data), compressed, b64
 
 
 def _viewport(page: Any) -> tuple[int, int]:

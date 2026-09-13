@@ -713,6 +713,7 @@ impl App {
                     profile: profile_name.clone(),
                     url: None,
                     allow_secrets: false,
+                    smart_optimize: true,
                 },
             )
             .await;
@@ -912,7 +913,7 @@ impl App {
     fn start_llm_timeout(&mut self) {
         self.input_mode = Some(InputMode::LlmTimeout);
         self.input_buf = self.llm.recover_timeout_sec.to_string();
-        self.status = "llm recover_timeout_sec (5..=3600)".into();
+        self.status = "llm recover_timeout_sec (default 90; 5..=3600; 300 advanced)".into();
     }
 
     fn current_llm_base(&self) -> String {

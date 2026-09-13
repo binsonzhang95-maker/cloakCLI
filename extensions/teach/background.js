@@ -10,6 +10,7 @@ const state = {
   goal: "",
   allowlist: new Set(),
   ignoredOrigin: "",
+  assistInFlight: false,
 };
 
 function isHttpOrigin(origin) {
@@ -155,6 +156,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       record(msg.event);
       sendResponse({ ok: true, n: state.events.length });
+      if (msg.event && msg.event.unstable) {
+        maybeAssist(msg.event);
+      }
       return;
     }
     if (type === "status") {
@@ -247,7 +251,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     if (type === "export") {
-      const result = await doExport(msg.name, msg.goal);
+      const result = await doExport(msg.name, msg.goal, msg.smartOptimize);
       sendResponse(result);
       return;
     }
@@ -264,7 +268,40 @@ async function activeHttpTab() {
   return t;
 }
 
-async function doExport(name, goal) {
+async function maybeAssist(event) {
+  /* TEACH PATH: optional mid-record assist. Server caps LLM at 2 and may defer. */
+  if (!state.cfg || state.assistInFlight || !event) return;
+  const origin = (state.cfg.exportOrigin || "").replace(/\/$/, "");
+  if (!origin) return;
+  state.assistInFlight = true;
+  try {
+    const r = await fetch(`${origin}/assist`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CloakCLI-Token": state.cfg.token,
+      },
+      body: JSON.stringify({
+        selector: event.selector,
+        selectors: event.selectors || [],
+        field: event.field || null,
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (data && data.ok && Array.isArray(data.selectors) && data.selectors.length) {
+      const last = state.events[state.events.length - 1];
+      if (last && last.selector === event.selector) {
+        last.selectors = data.selectors;
+      }
+    }
+  } catch {
+    /* assist is optional; recording continues */
+  } finally {
+    state.assistInFlight = false;
+  }
+}
+
+async function doExport(name, goal, smartOptimize) {
   if (!state.cfg) {
     return { ok: false, error: "start via cloakcli teach start" };
   }
@@ -274,6 +311,10 @@ async function doExport(name, goal) {
   }
   const g = String(goal || state.goal || "").trim();
   const url = `${state.cfg.exportOrigin.replace(/\/$/, "")}/export`;
+  const smart =
+    typeof smartOptimize === "boolean"
+      ? smartOptimize
+      : state.cfg.smartOptimize !== false;
   try {
     const r = await fetch(url, {
       method: "POST",
@@ -285,6 +326,7 @@ async function doExport(name, goal) {
         name: n,
         goal: g || undefined,
         events: state.events,
+        smartOptimize: smart,
       }),
     });
     const data = await r.json().catch(() => ({}));

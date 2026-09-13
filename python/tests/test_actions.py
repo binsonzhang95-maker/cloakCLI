@@ -59,3 +59,19 @@ class ActionSchemaTests(unittest.TestCase):
     def test_click_requires_target(self):
         with self.assertRaises(ActionError):
             validate_action({"action": "click"})
+
+    def test_press_and_select_on_form_whitelist(self):
+        p = validate_action({"action": "press", "key": "Enter"})
+        self.assertEqual(p.type, "press")
+        self.assertEqual(p.key, "Enter")
+        s = validate_action({"action": "select", "css": "select#n", "value": "CA"})
+        self.assertEqual(s.type, "select")
+        self.assertEqual(s.value, "CA")
+
+    def test_press_rejects_unknown_key(self):
+        with self.assertRaises(ActionError):
+            validate_action({"action": "press", "key": "Meta+Alt+F4"})
+
+    def test_large_scroll_rejected(self):
+        with self.assertRaises(ActionError):
+            validate_action({"action": "scroll", "delta_y": 20000})

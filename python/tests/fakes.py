@@ -27,6 +27,9 @@ class FakeKeyboard:
                 self.page.fields.get(self.page.focused, "") + text
             )
 
+    def press(self, key: str) -> None:
+        self.page.pressed.append(key)
+
 
 class FakeMouse:
     def __init__(self, page: "FakePage"):
@@ -67,6 +70,11 @@ class FakeLocator:
             raise FakeTimeoutError(f"TimeoutError: waiting for {self.sel}")
         self.page.scrolls.append(("into_view", self.sel))
 
+    def bounding_box(self) -> dict[str, float] | None:
+        if self.sel not in self.page.elements:
+            return None
+        return {"x": 10.0, "y": 10.0, "width": 80.0, "height": 20.0}
+
 
 class FakePage:
     def __init__(self, url: str = "https://example.com/") -> None:
@@ -84,6 +92,9 @@ class FakePage:
         self.filled: list[tuple[str, str]] = []
         self.gotos: list[str] = []
         self.scrolls: list[Any] = []
+        self.pressed: list[str] = []
+        self.selected: list[tuple[str, str]] = []
+        self.screenshot_calls: list[dict[str, Any]] = []
         self.focused: str | None = None
         self._closed = False
         self.nav_on_click: dict[str, str] = {}
@@ -96,11 +107,20 @@ class FakePage:
     def close(self) -> None:
         self._closed = True
 
-    def screenshot(self, path: str | None = None, full_page: bool = False) -> bytes:
+    def screenshot(self, path: str | None = None, full_page: bool = False, **kwargs: Any) -> bytes:
+        self.screenshot_calls.append(
+            {"path": path, "full_page": bool(full_page), **kwargs}
+        )
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             Path(path).write_bytes(TINY_PNG)
         return TINY_PNG
+
+    def select_option(self, sel: str, value: str, timeout: int = 0) -> None:
+        if sel not in self.elements:
+            raise FakeTimeoutError(f"TimeoutError: waiting for {sel}")
+        self.selected.append((sel, value))
+        self.focused = sel
 
     def click(self, sel: str, timeout: int = 0) -> None:
         if sel not in self.elements:
@@ -150,9 +170,14 @@ class ScriptedProvider:
         self.replies = list(replies)
         self.calls = 0
         self.before_complete = before_complete
+        self.images: list[bool] = []
+        self.image_bytes: list[int] = []
 
     def complete(self, cfg, messages, *, image_b64=None, timeout_sec=60):
         self.calls += 1
+        attached = bool(image_b64)
+        self.images.append(attached)
+        self.image_bytes.append(len(image_b64) if image_b64 else 0)
         if self.before_complete:
             self.before_complete(self.calls)
         if not self.replies:
