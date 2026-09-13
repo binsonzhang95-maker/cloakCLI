@@ -12,6 +12,7 @@ from pathlib import Path
 from cloakcli_worker.teach_hub import (
     MAX_MESSAGE_BYTES,
     TeachHubClient,
+    _redact,
     envelope,
     origin_allowed,
     origin_of,
@@ -71,6 +72,8 @@ class _FakeHub:
         self.pairing_id = "pair-1"
         self.seen_roles: list[str] = []
         self.page_states: list[dict] = []
+        self.slots: dict[str, str] = {}
+        self.reconnects = 0
         self.stop = False
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -126,21 +129,34 @@ class _FakeHub:
         t = msg.get("type")
         data = msg.get("data") or {}
         if t == "pairing_accept":
-            if data.get("session_token") == self.token:
-                self._send(
-                    conn,
-                    {
-                        "v": 1,
-                        "type": "pairing_result",
-                        "data": {
-                            "ok": True,
-                            "session_id": self.session_id,
-                            "session_token": self.token,
-                            "resumed": True,
-                            "role": data.get("role"),
+            role = str(data.get("role") or "")
+            token_in = data.get("session_token")
+            if token_in:
+                if self.slots.get(role) == token_in:
+                    self.reconnects += 1
+                    self._send(
+                        conn,
+                        {
+                            "v": 1,
+                            "type": "pairing_result",
+                            "data": {
+                                "ok": True,
+                                "session_id": self.session_id,
+                                "session_token": token_in,
+                                "resumed": True,
+                                "role": role,
+                            },
                         },
-                    },
-                )
+                    )
+                else:
+                    self._send(
+                        conn,
+                        {
+                            "v": 1,
+                            "type": "pairing_result",
+                            "data": {"ok": False, "error": "unauthorized"},
+                        },
+                    )
                 return
             if data.get("code") != self.code or data.get("pairing_id") != self.pairing_id:
                 self._send(
@@ -152,7 +168,17 @@ class _FakeHub:
                     },
                 )
                 return
-            role = str(data.get("role") or "")
+            if role in self.slots:
+                self._send(
+                    conn,
+                    {
+                        "v": 1,
+                        "type": "pairing_result",
+                        "data": {"ok": False, "error": "pairing_consumed"},
+                    },
+                )
+                return
+            self.slots[role] = self.token
             self.seen_roles.append(role)
             self._send(
                 conn,
@@ -216,7 +242,45 @@ class HubClientTests(unittest.TestCase):
             t2.start()
             self.assertTrue(c2.wait_paired(3), c2.last_error)
             self.assertEqual(c2.session_id, hub.session_id)
+            self.assertGreaterEqual(hub.reconnects, 1)
             c2.stop()
+        finally:
+            hub.close()
+
+    def test_worker_drop_connection_reuses_session(self):
+        hub = _FakeHub()
+        try:
+            c = TeachHubClient("127.0.0.1", hub.port, hub.pairing_id, hub.code, role="worker")
+            t = threading.Thread(target=c.run, daemon=True)
+            t.start()
+            self.assertTrue(c.wait_paired(3), c.last_error)
+            sid = c.session_id
+            c.paired.clear()
+            c.drop_connection()
+            self.assertTrue(c.wait_paired(5), c.last_error)
+            self.assertEqual(c.session_id, sid)
+            self.assertEqual(hub.session_id, sid)
+            self.assertGreaterEqual(hub.reconnects, 1)
+            c.stop()
+        finally:
+            hub.close()
+
+    def test_duplicate_pairing_rejected(self):
+        hub = _FakeHub()
+        try:
+            c = TeachHubClient("127.0.0.1", hub.port, hub.pairing_id, hub.code, role="worker")
+            t = threading.Thread(target=c.run, daemon=True)
+            t.start()
+            self.assertTrue(c.wait_paired(3), c.last_error)
+            other = TeachHubClient("127.0.0.1", hub.port, hub.pairing_id, hub.code, role="worker")
+            t2 = threading.Thread(target=other.run, daemon=True)
+            t2.start()
+            self.assertFalse(other.wait_paired(1.5))
+            self.assertIn(other.last_error, ("pairing_consumed", "pairing_failed"))
+            self.assertEqual(c.session_id, hub.session_id)
+            self.assertEqual(len(hub.slots), 1)
+            other.stop()
+            c.stop()
         finally:
             hub.close()
 
@@ -247,6 +311,56 @@ class ExtensionSafetyTests(unittest.TestCase):
         self.assertIn("pairing_accept", pairing)
         self.assertIn("session_token", pairing)
         self.assertIn("page_state", pairing)
+        self.assertIn('["session", "local"]', pairing)
+
+    def test_hub_client_redacts_token_cookie_password(self):
+        raw = (
+            '{"session_token":"tok-fake-not-for-logs","password":"hunter2",'
+            '"cookie":"abc123secret"}'
+        )
+        red = _redact(raw)
+        self.assertNotIn("tok-fake-not-for-logs", red)
+        self.assertNotIn("hunter2", red)
+        self.assertNotIn("abc123secret", red)
+        self.assertIn("[REDACTED]", red)
+
+    def test_headed_smoke_log_scanner(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "teach_m1_headed_smoke",
+            ROOT / "scripts" / "teach_m1_headed_smoke.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        leaks = mod.scan_logs_for_leaks(
+            '{"session_token":"abc123secret","password":"hunter2","cookie":"cval"}'
+        )
+        self.assertTrue(leaks)
+        clean = mod.scan_logs_for_leaks(
+            '{"session_token":"[REDACTED]"} teach hub: paired role=worker page_state origin=https://example.com'
+        )
+        self.assertEqual(clean, [])
+
+    def test_pairing_reconnect_runtime(self):
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required for pairing reconnect runtime")
+        runtime = Path(__file__).resolve().parent / "teach_pairing_reconnect_runtime.js"
+        proc = subprocess.run(
+            [node, str(runtime)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("reconnect reuses session", out)
+        self.assertIn("duplicate pairing rejected", out)
 
 
 if __name__ == "__main__":

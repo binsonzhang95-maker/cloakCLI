@@ -59,6 +59,7 @@ const chrome = {
   runtime: {
     getURL: (p) => "chrome-extension://teach/" + p,
     onInstalled: { addListener: () => {} },
+    onStartup: { addListener: () => {} },
     onMessage: {
       addListener: (fn) => messageListeners.push(fn),
     },
@@ -99,6 +100,16 @@ const chrome = {
   },
   storage: {
     session: {
+      get: async (keys) => {
+        const out = {};
+        for (const k of keys) if (sessionStore[k] !== undefined) out[k] = sessionStore[k];
+        return out;
+      },
+      set: async (obj) => {
+        Object.assign(sessionStore, obj);
+      },
+    },
+    local: {
       get: async (keys) => {
         const out = {};
         for (const k of keys) if (sessionStore[k] !== undefined) out[k] = sessionStore[k];

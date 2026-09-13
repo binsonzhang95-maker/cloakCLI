@@ -448,9 +448,15 @@ async fn run_browser(
         cmd.env("CLOAKCLI_TEACH_PAIRING_ID", &h.pairing_id);
         cmd.env("CLOAKCLI_TEACH_PAIRING_CODE", &h.pairing_code);
     }
-    if let Ok(secs) = std::env::var("CLOAKCLI_TEACH_SMOKE_SECONDS") {
-        if !secs.is_empty() {
-            cmd.env("CLOAKCLI_TEACH_SMOKE_SECONDS", secs);
+    for key in [
+        "CLOAKCLI_TEACH_SMOKE_SECONDS",
+        "CLOAKCLI_TEACH_M1_SMOKE",
+        "CLOAKCLI_TEACH_SMOKE_DENY_URL",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                cmd.env(key, v);
+            }
         }
     }
     let worker_parent = root.join("python");

@@ -14,6 +14,8 @@ const state = {
   assistInFlight: false,
 };
 
+let configLoad = null;
+
 function isHttpOrigin(origin) {
   try {
     const u = new URL(origin);
@@ -43,20 +45,28 @@ function originAllowed(origin) {
 
 async function loadConfig() {
   if (state.cfg) return state.cfg;
-  try {
-    const r = await fetch(chrome.runtime.getURL("session.json"));
-    if (!r.ok) return null;
-    state.cfg = await r.json();
-    for (const o of state.cfg.allowOrigins || []) {
-      if (isHttpOrigin(o) && !(exportOrigin() && o === originOf(exportOrigin()))) {
-        state.allowlist.add(o);
+  if (configLoad) return configLoad;
+  configLoad = (async () => {
+    try {
+      const r = await fetch(chrome.runtime.getURL("session.json"));
+      if (!r.ok) {
+        configLoad = null;
+        return null;
       }
+      state.cfg = await r.json();
+      for (const o of state.cfg.allowOrigins || []) {
+        if (isHttpOrigin(o) && !(exportOrigin() && o === originOf(exportOrigin()))) {
+          state.allowlist.add(o);
+        }
+      }
+      startHub();
+      return state.cfg;
+    } catch {
+      configLoad = null;
+      return null;
     }
-    startHub();
-    return state.cfg;
-  } catch {
-    return null;
-  }
+  })();
+  return configLoad;
 }
 
 function startHub() {
@@ -153,6 +163,12 @@ function noteIgnored(origin) {
 chrome.runtime.onInstalled.addListener(() => {
   loadConfig();
 });
+
+if (chrome.runtime.onStartup) {
+  chrome.runtime.onStartup.addListener(() => {
+    loadConfig();
+  });
+}
 
 chrome.webNavigation.onCommitted.addListener(async (d) => {
   if (d.frameId !== 0) return;
@@ -399,3 +415,6 @@ async function doExport(name, goal, smartOptimize) {
     return { ok: false, error: String(e) };
   }
 }
+
+/* Service-worker start (install, browser start, or idle-kill restart). */
+loadConfig();

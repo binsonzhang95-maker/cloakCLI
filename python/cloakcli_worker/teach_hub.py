@@ -183,8 +183,17 @@ class TeachHubClient:
 
     def stop(self) -> None:
         self._stop.set()
+        self.drop_connection()
+
+    def drop_connection(self) -> None:
+        """Close the socket so run() reconnects with the stored session token."""
         sock = self._sock
+        self._sock = None
         if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 sock.close()
             except OSError:

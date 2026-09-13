@@ -4,6 +4,11 @@
 (function () {
   if (window.__cloakcliTeachInjected) return;
   window.__cloakcliTeachInjected = true;
+  try {
+    document.documentElement.setAttribute("data-cloakcli-teach-injected", "1");
+  } catch {
+    /* document may not be ready */
+  }
 
   const origin = location.origin;
   if (!origin.startsWith("http://") && !origin.startsWith("https://")) {

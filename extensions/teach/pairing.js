@@ -38,33 +38,37 @@
   }
 
   async function loadStored() {
-    try {
-      if (!root.chrome || !chrome.storage || !chrome.storage.session) return;
-      const got = await chrome.storage.session.get([
-        "teachSessionId",
-        "teachSessionToken",
-      ]);
-      if (got && got.teachSessionId && got.teachSessionToken) {
-        TeachHub.sessionId = got.teachSessionId;
-        TeachHub.sessionToken = got.teachSessionToken;
+    const keys = ["teachSessionId", "teachSessionToken"];
+    for (const area of ["session", "local"]) {
+      try {
+        if (!root.chrome || !chrome.storage || !chrome.storage[area]) continue;
+        const got = await chrome.storage[area].get(keys);
+        if (got && got.teachSessionId && got.teachSessionToken) {
+          TeachHub.sessionId = got.teachSessionId;
+          TeachHub.sessionToken = got.teachSessionToken;
+          return;
+        }
+      } catch {
+        /* storage area may be unavailable in tests */
       }
-    } catch {
-      /* storage.session may be unavailable in tests */
     }
   }
 
   async function storeSession(id, token) {
     TeachHub.sessionId = id;
     TeachHub.sessionToken = token;
-    try {
-      if (root.chrome && chrome.storage && chrome.storage.session) {
-        await chrome.storage.session.set({
-          teachSessionId: id,
-          teachSessionToken: token,
-        });
+    const payload = {
+      teachSessionId: id,
+      teachSessionToken: token,
+    };
+    for (const area of ["session", "local"]) {
+      try {
+        if (root.chrome && chrome.storage && chrome.storage[area]) {
+          await chrome.storage[area].set(payload);
+        }
+      } catch {
+        /* memory-only fallback */
       }
-    } catch {
-      /* memory-only fallback */
     }
   }
 
@@ -108,7 +112,6 @@
     const type = env.type;
     const data = env.data || {};
     if (type === "pairing_offer") {
-      if (!TeachHub.paired) sendPairingAccept();
       return;
     }
     if (type === "pairing_result") {
@@ -118,7 +121,7 @@
         TeachHub.backoffMs = 250;
         setStatus(data.resumed ? "reconnected" : "paired");
         startHeartbeat();
-      } else {
+      } else if (!TeachHub.sessionId) {
         TeachHub.paired = false;
         setStatus("pairing_failed");
       }
@@ -158,16 +161,39 @@
       setStatus("no_hub");
       return;
     }
+    if (TeachHub.ws && (TeachHub.ws.readyState === 0 || TeachHub.ws.readyState === 1)) {
+      return;
+    }
     try {
       const ws = new WebSocket(url);
       TeachHub.ws = ws;
+      let acceptSent = false;
       setStatus("connecting");
+      function tryAccept() {
+        if (acceptSent || TeachHub.closed) return;
+        acceptSent = true;
+        sendPairingAccept();
+      }
       ws.onopen = () => {
         setStatus("connected");
-        sendPairingAccept();
+        tryAccept();
       };
-      ws.onmessage = onMessage;
+      ws.onmessage = (ev) => {
+        let env;
+        try {
+          env = JSON.parse(ev.data);
+        } catch {
+          return;
+        }
+        if (!env || typeof env !== "object" || env.v !== 1) return;
+        if (env.type === "pairing_offer") {
+          tryAccept();
+          return;
+        }
+        onMessage(ev);
+      };
       ws.onclose = () => {
+        if (TeachHub.ws === ws) TeachHub.ws = null;
         TeachHub.paired = false;
         setStatus("disconnected");
         if (TeachHub.heartbeatTimer) {
@@ -194,6 +220,9 @@
     TeachHub.closed = false;
     TeachHub.backoffMs = 250;
     await loadStored();
+    if (TeachHub.ws && (TeachHub.ws.readyState === 0 || TeachHub.ws.readyState === 1)) {
+      return;
+    }
     connect();
   };
 

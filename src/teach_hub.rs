@@ -7,10 +7,12 @@
 //! the human on the same Playwright page. Not implemented in M1.
 
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -79,6 +81,11 @@ impl TeachHubHandle {
     pub async fn session_count(&self) -> usize {
         1
     }
+
+    #[cfg(test)]
+    pub async fn reconnect_count(&self) -> u32 {
+        self.inner.read().await.reconnects
+    }
 }
 
 impl Drop for TeachHubHandle {
@@ -93,6 +100,7 @@ struct HubInner {
     slots: HashMap<ClientRole, PairedSlot>,
     seq: u64,
     timeline: Vec<StoredEvent>,
+    reconnects: u32,
 }
 
 struct Session {
@@ -160,6 +168,7 @@ pub async fn spawn(opts: TeachHubOpts) -> Result<TeachHubHandle> {
         slots: HashMap::new(),
         seq: 0,
         timeline: Vec::new(),
+        reconnects: 0,
     }));
 
     let serve_inner = inner.clone();
@@ -198,6 +207,29 @@ fn new_token() -> String {
 
 fn hub_log(msg: &str) {
     eprintln!("teach hub: {}", redact_for_log(msg));
+}
+
+static EVENT_FILE_LOCK: StdMutex<()> = StdMutex::new(());
+
+/// Append a redacted JSONL event when `CLOAKCLI_TEACH_HUB_EVENTS` is set.
+/// Never writes session tokens, cookies, or passwords.
+fn emit_event(kind: &str, data: Value) {
+    let rec = json!({
+        "event": kind,
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "data": data,
+    });
+    let line = redact_for_log(&rec.to_string());
+    let Ok(path) = std::env::var("CLOAKCLI_TEACH_HUB_EVENTS") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let _g = EVENT_FILE_LOCK.lock();
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 async fn run_listener(listener: TcpListener, inner: SharedHub) {
@@ -554,6 +586,7 @@ async fn handle_pairing_accept(
                 slot.last_seq = r;
             }
         }
+        g.reconnects = g.reconnects.saturating_add(1);
         *authed = Some(role);
         let resume_seq = g.slots.get(&role).map(|s| s.last_seq).unwrap_or(0);
         let missed: Vec<Envelope> = g
@@ -564,6 +597,14 @@ async fn handle_pairing_accept(
             .collect();
         drop(g);
         hub_log(&format!("reconnect role={} (same session)", role.as_str()));
+        emit_event(
+            "reconnected",
+            json!({
+                "role": role.as_str(),
+                "session_id": session_id,
+                "resumed": true,
+            }),
+        );
         let mut out = vec![pairing_ok(
             &session_id,
             env.request_id.as_deref(),
@@ -635,6 +676,14 @@ async fn handle_pairing_accept(
     if g.slots.contains_key(&role) {
         // Code is one-shot per role. Reconnect must use the session token.
         drop(g);
+        emit_event(
+            "pairing_rejected",
+            json!({
+                "error": "pairing_consumed",
+                "role": role.as_str(),
+                "session_id": session_id,
+            }),
+        );
         return Ok(vec![pairing_fail(
             &session_id,
             env.request_id.as_deref(),
@@ -657,6 +706,14 @@ async fn handle_pairing_accept(
     *authed = Some(role);
     drop(g);
     hub_log(&format!("paired role={}", role.as_str()));
+    emit_event(
+        "paired",
+        json!({
+            "role": role.as_str(),
+            "session_id": session_id,
+            "resumed": false,
+        }),
+    );
     Ok(vec![pairing_ok(
         &session_id,
         env.request_id.as_deref(),
@@ -731,7 +788,21 @@ async fn handle_page_state(
         ));
     }
     let allow = g.session.allow_origins.clone();
-    let ps = PageState::from_data(&env.data, &allow)?;
+    let ps = match PageState::from_data(&env.data, &allow) {
+        Ok(ps) => ps,
+        Err(err) => {
+            if err.code == "origin_not_allowed" {
+                emit_event(
+                    "page_state_denied",
+                    json!({
+                        "origin": env.data.get("origin"),
+                        "session_id": g.session.session_id,
+                    }),
+                );
+            }
+            return Err(err);
+        }
+    };
     g.seq += 1;
     let seq = g.seq;
     g.session.last_page_state = Some(ps.clone());
@@ -765,6 +836,17 @@ async fn handle_page_state(
         ps.viewport.width,
         ps.viewport.height
     ));
+    emit_event(
+        "page_state",
+        json!({
+            "url": ps.url,
+            "origin": ps.origin,
+            "title": ps.title,
+            "viewport": {"width": ps.viewport.width, "height": ps.viewport.height},
+            "observation_id": ps.observation_id,
+            "session_id": g.session.session_id,
+        }),
+    );
     Ok(vec![stored])
 }
 
@@ -1227,6 +1309,39 @@ mod tests {
         assert_eq!(r.data["session_id"], sess);
         assert_eq!(hub.session_count().await, 1);
         assert_eq!(hub.paired_roles().await.len(), 1);
+        assert_eq!(hub.reconnect_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_pairing_same_role_rejected() {
+        let hub = spawn(TeachHubOpts {
+            allow_origins: vec!["https://example.com".into()],
+        })
+        .await
+        .unwrap();
+        let mut c = jsonl_client(hub.addr).await;
+        send_line(
+            &mut c,
+            &accept_env(hub.pairing_code(), hub.pairing_id(), "worker", "n1"),
+        )
+        .await;
+        let first = read_env(&mut c).await;
+        assert_eq!(first.data["ok"], true);
+        let sess = first.data["session_id"].as_str().unwrap().to_string();
+
+        let mut c2 = jsonl_client(hub.addr).await;
+        send_line(
+            &mut c2,
+            &accept_env(hub.pairing_code(), hub.pairing_id(), "worker", "n2"),
+        )
+        .await;
+        let r = read_env(&mut c2).await;
+        assert_eq!(r.data["ok"], false);
+        assert_eq!(r.data["error"], "pairing_consumed");
+        assert_eq!(hub.session_count().await, 1);
+        assert_eq!(hub.session_id(), sess);
+        assert_eq!(hub.paired_roles().await.len(), 1);
+        assert_eq!(hub.reconnect_count().await, 0);
     }
 
     #[tokio::test]

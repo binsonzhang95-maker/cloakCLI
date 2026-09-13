@@ -172,6 +172,18 @@ Teach and recover are separate paths: teach writes `skill.json`; recover only ru
 
 Fixture round-trip: `fixtures/teach/recorded-events.json` → `fixtures/teach/expected-skill.json`.
 
+### Teach Chat M1 headed smoke
+
+Repeatable headed CloakBrowser acceptance for pairing, `page_state`, allowlist inject, service-worker restart, worker reconnect, duplicate pairing, and log leak scan:
+
+```bash
+./scripts/e2e-teach-m1-smoke.sh
+# or:
+CLOAKCLI_BIN=target/release/cloakcli python3 scripts/teach_m1_headed_smoke.py
+```
+
+Requires a display (`DISPLAY` / `WAYLAND_DISPLAY`) or `xvfb-run`, a built `cloakcli`, and the CloakBrowser Chromium binary. The script starts two loopback origins (allow + deny), runs `cloakcli teach start`, and fails if hub events or worker JSON miss the M1 checks. Non-headed coverage (SW token reuse, worker reconnect, duplicate pairing) lives in `python/tests/test_teach_chat_protocol.py` and `cargo test`.
+
 ## Skill format
 
 ```json

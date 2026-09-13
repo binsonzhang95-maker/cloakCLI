@@ -7,6 +7,7 @@ resolved the bundled install/repo copy). Headless is a hard error.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import threading
@@ -128,6 +129,13 @@ def main(argv: list[str] | None = None) -> int:
         hub_thread.start()
         hub_client.wait_paired(timeout=5.0)
 
+    m1_smoke = os.environ.get("CLOAKCLI_TEACH_M1_SMOKE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
     ctx = launch_context(
         user_data_dir=str(user_data),
         headed=True,
@@ -138,6 +146,12 @@ def main(argv: list[str] | None = None) -> int:
         from .browser import get_page
 
         page = get_page(ctx)
+        if m1_smoke:
+            from .teach_m1_smoke import run_headed_smoke
+
+            result = run_headed_smoke(ctx, page, args.url, hub_client)
+            print("TEACH_M1_SMOKE_JSON " + json.dumps(result, ensure_ascii=False), flush=True)
+            return 0 if result.get("ok") else 1
         if args.url:
             try:
                 page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
