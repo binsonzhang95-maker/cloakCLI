@@ -9,11 +9,13 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
 from .browser import launch_context
 from .paths import PathTrustError, ensure_under_root, set_root
+from .teach_hub import TeachHubClient
 
 
 def _require_headed(headed: bool) -> None:
@@ -92,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--proxy")
     p.add_argument("--headed", action="store_true")
     p.add_argument("--headless", action="store_true")
+    p.add_argument("--hub", help="loopback teach hub host:port")
+    p.add_argument("--pairing-id")
     args = p.parse_args(argv)
 
     if args.headless or not args.headed:
@@ -117,6 +121,13 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             smoke = 0.0
 
+    hub_client = _maybe_hub_client(args)
+    hub_thread: threading.Thread | None = None
+    if hub_client is not None:
+        hub_thread = threading.Thread(target=hub_client.run, name="teach-hub", daemon=True)
+        hub_thread.start()
+        hub_client.wait_paired(timeout=5.0)
+
     ctx = launch_context(
         user_data_dir=str(user_data),
         headed=True,
@@ -134,11 +145,26 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"teach goto warning: {type(e).__name__}", file=sys.stderr)
         _wait_closed(ctx, smoke)
     finally:
+        if hub_client is not None:
+            hub_client.stop()
         try:
             ctx.close()
         except Exception:
             pass
     return 0
+
+
+def _maybe_hub_client(args: argparse.Namespace) -> TeachHubClient | None:
+    addr = (args.hub or os.environ.get("CLOAKCLI_TEACH_HUB") or "").strip()
+    pairing_id = (args.pairing_id or os.environ.get("CLOAKCLI_TEACH_PAIRING_ID") or "").strip()
+    code = os.environ.get("CLOAKCLI_TEACH_PAIRING_CODE", "").strip()
+    if not addr or not pairing_id or not code:
+        return None
+    host, sep, port_s = addr.rpartition(":")
+    if not sep or host not in ("127.0.0.1", "localhost") or not port_s.isdigit():
+        print("teach hub: ignoring non-loopback hub address", file=sys.stderr)
+        return None
+    return TeachHubClient(host, int(port_s), pairing_id, code, role="worker")
 
 
 if __name__ == "__main__":

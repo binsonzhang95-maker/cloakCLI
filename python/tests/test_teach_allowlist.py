@@ -64,7 +64,11 @@ class TeachAllowlistTests(unittest.TestCase):
     def test_manifest_still_no_all_urls(self):
         data = json.loads(MANIFEST.read_text(encoding="utf-8"))
         self.assertNotIn("content_scripts", data)
-        self.assertNotIn("<all_urls>", MANIFEST.read_text(encoding="utf-8"))
+        text = MANIFEST.read_text(encoding="utf-8")
+        self.assertNotIn("<all_urls>", text)
+        hosts = data.get("host_permissions") or []
+        self.assertIn("ws://127.0.0.1/*", hosts)
+        self.assertTrue(all(h != "<all_urls>" for h in hosts))
 
     def test_preflight_missing_binary(self):
         with patch.object(

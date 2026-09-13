@@ -82,6 +82,12 @@ struct ExtConfig {
     #[serde(rename = "smartOptimize", default = "default_true")]
     smart_optimize: bool,
     profile: String,
+    #[serde(rename = "hubUrl", skip_serializing_if = "Option::is_none")]
+    hub_url: Option<String>,
+    #[serde(rename = "pairingCode", skip_serializing_if = "Option::is_none")]
+    pairing_code: Option<String>,
+    #[serde(rename = "pairingId", skip_serializing_if = "Option::is_none")]
+    pairing_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -278,6 +284,13 @@ pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
         }
     }
 
+    let hub = crate::teach_hub::spawn(crate::teach_hub::TeachHubOpts {
+        allow_origins: allow_origins.clone(),
+    })
+    .await
+    .context("start teach hub on 127.0.0.1")?;
+    let hub_url = format!("ws://127.0.0.1:{}", hub.port());
+
     let staged = stage_extension(
         root,
         &ext_src,
@@ -288,6 +301,9 @@ pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
             allow_secrets: opts.allow_secrets,
             smart_optimize: opts.smart_optimize,
             profile: prof.name.clone(),
+            hub_url: Some(hub_url.clone()),
+            pairing_code: Some(hub.pairing_code().to_string()),
+            pairing_id: Some(hub.pairing_id().to_string()),
         },
     )?;
 
@@ -309,6 +325,8 @@ pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
     println!("  profile:   {}", prof.name);
     println!("  extension: {}", staged.display());
     println!("  export:    {export_origin}/export");
+    println!("  hub:       {hub_url} (loopback)");
+    println!("  pairing:   {}", hub.pairing_code());
     println!("Record with the extension popup: record → mark goal → stop → export.");
     if opts.smart_optimize {
         println!("Smart optimize: ON (one LLM call after export; --no-smart-optimize to skip).");
@@ -323,10 +341,16 @@ pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
         &staged,
         opts.url.as_deref(),
         prof.proxy.as_deref(),
+        Some(HubConnect {
+            addr: format!("127.0.0.1:{}", hub.port()),
+            pairing_id: hub.pairing_id().to_string(),
+            pairing_code: hub.pairing_code().to_string(),
+        }),
     )
     .await;
 
     server.abort();
+    hub.abort();
     let _ = fs::remove_dir_all(&staged);
 
     if let Some(path) = state.last.lock().ok().and_then(|g| g.clone()) {
@@ -386,12 +410,19 @@ fn copy_ext_dir(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+struct HubConnect {
+    addr: String,
+    pairing_id: String,
+    pairing_code: String,
+}
+
 async fn run_browser(
     root: &Path,
     user_data_dir: &str,
     extension: &Path,
     url: Option<&str>,
     proxy: Option<&str>,
+    hub: Option<HubConnect>,
 ) -> Result<()> {
     let py = python_bin()?;
     let mut cmd = Command::new(&py);
@@ -409,6 +440,13 @@ async fn run_browser(
     }
     if let Some(p) = proxy {
         cmd.arg("--proxy").arg(p);
+    }
+    if let Some(h) = hub.as_ref() {
+        cmd.arg("--hub").arg(&h.addr);
+        cmd.arg("--pairing-id").arg(&h.pairing_id);
+        cmd.env("CLOAKCLI_TEACH_HUB", &h.addr);
+        cmd.env("CLOAKCLI_TEACH_PAIRING_ID", &h.pairing_id);
+        cmd.env("CLOAKCLI_TEACH_PAIRING_CODE", &h.pairing_code);
     }
     if let Ok(secs) = std::env::var("CLOAKCLI_TEACH_SMOKE_SECONDS") {
         if !secs.is_empty() {

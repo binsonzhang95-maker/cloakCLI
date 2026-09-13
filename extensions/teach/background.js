@@ -2,6 +2,7 @@
  * Origin allowlist: CLI --url origin from session.json, plus origins the
  * user explicitly Allows in the popup. Navigating does not silent-add.
  */
+importScripts("pairing.js");
 
 const state = {
   cfg: null,
@@ -51,9 +52,50 @@ async function loadConfig() {
         state.allowlist.add(o);
       }
     }
+    startHub();
     return state.cfg;
   } catch {
     return null;
+  }
+}
+
+function startHub() {
+  if (!state.cfg || !state.cfg.hubUrl) return;
+  if (typeof TeachHub === "undefined" || !TeachHub.start) return;
+  TeachHub.start({
+    hubUrl: state.cfg.hubUrl,
+    pairingCode: state.cfg.pairingCode,
+    pairingId: state.cfg.pairingId,
+  });
+}
+
+function hubSend(type, data) {
+  if (typeof TeachHub === "undefined" || !TeachHub.send) return false;
+  return TeachHub.send(type, data);
+}
+
+function hubStatus() {
+  if (typeof TeachHub === "undefined" || !TeachHub.status) {
+    return { hub: "idle", paired: false, sessionId: "" };
+  }
+  return TeachHub.status();
+}
+
+function forwardPageState(snapshot, senderUrl) {
+  if (!snapshot || typeof snapshot !== "object") return false;
+  const origin = snapshot.origin || originOf(snapshot.url || senderUrl || "");
+  if (!originAllowed(origin)) return false;
+  return hubSend("page_state", snapshot);
+}
+
+async function requestPageState(tabId, url) {
+  const origin = originOf(url || "");
+  if (!originAllowed(origin)) return;
+  try {
+    const snap = await chrome.tabs.sendMessage(tabId, { type: "collectPageState" });
+    if (snap) forwardPageState(snap, url);
+  } catch {
+    /* content script may not be ready */
   }
 }
 
@@ -125,6 +167,7 @@ chrome.webNavigation.onCommitted.addListener(async (d) => {
     record({ kind: "navigation", url: d.url });
   }
   await inject(d.tabId, d.url);
+  await requestPageState(d.tabId, d.url);
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
@@ -137,6 +180,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
     return;
   }
   await inject(tabId, url);
+  await requestPageState(tabId, url);
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -146,6 +190,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (type === "allowOrigin?") {
       const origin = msg.origin || originOf(sender.url || "");
       sendResponse(originAllowed(origin));
+      return;
+    }
+    if (type === "page_state") {
+      const origin = (msg.state && msg.state.origin) || originOf(sender.url || sender.tab?.url || "");
+      if (!originAllowed(origin)) {
+        sendResponse({ ok: false, error: "origin not allowlisted" });
+        return;
+      }
+      const sent = forwardPageState(msg.state, sender.url || "");
+      sendResponse({ ok: sent });
       return;
     }
     if (type === "record") {
@@ -162,6 +216,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     if (type === "status") {
+      const hub = hubStatus();
       sendResponse({
         ok: true,
         recording: state.recording,
@@ -172,6 +227,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         allowSecrets: Boolean(state.cfg && state.cfg.allowSecrets),
         exportOrigin: exportOrigin(),
         ignoredOrigin: state.ignoredOrigin || "",
+        hub: hub.hub,
+        hubPaired: Boolean(hub.paired),
+        hubSessionId: hub.sessionId || "",
       });
       return;
     }
@@ -190,6 +248,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (originAllowed(origin)) {
           record({ kind: "navigation", url: tab.url });
           await inject(tab.id, tab.url);
+          await requestPageState(tab.id, tab.url);
         } else {
           noteIgnored(origin);
         }
@@ -242,7 +301,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           record({ kind: "navigation", url: t.url });
         }
         await inject(t.id, t.url);
+        await requestPageState(t.id, t.url);
       }
+      hubSend("allowlist_update", { origin });
       sendResponse({
         ok: true,
         origin,

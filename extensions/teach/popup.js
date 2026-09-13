@@ -52,6 +52,12 @@ async function refresh() {
   $("allow").textContent = (s.allowlist || []).length
     ? "origins: " + s.allowlist.join(", ")
     : "origins: (none — use --url or Allow this origin)";
+  const hubEl = $("hub");
+  if (hubEl) {
+    hubEl.textContent = s.hubPaired
+      ? "hub: paired"
+      : "hub: " + (s.hub || "idle");
+  }
 
   const tab = await currentTab();
   const origin = originOf((tab && tab.url) || "");

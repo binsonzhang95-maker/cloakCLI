@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Record click, input, and navigation; mark a goal; export a CloakCLI skill.json.",
   "permissions": ["storage", "scripting", "tabs", "webNavigation", "activeTab"],
-  "host_permissions": ["http://127.0.0.1/*"],
+  "host_permissions": ["http://127.0.0.1/*", "ws://127.0.0.1/*"],
   "optional_host_permissions": ["http://*/*", "https://*/*"],
   "background": {
     "service_worker": "background.js"

@@ -10,14 +10,84 @@
     return;
   }
 
+  let allowed = false;
+
   chrome.runtime.sendMessage({ type: "allowOrigin?", origin }, (ok) => {
     if (chrome.runtime.lastError || !ok) return;
+    allowed = true;
     install();
+    sendPageState();
+  });
+
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (!allowed) {
+      sendResponse(null);
+      return;
+    }
+    if (msg && msg.type === "collectPageState") {
+      sendResponse(collectPageState());
+    }
   });
 
   function install() {
     document.addEventListener("click", onClick, true);
     document.addEventListener("change", onChange, true);
+    window.addEventListener("popstate", sendPageState);
+    window.addEventListener("hashchange", sendPageState);
+  }
+
+  function isSecretField(el) {
+    if (!(el instanceof Element)) return false;
+    const t = (el.getAttribute("type") || el.type || "").toLowerCase();
+    if (t === "password") return true;
+    const hay = [
+      el.getAttribute("name") || "",
+      el.id || "",
+      el.getAttribute("autocomplete") || "",
+      t,
+    ]
+      .join(" ")
+      .toLowerCase();
+    return /password|passwd|secret|token|authorization|cookie|credential/.test(hay);
+  }
+
+  function collectPageState() {
+    const clickable = [];
+    const els = document.querySelectorAll(
+      "a,button,input,select,[role='button'],[role='link']"
+    );
+    for (const el of els) {
+      if (clickable.length >= 40) break;
+      if (!(el instanceof Element)) continue;
+      const bundle = selectorBundle(el);
+      let text = (el.innerText || el.getAttribute("aria-label") || "").trim();
+      if (isSecretField(el)) text = "[REDACTED]";
+      if (text.length > 80) text = text.slice(0, 80);
+      clickable.push({
+        tag: (el.tagName || "").toLowerCase(),
+        role: el.getAttribute("role") || "",
+        text,
+        selector: bundle.selector,
+      });
+    }
+    const observation_id =
+      "obs-" +
+      (crypto.randomUUID
+        ? crypto.randomUUID()
+        : String(Date.now()) + "-" + String(Math.random()).slice(2, 10));
+    return {
+      url: location.href,
+      origin: location.origin,
+      title: document.title || "",
+      viewport: { width: window.innerWidth || 0, height: window.innerHeight || 0 },
+      observation_id,
+      clickable,
+    };
+  }
+
+  function sendPageState() {
+    if (!allowed) return;
+    chrome.runtime.sendMessage({ type: "page_state", state: collectPageState() });
   }
 
   function cssAttr(v) {

@@ -26,7 +26,34 @@ const sessionCfg = {
   allowOrigins: ["https://example.com"],
   allowSecrets: false,
   profile: "demo",
+  hubUrl: "ws://127.0.0.1:9",
+  pairingCode: "TEST01",
+  pairingId: "pair-test",
 };
+
+const sessionStore = {};
+const tabMessages = [];
+const hubSent = [];
+
+class FakeWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    this.onopen = null;
+    this.onmessage = null;
+    this.onclose = null;
+    this.onerror = null;
+  }
+  send() {}
+  close() {
+    this.readyState = 3;
+    if (typeof this.onclose === "function") this.onclose();
+  }
+}
+FakeWebSocket.CONNECTING = 0;
+FakeWebSocket.OPEN = 1;
+FakeWebSocket.CLOSING = 2;
+FakeWebSocket.CLOSED = 3;
 
 const chrome = {
   runtime: {
@@ -50,6 +77,10 @@ const chrome = {
       if (q && q.active) return tabs.filter((t) => t.active);
       return tabs.slice();
     },
+    sendMessage: async (tabId, msg) => {
+      tabMessages.push({ tabId, msg });
+      return null;
+    },
   },
   scripting: {
     executeScript: async (opts) => {
@@ -64,6 +95,18 @@ const chrome = {
     request: async (p) => {
       permissionRequests.push(p);
       return true;
+    },
+  },
+  storage: {
+    session: {
+      get: async (keys) => {
+        const out = {};
+        for (const k of keys) if (sessionStore[k] !== undefined) out[k] = sessionStore[k];
+        return out;
+      },
+      set: async (obj) => {
+        Object.assign(sessionStore, obj);
+      },
     },
   },
 };
@@ -83,6 +126,8 @@ const sandbox = {
   URL,
   setTimeout,
   clearTimeout,
+  setInterval,
+  clearInterval,
   Promise,
   Map,
   Set,
@@ -94,9 +139,27 @@ const sandbox = {
   Number,
   Error,
   TypeError,
+  WebSocket: FakeWebSocket,
+  crypto,
+  self: null,
+  importScripts: (name) => {
+    if (String(name) !== "pairing.js") {
+      throw new Error("unexpected importScripts " + name);
+    }
+    const pairingPath = path.resolve(__dirname, "../../extensions/teach/pairing.js");
+    vm.runInContext(fs.readFileSync(pairingPath, "utf8"), sandbox);
+  },
 };
+sandbox.self = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox);
+if (sandbox.TeachHub && sandbox.TeachHub.send) {
+  sandbox.TeachHub.send = function (type, data) {
+    hubSent.push({ type, data });
+    return true;
+  };
+  sandbox.TeachHub.paired = true;
+}
 
 function fail(msg) {
   console.error("FAIL:", msg);
@@ -197,6 +260,26 @@ async function complete(tabId, url) {
     "ignoredOrigin should surface the blocked site, got " + st2.ignoredOrigin
   );
 
+  const hubBeforeEvil = hubSent.length;
+  const psEvil = await send(
+    {
+      type: "page_state",
+      state: {
+        url: "https://evil.example/phish",
+        origin: "https://evil.example",
+        title: "phish",
+        viewport: { width: 1, height: 1 },
+        observation_id: "obs-evil",
+      },
+    },
+    { url: "https://evil.example/phish", tab: { id: 2, url: "https://evil.example/phish" } }
+  );
+  assert(psEvil.ok === false, "page_state from unapproved origin must fail");
+  assert(
+    hubSent.length === hubBeforeEvil,
+    "unapproved origin must not send page_state to hub, n=" + hubSent.length
+  );
+
   const rec = await send(
     { type: "record", event: { kind: "click", selector: "#x" } },
     { url: "https://evil.example/phish", tab: { id: 2, url: "https://evil.example/phish" } }
@@ -242,12 +325,33 @@ async function complete(tabId, url) {
   assert(st4.n > nAfterApprove, "approved second origin navigation is recorded");
   assert(injected.length > injectAfterApprove, "approved second origin is injected");
 
+  const psOk = await send(
+    {
+      type: "page_state",
+      state: {
+        url: "https://example.com/app",
+        origin: "https://example.com",
+        title: "Dashboard",
+        viewport: { width: 1280, height: 720 },
+        observation_id: "obs-ok",
+      },
+    },
+    { url: "https://example.com/app", tab: { id: 1, url: "https://example.com/app" } }
+  );
+  assert(psOk.ok === true, "allowlisted page_state should forward: " + JSON.stringify(psOk));
+  assert(
+    hubSent.some((h) => h.type === "page_state" && h.data && h.data.observation_id === "obs-ok"),
+    "hub should receive allowlisted page_state"
+  );
+
   console.log("PASS: CLI origin injected+recorded");
   console.log("PASS: unapproved second origin not injected");
   console.log("PASS: unapproved second origin not recorded");
   console.log("PASS: unapproved origin not added to allowlist");
   console.log("PASS: navigation does not call permissions.request");
   console.log("PASS: explicit popup approve then injects+records");
+  console.log("PASS: unapproved origin does not send page_state");
+  console.log("PASS: allowlisted origin forwards page_state");
   process.exit(0);
 })().catch((e) => {
   console.error("FAIL:", e && e.stack ? e.stack : e);
