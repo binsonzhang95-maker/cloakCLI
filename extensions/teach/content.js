@@ -1,5 +1,6 @@
 /* CloakCLI Teach content script.
  * Injected only for allowlisted http(s) origins (never <all_urls>).
+ * M3: richer DOM capture during human takeover (click/fill/press/select).
  */
 (function () {
   if (window.__cloakcliTeachInjected) return;
@@ -16,6 +17,8 @@
   }
 
   let allowed = false;
+  let takeover = false;
+  let lastObservationId = "";
 
   chrome.runtime.sendMessage({ type: "allowOrigin?", origin }, (ok) => {
     if (chrome.runtime.lastError || !ok) return;
@@ -31,12 +34,19 @@
     }
     if (msg && msg.type === "collectPageState") {
       sendResponse(collectPageState());
+      return;
+    }
+    if (msg && msg.type === "takeover") {
+      takeover = !!msg.on;
+      sendResponse({ ok: true, takeover });
+      return;
     }
   });
 
   function install() {
     document.addEventListener("click", onClick, true);
     document.addEventListener("change", onChange, true);
+    document.addEventListener("keydown", onKey, true);
     window.addEventListener("popstate", sendPageState);
     window.addEventListener("hashchange", sendPageState);
   }
@@ -54,6 +64,24 @@
       .join(" ")
       .toLowerCase();
     return /password|passwd|secret|token|authorization|cookie|credential/.test(hay);
+  }
+
+  function inShadow(el) {
+    try {
+      const root = el.getRootNode && el.getRootNode();
+      return !!(root && root !== document && typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot);
+    } catch {
+      return false;
+    }
+  }
+
+  function frameName() {
+    try {
+      if (window !== window.top) return "iframe";
+    } catch {
+      return "iframe";
+    }
+    return "main";
   }
 
   function collectPageState() {
@@ -80,6 +108,7 @@
       (crypto.randomUUID
         ? crypto.randomUUID()
         : String(Date.now()) + "-" + String(Math.random()).slice(2, 10));
+    lastObservationId = observation_id;
     return {
       url: location.href,
       origin: location.origin,
@@ -117,29 +146,72 @@
 
   function selectorBundle(el) {
     const selectors = [];
-    const add = (s) => {
-      if (s && unique(s) && !selectors.includes(s)) selectors.push(s);
+    const candidates = {};
+    const uniqueMap = {};
+    const add = (key, s) => {
+      if (!s) return;
+      const u = unique(s);
+      uniqueMap[key] = u;
+      if (u && !selectors.includes(s)) selectors.push(s);
+      if (!candidates[key]) candidates[key] = s;
     };
-    if (el.id) add("#" + CSS.escape(el.id));
+    if (el.id) add("id", "#" + CSS.escape(el.id));
     const testid = el.getAttribute("data-testid") || el.getAttribute("data-test");
     if (testid) {
       const key = el.hasAttribute("data-testid") ? "data-testid" : "data-test";
-      add(`[${key}="${cssAttr(testid)}"]`);
+      add("testid", `[${key}="${cssAttr(testid)}"]`);
     }
     if (el.getAttribute("name")) {
-      add(`${el.tagName.toLowerCase()}[name="${cssAttr(el.getAttribute("name"))}"]`);
+      add("name", `${el.tagName.toLowerCase()}[name="${cssAttr(el.getAttribute("name"))}"]`);
     }
     const ac = el.getAttribute("autocomplete");
-    if (ac && ac !== "off") add(`[autocomplete="${cssAttr(ac)}"]`);
+    if (ac && ac !== "off") add("autocomplete", `[autocomplete="${cssAttr(ac)}"]`);
     const aria = el.getAttribute("aria-label");
-    if (aria) add(`${el.tagName.toLowerCase()}[aria-label="${cssAttr(aria)}"]`);
-    const primary = selectors[0] || cssPath(el);
+    const role = el.getAttribute("role") || implicitRole(el);
+    if (role && aria) {
+      add("role_name", `[role="${cssAttr(role)}"][aria-label="${cssAttr(aria)}"]`);
+    }
+    if (aria) add("aria", `${el.tagName.toLowerCase()}[aria-label="${cssAttr(aria)}"]`);
+    if (aria) add("label", `[aria-label="${cssAttr(aria)}"]`);
+    const text = stableText(el);
+    if (text) {
+      add("text", `${el.tagName.toLowerCase()}:has-text("${cssAttr(text)}")`);
+    }
+    const path = cssPath(el);
+    if (path) {
+      candidates.css_path = path;
+      uniqueMap.css = unique(path);
+    }
+    const primary = selectors[0] || path;
     if (primary && !selectors.includes(primary)) selectors.unshift(primary);
     return {
       selector: primary,
       selectors,
       unstable: isUnstable(primary),
+      selector_candidates: candidates,
+      candidate_unique: uniqueMap,
     };
+  }
+
+  function implicitRole(el) {
+    const tag = (el.tagName || "").toLowerCase();
+    if (tag === "button") return "button";
+    if (tag === "a") return "link";
+    if (tag === "input") {
+      const t = (el.type || "text").toLowerCase();
+      if (t === "submit" || t === "button") return "button";
+    }
+    if (tag === "select") return "combobox";
+    return el.getAttribute("role") || "";
+  }
+
+  function stableText(el) {
+    if (isSecretField(el)) return "";
+    let t = (el.getAttribute("aria-label") || el.innerText || el.textContent || "").trim();
+    t = t.replace(/\s+/g, " ");
+    if (!t || t.length > 48) return "";
+    if (/^[0-9.$€£¥%]+$/.test(t)) return "";
+    return t;
   }
 
   function cssPath(el) {
@@ -211,42 +283,101 @@
     );
   }
 
-  function onClick(ev) {
-    const el = ev.target && ev.target.closest ? ev.target.closest("a,button,input,select,textarea,[role='button']") : ev.target;
-    if (!(el instanceof Element)) return;
-    if (!isTypingField(el)) {
-      const bundle = selectorBundle(el);
-      chrome.runtime.sendMessage({
-        type: "record",
-        event: {
-          kind: "click",
-          selector: bundle.selector,
-          selectors: bundle.selectors,
-          unstable: bundle.unstable,
-          role: el.getAttribute("role") || "",
-          label: el.getAttribute("aria-label") || (el.innerText || "").trim().slice(0, 80),
-        },
-      });
+  function buildEvent(kind, el, extra) {
+    const bundle = el instanceof Element ? selectorBundle(el) : { selector: "", selectors: [], unstable: true, selector_candidates: {}, candidate_unique: {} };
+    const role = el instanceof Element ? implicitRole(el) : "";
+    const label = el instanceof Element ? (el.getAttribute("aria-label") || "").trim() : "";
+    let text = "";
+    if (el instanceof Element && !isSecretField(el)) {
+      text = stableText(el);
     }
+    const ev = {
+      kind,
+      ts: new Date().toISOString(),
+      url: location.href,
+      origin: location.origin,
+      tag: el instanceof Element ? (el.tagName || "").toLowerCase() : "",
+      role,
+      text,
+      label: label || text,
+      accessible_name: label || text,
+      selector: bundle.selector,
+      selectors: bundle.selectors,
+      unstable: bundle.unstable,
+      selector_candidates: bundle.selector_candidates,
+      candidate_unique: bundle.candidate_unique,
+      viewport: { width: window.innerWidth || 0, height: window.innerHeight || 0 },
+      frame: frameName(),
+      shadow: el instanceof Element ? inShadow(el) : false,
+      observation_id: lastObservationId,
+      field: el instanceof Element ? fieldHint(el) : undefined,
+    };
+    if (extra) Object.assign(ev, extra);
+    return ev;
+  }
+
+  function emit(ev) {
+    chrome.runtime.sendMessage({ type: "record", event: ev, takeover: takeover });
+  }
+
+  function onClick(ev) {
+    const el =
+      ev.target && ev.target.closest
+        ? ev.target.closest("a,button,input,select,textarea,[role='button'],[role='link']")
+        : ev.target;
+    if (!(el instanceof Element)) return;
+    if (isTypingField(el) && el.tagName.toLowerCase() !== "select") return;
+    const extra = {};
+    if (typeof ev.clientX === "number" && typeof ev.clientY === "number") {
+      extra.x = Math.round(ev.clientX);
+      extra.y = Math.round(ev.clientY);
+      extra.coords = { x: extra.x, y: extra.y };
+    }
+    if (el.tagName.toLowerCase() === "select") {
+      extra.kind = "click";
+    }
+    emit(buildEvent("click", el, extra));
   }
 
   function onChange(ev) {
     const el = ev.target;
-    if (!(el instanceof Element) || !isTypingField(el)) return;
+    if (!(el instanceof Element)) return;
+    const tag = el.tagName.toLowerCase();
+    if (tag === "select") {
+      emit(
+        buildEvent("select", el, {
+          value: String(el.value || ""),
+        })
+      );
+      return;
+    }
+    if (!isTypingField(el)) return;
+    const secret = isSecretField(el);
     let value = "";
     if ("value" in el) value = String(el.value);
-    const bundle = selectorBundle(el);
-    chrome.runtime.sendMessage({
-      type: "record",
-      event: {
-        kind: "input",
-        selector: bundle.selector,
-        selectors: bundle.selectors,
-        unstable: bundle.unstable,
-        value,
-        field: fieldHint(el),
-        label: el.getAttribute("aria-label") || "",
-      },
-    });
+    const extra = {
+      field: fieldHint(el),
+    };
+    if (secret) {
+      extra.value = "";
+      extra.redacted = true;
+      extra.value_len = value.length;
+    } else {
+      extra.value = value;
+    }
+    emit(buildEvent("input", el, extra));
+  }
+
+  function onKey(ev) {
+    if (!takeover) return;
+    const key = ev.key || "";
+    const keep = ["Enter", "Tab", "Escape", "Esc"];
+    if (!keep.includes(key)) return;
+    const el = ev.target instanceof Element ? ev.target : document.activeElement;
+    emit(
+      buildEvent("keypress", el, {
+        key: key === "Esc" ? "Escape" : key,
+      })
+    );
   }
 })();

@@ -7,6 +7,7 @@ importScripts("pairing.js");
 const state = {
   cfg: null,
   recording: false,
+  takeover: false,
   events: [],
   goal: "",
   allowlist: new Set(),
@@ -72,6 +73,7 @@ async function loadConfig() {
 function startHub() {
   if (!state.cfg || !state.cfg.hubUrl) return;
   if (typeof TeachHub === "undefined" || !TeachHub.start) return;
+  TeachHub.onHubMessage = handleHubMessage;
   TeachHub.start({
     hubUrl: state.cfg.hubUrl,
     pairingCode: state.cfg.pairingCode,
@@ -142,8 +144,32 @@ async function inject(tabId, url) {
   }
 }
 
+function redactTakeoverEvent(event) {
+  if (!event || typeof event !== "object") return event;
+  const out = { ...event };
+  const field = out.field || {};
+  const hay = [field.type, field.name, field.id, field.autocomplete, out.label, out.kind]
+    .join(" ")
+    .toLowerCase();
+  const secret =
+    out.redacted ||
+    field.type === "password" ||
+    /password|passwd|secret|token|authorization|cookie|credential/.test(hay);
+  if (secret) {
+    if (typeof out.value === "string") {
+      out.value_len = out.value_len || out.value.length;
+    }
+    out.value = "";
+    out.redacted = true;
+    if (out.text && /password|token|secret/.test(String(out.text).toLowerCase())) {
+      out.text = "[REDACTED]";
+    }
+  }
+  return out;
+}
+
 function record(event) {
-  if (!state.recording) return;
+  if (!state.recording && !state.takeover) return;
   if (!event || typeof event !== "object") return;
   const kind = String(event.kind || "").toLowerCase();
   if (kind === "navigation") {
@@ -151,7 +177,70 @@ function record(event) {
     const origin = originOf(url);
     if (!originAllowed(origin)) return;
   }
-  state.events.push(event);
+  const stored = state.takeover ? redactTakeoverEvent(event) : event;
+  if (state.recording) state.events.push(stored);
+  if (state.takeover) {
+    hubSend("takeover_event", stored);
+  }
+}
+
+async function broadcastTakeover(on) {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const t of tabs || []) {
+      if (!t.id) continue;
+      const origin = originOf(t.url || "");
+      if (!originAllowed(origin)) continue;
+      try {
+        await chrome.tabs.sendMessage(t.id, { type: "takeover", on: !!on });
+      } catch {
+        /* content script may not be ready */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function handleHubMessage(env) {
+  if (!env || typeof env !== "object") return;
+  const type = env.type;
+  const data = env.data || {};
+  if (type === "takeover_start") {
+    state.takeover = true;
+    state.recording = true;
+    broadcastTakeover(true);
+    (async () => {
+      const tab = await activeHttpTab();
+      if (tab && originAllowed(originOf(tab.url))) {
+        record({
+          kind: "navigation",
+          url: tab.url,
+          origin: originOf(tab.url),
+          ts: new Date().toISOString(),
+          frame: "main",
+        });
+        await inject(tab.id, tab.url);
+        await requestPageState(tab.id, tab.url);
+        try {
+          await chrome.tabs.sendMessage(tab.id, { type: "takeover", on: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    })();
+    return;
+  }
+  if (type === "takeover_stop") {
+    state.takeover = false;
+    state.recording = false;
+    broadcastTakeover(false);
+    return;
+  }
+  if (type === "resume") {
+    state.takeover = false;
+    broadcastTakeover(false);
+  }
 }
 
 function noteIgnored(origin) {
@@ -225,8 +314,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       record(msg.event);
-      sendResponse({ ok: true, n: state.events.length });
-      if (msg.event && msg.event.unstable) {
+      sendResponse({ ok: true, n: state.events.length, takeover: state.takeover });
+      if (msg.event && msg.event.unstable && !state.takeover) {
         maybeAssist(msg.event);
       }
       return;
@@ -236,6 +325,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({
         ok: true,
         recording: state.recording,
+        takeover: state.takeover,
         n: state.events.length,
         goal: state.goal,
         allowlist: [...state.allowlist],

@@ -16,3 +16,7 @@ Do not pass an arbitrary `--load-extension` path on the CLI.
 - Content script refuses non-allowlisted origins; unapproved origins are not injected or recorded.
 - Password / token / secret fields export as `{{vars.NAME}}` unless `--allow-secrets`.
 - Master and fleet do not teach; they only run exported skills.
+
+## Teach Chat takeover (M3)
+
+`cloakcli teach chat` sends `takeover_start` / `takeover_stop` over the hub. While recording, this extension emits `takeover_event` with selector candidates (`data-testid`, role+name, label, text, CSS, coords last). Password fields send type/length/`redacted` only. The Python worker locally normalizes events to Playwright actions (`source=human`); raw DOM is never an exportable step.

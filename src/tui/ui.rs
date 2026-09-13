@@ -1038,7 +1038,9 @@ fn context_help(tab: Tab) -> Vec<Span<'static>> {
             ("Enter", "send"),
             ("Ctrl-C", "cancel"),
             ("Y/N", "confirm nav"),
-            ("Ctrl-T/R/E", "M3/M4 stub"),
+            ("Ctrl-T", "takeover"),
+            ("Ctrl-R", "resume"),
+            ("Ctrl-E", "export (M4)"),
         ]),
     };
     spans.push(Span::styled("  │  ", style_desc()));

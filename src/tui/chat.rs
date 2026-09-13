@@ -1,7 +1,7 @@
 //! Teach Chat TUI (M2): dialogue, tool-call strip, status, input.
 //!
-//! Streaming is minimal (one-shot LLM text shown as assistant). Ctrl-T/R/E
-//! are stubs toward M3/M4.
+//! Streaming is minimal (one-shot LLM text shown as assistant).
+//! Ctrl-T toggles human takeover; Ctrl-R resumes the agent; Ctrl-E is M4.
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -19,8 +19,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::teach_chat::{
-    apply_plan, await_cancellable, execute_planned, live_llm_from_root, mock_llm_from_env, plan_turn,
-    run_llm_turn, stub_shortcut, ChatSession, MockLlm, PageBrief, PlannedTurn, TeachLlm,
+    apply_plan, await_cancellable, execute_planned, human_steps_from_values, live_llm_from_root,
+    mock_llm_from_env, plan_turn, run_llm_turn, run_llm_turn_ex, stub_shortcut, ChatSession,
+    MockLlm, NormalizePending, PageBrief, PlannedTurn, TeachLlm,
 };
 use crate::teach_hub::TeachHubHandle;
 use crate::teach_protocol::TeachMachine;
@@ -44,8 +45,8 @@ pub enum ChatCmd {
     Cancel,
     ConfirmYes,
     ConfirmNo,
-    StubT,
-    StubR,
+    Takeover,
+    Resume,
     StubE,
     ScrollUp,
     ScrollDown,
@@ -118,6 +119,23 @@ fn draw_dialogue(f: &mut Frame, area: Rect, session: &ChatSession) {
             Span::styled(session.stream.clone(), Style::default().fg(MUTED)),
         ]));
     }
+    if session.recording {
+        lines.push(Line::from(Span::styled(
+            "REC: human actions are not exported until you stop takeover (Ctrl-T). They will be normalized to Playwright steps.",
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(p) = &session.pending_normalize {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "NORMALIZE: {} step(s) ok, {} need confirm, {} non-exportable. Y=accept proposed, N=drop. Enter does not confirm.",
+                p.steps.len(),
+                p.needs_confirm,
+                p.non_exportable
+            ),
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        )));
+    }
     if let Some(c) = &session.confirm {
         lines.push(Line::from(Span::styled(
             format!(
@@ -158,8 +176,13 @@ fn draw_tools(f: &mut Frame, area: Rect, session: &ChatSession) {
                 "running" | "pending" => INFO,
                 _ => FG,
             };
+            let tag = if t.summary.starts_with("[HUMAN]") {
+                ""
+            } else {
+                "[LLM] "
+            };
             lines.push(Line::from(vec![
-                Span::styled("[LLM] ", Style::default().fg(PURPLE)),
+                Span::styled(tag, Style::default().fg(PURPLE)),
                 Span::styled(t.summary.clone(), Style::default().fg(FG)),
                 Span::styled(format!("  {}", t.status), Style::default().fg(color)),
             ]));
@@ -195,7 +218,8 @@ fn draw_status_bar(f: &mut Frame, area: Rect, session: &ChatSession) {
     } else {
         "worker=-"
     };
-    let rec = "REC=off";
+    let rec = if session.recording { "REC=on" } else { "REC=off" };
+    let rec_color = if session.recording { WARN } else { MUTED };
     let line = Line::from(vec![
         Span::styled(format!(" {url} "), Style::default().fg(INFO)),
         Span::styled("|", Style::default().fg(MUTED)),
@@ -203,19 +227,25 @@ fn draw_status_bar(f: &mut Frame, area: Rect, session: &ChatSession) {
         Span::styled("|", Style::default().fg(MUTED)),
         Span::styled(format!(" {hub} {ext} {wrk} "), Style::default().fg(MUTED)),
         Span::styled("|", Style::default().fg(MUTED)),
-        Span::styled(format!(" {rec} {} ", session.mode), Style::default().fg(ACCENT)),
+        Span::styled(format!(" {rec} {} ", session.mode), Style::default().fg(rec_color)),
         Span::styled(&session.status, Style::default().fg(MUTED)),
     ]);
     f.render_widget(Paragraph::new(line).block(bordered("status", false)), area);
 }
 
 fn draw_input(f: &mut Frame, area: Rect, session: &ChatSession) {
-    let hint = if session.phase == TeachMachine::AwaitingConfirm {
+    let hint = if session.pending_normalize.is_some() {
+        " Y accept proposed selectors  N drop  (Enter does not confirm) "
+    } else if session.phase == TeachMachine::AwaitingConfirm {
         " Y confirm  N/Esc reject  (Enter does not confirm) "
     } else if session.phase == TeachMachine::AgentActing {
-        " Ctrl-C cancel in-flight action "
+        " Ctrl-C cancel  Ctrl-T takeover "
+    } else if session.recording {
+        " Ctrl-T stop recording  Ctrl-C cancel takeover "
+    } else if session.phase == TeachMachine::Resume {
+        " Ctrl-R resume agent  Enter send  Ctrl-T takeover "
     } else {
-        " Enter send  Ctrl-C cancel  Ctrl-T/R/E stub  Esc clear "
+        " Enter send  Ctrl-C cancel  Ctrl-T takeover  Ctrl-R resume  Ctrl-E export(M4) "
     };
     let shown = if session.input.is_empty() {
         hint.to_string()
@@ -234,15 +264,16 @@ pub fn handle_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) -> ChatCmd {
-    if session.phase == TeachMachine::AwaitingConfirm {
+    if session.pending_normalize.is_some() || session.phase == TeachMachine::AwaitingConfirm {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => return ChatCmd::ConfirmYes,
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return ChatCmd::ConfirmNo,
             KeyCode::Enter => {
-                session.status = "Enter does not confirm high-risk navigation — press Y".into();
+                session.status = "Enter does not confirm — press Y".into();
                 return ChatCmd::None;
             }
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return ChatCmd::Cancel,
+            KeyCode::Char('t') if mods.contains(KeyModifiers::CONTROL) => return ChatCmd::Takeover,
             _ => return ChatCmd::None,
         }
     }
@@ -250,8 +281,8 @@ pub fn handle_key(
     if mods.contains(KeyModifiers::CONTROL) {
         return match code {
             KeyCode::Char('c') => ChatCmd::Cancel,
-            KeyCode::Char('t') => ChatCmd::StubT,
-            KeyCode::Char('r') => ChatCmd::StubR,
+            KeyCode::Char('t') => ChatCmd::Takeover,
+            KeyCode::Char('r') => ChatCmd::Resume,
             KeyCode::Char('e') => ChatCmd::StubE,
             KeyCode::Char('q') => ChatCmd::Quit,
             _ => ChatCmd::None,
@@ -297,14 +328,30 @@ pub fn apply_cmd_local(session: &mut ChatSession, cmd: ChatCmd) -> bool {
             session.scroll = session.scroll.saturating_sub(1);
             false
         }
-        ChatCmd::StubT => {
-            session.push_system(stub_shortcut('t'));
-            session.status = stub_shortcut('t').into();
+        ChatCmd::Takeover => {
+            session.recording = !session.recording;
+            if session.recording {
+                session.phase = TeachMachine::HumanTakeover;
+                session.mode = "HUMAN".into();
+                session.status = "recording (human takeover)".into();
+                session.push_system(
+                    "Takeover started. Drive the browser; actions normalize after Ctrl-T stop. Agent is paused.",
+                );
+            } else {
+                session.status = "stopping takeover…".into();
+                session.mode = "HUMAN".into();
+            }
             false
         }
-        ChatCmd::StubR => {
-            session.push_system(stub_shortcut('r'));
-            session.status = stub_shortcut('r').into();
+        ChatCmd::Resume => {
+            if session.recording {
+                session.status = "stop takeover (Ctrl-T) before resume".into();
+                return false;
+            }
+            session.phase = TeachMachine::Chat;
+            session.mode = "LLM".into();
+            session.status = "resumed".into();
+            session.push_system("Agent resumed from current page + human steps.");
             false
         }
         ChatCmd::StubE => {
@@ -313,7 +360,15 @@ pub fn apply_cmd_local(session: &mut ChatSession, cmd: ChatCmd) -> bool {
             false
         }
         ChatCmd::Cancel => {
-            if session.phase == TeachMachine::AgentActing
+            if session.recording || session.phase == TeachMachine::HumanTakeover {
+                session.recording = false;
+                session.phase = TeachMachine::Chat;
+                session.mode = "LLM".into();
+                session.status = "takeover cancelled".into();
+                session.push_system("takeover cancelled; events discarded");
+                session.pending_normalize = None;
+                session.ctrl_c_armed = false;
+            } else if session.phase == TeachMachine::AgentActing
                 || session.phase == TeachMachine::AwaitingConfirm
             {
                 session.cancel.store(true, Ordering::SeqCst);
@@ -331,6 +386,9 @@ pub fn apply_cmd_local(session: &mut ChatSession, cmd: ChatCmd) -> bool {
             false
         }
         ChatCmd::ConfirmNo => {
+            if session.pending_normalize.is_some() {
+                return false;
+            }
             session.confirm = None;
             session.phase = TeachMachine::Chat;
             session.status = "navigation rejected".into();
@@ -357,6 +415,37 @@ pub fn dry_send(session: &mut ChatSession, llm_text: &str, allow: &[String]) -> 
     planned
 }
 
+pub async fn live_send_ex(
+    session: &mut ChatSession,
+    llm: &dyn TeachLlm,
+    allow: &[String],
+) -> Result<PlannedTurn> {
+    let goal = std::mem::take(&mut session.input);
+    session.push_user(&goal);
+    session.phase = TeachMachine::AgentActing;
+    session.status = "llm…".into();
+    session.cancel.store(false, Ordering::SeqCst);
+    let page = if session.page_url.is_empty() {
+        None
+    } else {
+        Some(PageBrief {
+            url: session.page_url.clone(),
+            origin: session.page_origin.clone(),
+            title: session.page_title.clone(),
+        })
+    };
+    let human = if session.last_human_summary.is_empty() {
+        None
+    } else {
+        Some(session.last_human_summary.as_str())
+    };
+    let planned = run_llm_turn_ex(llm, &goal, page.as_ref(), allow, human).await?;
+    session.stream = planned.assistant_text.clone();
+    apply_plan(session, &planned);
+    Ok(planned)
+}
+
+#[allow(dead_code)]
 pub async fn live_send(
     session: &mut ChatSession,
     llm: &dyn TeachLlm,
@@ -455,6 +544,11 @@ async fn dedicated_loop(
         }
         match cmd {
             ChatCmd::Send => {
+                if session.recording || session.phase == TeachMachine::HumanTakeover {
+                    session.push_system("agent paused during takeover — Ctrl-T to stop, Ctrl-R to resume");
+                    session.input.clear();
+                    continue;
+                }
                 session.cancel.store(false, Ordering::SeqCst);
                 let allow = hub.allow_origins().await;
                 let planned = if let Some(m) = mock {
@@ -466,7 +560,7 @@ async fn dedicated_loop(
                     let cancel = session.cancel.clone();
                     await_cancellable(
                         &cancel,
-                        live_send(session, llm, &allow),
+                        live_send_ex(session, llm, &allow),
                         poll_ctrl_c,
                     )
                     .await?
@@ -495,14 +589,94 @@ async fn dedicated_loop(
                 pending = None;
             }
             ChatCmd::ConfirmYes => {
-                if let Some(p) = pending.take() {
+                if session.pending_normalize.is_some() {
+                    match hub.confirm_normalize(true).await {
+                        Ok(steps) => {
+                            let acts = human_steps_from_values(&steps);
+                            session.set_human_tools(&acts, "ok");
+                            session.pending_normalize = None;
+                            session.phase = TeachMachine::Resume;
+                            session.status = "human steps confirmed".into();
+                            session.last_human_summary = hub.last_human_summary().await;
+                            session.push_system(&format!(
+                                "accepted proposed selectors; {}",
+                                session.last_human_summary
+                            ));
+                        }
+                        Err(e) => session.push_system(&format!("confirm: {e}")),
+                    }
+                } else if let Some(p) = pending.take() {
                     session.confirm = None;
                     dispatch_now(session, hub, &p, true).await?;
+                }
+            }
+            ChatCmd::ConfirmNo => {
+                if session.pending_normalize.is_some() {
+                    match hub.confirm_normalize(false).await {
+                        Ok(_) => {
+                            session.pending_normalize = None;
+                            session.phase = TeachMachine::Resume;
+                            session.status = "unstable steps dropped (non-exportable)".into();
+                            session.last_human_summary = hub.last_human_summary().await;
+                            session.push_system("dropped proposed selectors (non-exportable)");
+                        }
+                        Err(e) => session.push_system(&format!("confirm: {e}")),
+                    }
+                }
+            }
+            ChatCmd::Takeover => {
+                if session.recording {
+                    if session.phase == TeachMachine::AgentActing {
+                        if let Some(id) = session.last_request_id.clone() {
+                            let _ = hub.cancel_request(Some(&id)).await;
+                        }
+                        session.cancel.store(true, Ordering::SeqCst);
+                    }
+                    if let Err(e) = hub.start_takeover("ctrl-t").await {
+                        session.recording = false;
+                        session.phase = TeachMachine::Chat;
+                        session.mode = "LLM".into();
+                        session.push_system(&format!("takeover start: {e}"));
+                    } else {
+                        session.phase = TeachMachine::HumanTakeover;
+                        session.mode = "HUMAN".into();
+                    }
+                } else {
+                    match hub.stop_takeover().await {
+                        Ok(rx) => match hub
+                            .wait_normalize_result(rx, Duration::from_secs(20))
+                            .await
+                        {
+                            Ok(env) => apply_normalize(session, &env.data),
+                            Err(e) => {
+                                session.phase = TeachMachine::Resume;
+                                session.push_system(&format!("normalize: {e}"));
+                            }
+                        },
+                        Err(e) => session.push_system(&format!("takeover stop: {e}")),
+                    }
+                    session.recording = false;
+                    session.mode = "LLM".into();
+                }
+            }
+            ChatCmd::Resume => {
+                if let Err(e) = hub.resume_agent().await {
+                    session.push_system(&format!("resume: {e}"));
+                } else {
+                    session.phase = TeachMachine::Chat;
+                    session.mode = "LLM".into();
+                    session.recording = false;
                 }
             }
             ChatCmd::Cancel => {
                 if let Some(id) = session.last_request_id.clone() {
                     let _ = hub.cancel_request(Some(&id)).await;
+                }
+                if session.phase == TeachMachine::HumanTakeover || hub.takeover_active().await {
+                    let _ = hub.resume_agent().await;
+                    session.recording = false;
+                    session.mode = "LLM".into();
+                    session.phase = TeachMachine::Chat;
                 }
             }
             _ => {}
@@ -558,6 +732,61 @@ async fn dispatch_now(
     Ok(())
 }
 
+fn apply_normalize(session: &mut ChatSession, data: &serde_json::Value) {
+    let steps = data
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let needs = data
+        .get("needs_confirm")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let non_exp = data
+        .get("non_exportable")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let acts = human_steps_from_values(&steps);
+    session.set_human_tools(&acts, "ok");
+    session.last_human_summary = data
+        .get("summary")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    if session.last_human_summary.is_empty() {
+        session.last_human_summary = crate::teach_chat::summarize_human(&acts);
+    }
+    if needs > 0 {
+        session.pending_normalize = Some(NormalizePending {
+            request_id: data
+                .get("request_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("normalize")
+                .to_string(),
+            needs_confirm: needs,
+            non_exportable: non_exp,
+            steps: acts,
+            summary: session.last_human_summary.clone(),
+        });
+        session.phase = TeachMachine::HumanTakeover;
+        session.status = format!("{needs} step(s) need confirm (Y accept / N drop)");
+        session.push_system(&format!(
+            "normalized {} Playwright step(s), {needs} need confirm, {non_exp} non-exportable",
+            session.pending_normalize.as_ref().map(|p| p.steps.len()).unwrap_or(0)
+        ));
+    } else {
+        session.pending_normalize = None;
+        session.phase = TeachMachine::Resume;
+        session.status = "normalized".into();
+        session.push_system(&format!(
+            "normalized {} Playwright step(s) source=human. Ctrl-R to resume.",
+            acts.len()
+        ));
+    }
+}
+
 fn apply_results(session: &mut ChatSession, data: &serde_json::Value) {
     if let Some(arr) = data.get("results").and_then(|v| v.as_array()) {
         for (i, r) in arr.iter().enumerate() {
@@ -606,6 +835,12 @@ async fn refresh_from_hub(session: &mut ChatSession, hub: &TeachHubHandle) {
         session.page_url = url;
         session.page_origin = origin;
         session.page_title = title;
+    }
+    let rec = hub.takeover_active().await;
+    if rec {
+        session.recording = true;
+        session.mode = "HUMAN".into();
+        session.takeover_event_count = hub.takeover_event_count().await as u32;
     }
 }
 
@@ -658,5 +893,58 @@ mod tests {
     fn poll_ctrl_c_ignores_idle_terminal() {
         // No event queued in tests; must not panic or report a hit.
         assert!(!poll_ctrl_c());
+    }
+
+    #[test]
+    fn ctrl_t_toggles_takeover_recording() {
+        let mut s = ChatSession::default();
+        let cmd = handle_key(&mut s, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(cmd, ChatCmd::Takeover);
+        assert!(!apply_cmd_local(&mut s, ChatCmd::Takeover));
+        assert!(s.recording);
+        assert_eq!(s.phase, TeachMachine::HumanTakeover);
+        assert_eq!(s.mode, "HUMAN");
+        assert!(!apply_cmd_local(&mut s, ChatCmd::Takeover));
+        assert!(!s.recording);
+    }
+
+    #[test]
+    fn ctrl_r_resume_from_takeover_stop() {
+        let mut s = ChatSession::default();
+        s.phase = TeachMachine::Resume;
+        let cmd = handle_key(&mut s, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(cmd, ChatCmd::Resume);
+        assert!(!apply_cmd_local(&mut s, ChatCmd::Resume));
+        assert_eq!(s.phase, TeachMachine::Chat);
+        assert_eq!(s.mode, "LLM");
+    }
+
+    #[test]
+    fn ctrl_e_still_m4_stub() {
+        let mut s = ChatSession::default();
+        let cmd = handle_key(&mut s, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(cmd, ChatCmd::StubE);
+        apply_cmd_local(&mut s, ChatCmd::StubE);
+        assert!(s.status.contains("M4"));
+    }
+
+    #[test]
+    fn apply_normalize_human_steps_not_raw_dom() {
+        let mut s = ChatSession::default();
+        apply_normalize(
+            &mut s,
+            &serde_json::json!({
+                "steps": [
+                    {"action":"click","selector":"#ok","source":"human"},
+                    {"kind":"click","selector":"#raw"}
+                ],
+                "needs_confirm": [],
+                "non_exportable": [{"reason":"shadow_dom"}],
+                "summary": "click #ok"
+            }),
+        );
+        assert_eq!(s.phase, TeachMachine::Resume);
+        assert!(s.tools.iter().any(|t| t.summary.contains("[HUMAN]")));
+        assert!(!s.last_human_summary.contains("kind"));
     }
 }

@@ -54,6 +54,12 @@ class FakeLocator:
     def first(self) -> "FakeLocator":
         return self
 
+    def count(self) -> int:
+        counts = getattr(self.page, "selector_counts", None)
+        if isinstance(counts, dict) and self.sel in counts:
+            return int(counts[self.sel])
+        return 1 if self.sel in self.page.elements else 0
+
     def wait_for(self, state: str = "visible", timeout: int = 0) -> None:
         if self.sel not in self.page.elements:
             raise FakeTimeoutError(f"TimeoutError: waiting for {self.sel}")
@@ -100,6 +106,7 @@ class FakePage:
         self.focused: str | None = None
         self._closed = False
         self.nav_on_click: dict[str, str] = {}
+        self.selector_counts: dict[str, int] = {}
         self.keyboard = FakeKeyboard(self)
         self.mouse = FakeMouse(self)
         self._interrupt = threading.Event()

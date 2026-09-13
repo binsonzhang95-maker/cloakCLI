@@ -1,7 +1,7 @@
 //! Teach Chat M2: LLM turn orchestration over the Teach Hub.
 //!
 //! One user goal → parse/validate → at most 3 schema actions → hub → worker.
-//! Raw model text is never executed. Takeover/export are M3/M4 stubs.
+//! Raw model text is never executed. M3: human takeover → local normalize.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,9 @@ pub const MAX_REASON_LEN: usize = 500;
 const UNIFIED: &[&str] = &[
     "goto", "click", "fill", "type", "scroll", "wait", "done", "fail", "ask_human",
 ];
+
+/// Human-normalized extras (same Playwright executor Recover already allows).
+const HUMAN_EXTRA: &[&str] = &["press", "select"];
 
 const FORBIDDEN: &[&str] = &[
     "shell",
@@ -105,6 +108,14 @@ pub struct TeachAction {
     pub observation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_strategy: Option<String>,
 }
 
 impl TeachAction {
@@ -139,6 +150,11 @@ impl TeachAction {
                 self.delta_y.unwrap_or(0)
             ),
             "wait" => format!("wait {}ms", self.ms.unwrap_or(0)),
+            "press" => format!("press {}", self.key.as_deref().unwrap_or("")),
+            "select" => format!(
+                "select {} [REDACTED]",
+                self.selector.as_deref().unwrap_or("")
+            ),
             other => {
                 let r = self.reason.as_deref().unwrap_or("");
                 if r.is_empty() {
@@ -207,6 +223,21 @@ pub struct ChatSession {
     pub ctrl_c_armed: bool,
     pub last_request_id: Option<String>,
     pub cancel: Arc<AtomicBool>,
+    pub recording: bool,
+    pub takeover_event_count: u32,
+    pub last_human_summary: String,
+    pub pending_normalize: Option<NormalizePending>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizePending {
+    #[allow(dead_code)]
+    pub request_id: String,
+    pub needs_confirm: usize,
+    pub non_exportable: usize,
+    pub steps: Vec<TeachAction>,
+    #[allow(dead_code)]
+    pub summary: String,
 }
 
 impl Default for ChatSession {
@@ -215,7 +246,7 @@ impl Default for ChatSession {
             phase: TeachMachine::Chat,
             messages: vec![ChatLine {
                 role: "system".into(),
-                text: "Teach Chat M2 — send a goal with Enter. Ctrl-C cancels. Ctrl-T/R/E are M3/M4."
+                text: "Teach Chat — send a goal with Enter. Ctrl-C cancels. Ctrl-T takeover, Ctrl-R resume. Ctrl-E export is M4."
                     .into(),
             }],
             tools: Vec::new(),
@@ -234,6 +265,10 @@ impl Default for ChatSession {
             ctrl_c_armed: false,
             last_request_id: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            recording: false,
+            takeover_event_count: 0,
+            last_human_summary: String::new(),
+            pending_normalize: None,
         }
     }
 }
@@ -268,6 +303,15 @@ impl ChatSession {
                 status: status.into(),
             })
             .collect();
+    }
+
+    pub fn set_human_tools(&mut self, actions: &[TeachAction], status: &str) {
+        for a in actions {
+            self.tools.push(ToolLine {
+                summary: format!("[HUMAN] {}", a.summary()),
+                status: status.into(),
+            });
+        }
     }
 }
 
@@ -325,6 +369,14 @@ pub fn parse_json_blob(blob: &Value) -> ParseResult {
 }
 
 pub fn validate_action(item: &Value) -> Result<TeachAction, ActionError> {
+    validate_action_with_source(item, "llm")
+}
+
+pub fn validate_human_action(item: &Value) -> Result<TeachAction, ActionError> {
+    validate_action_with_source(item, "human")
+}
+
+pub fn validate_action_with_source(item: &Value, default_source: &str) -> Result<TeachAction, ActionError> {
     let obj = item
         .as_object()
         .ok_or_else(|| ActionError {
@@ -348,7 +400,15 @@ pub fn validate_action(item: &Value) -> Result<TeachAction, ActionError> {
             message: format!("forbidden action: {raw_type}"),
         });
     }
-    if !UNIFIED.iter().any(|f| *f == raw_type) {
+    let source_in = obj
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or(default_source)
+        .trim()
+        .to_ascii_lowercase();
+    let source = if source_in == "human" { "human" } else { "llm" };
+    let extra_ok = source == "human" && HUMAN_EXTRA.iter().any(|f| *f == raw_type);
+    if !UNIFIED.iter().any(|f| *f == raw_type) && !extra_ok {
         return Err(ActionError {
             message: format!("unknown action: {raw_type}"),
         });
@@ -491,6 +551,14 @@ pub fn validate_action(item: &Value) -> Result<TeachAction, ActionError> {
             }
         }
         "done" | "fail" | "ask_human" => {}
+        "press" => {}
+        "select" => {
+            if selector.is_none() {
+                return Err(ActionError {
+                    message: "select requires selector/css".into(),
+                });
+            }
+        }
         _ => {}
     }
 
@@ -502,6 +570,25 @@ pub fn validate_action(item: &Value) -> Result<TeachAction, ActionError> {
     } else {
         Some(reason)
     };
+
+    let key = obj
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    let value = obj.get("value").and_then(|v| {
+        if v.is_string() {
+            v.as_str().map(|s| s.to_string())
+        } else {
+            Some(v.to_string())
+        }
+    });
+    let confidence = obj.get("confidence").and_then(|v| v.as_f64());
+    let selector_strategy = obj
+        .get("selector_strategy")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
 
     Ok(TeachAction {
         schema_version: SCHEMA_VERSION,
@@ -516,7 +603,11 @@ pub fn validate_action(item: &Value) -> Result<TeachAction, ActionError> {
         x,
         y,
         observation_id,
-        source: Some("llm".into()),
+        source: Some(source.to_string()),
+        key,
+        value,
+        confidence,
+        selector_strategy,
     })
 }
 
@@ -615,6 +706,15 @@ fn extract_json(text: &str) -> Option<Value> {
 }
 
 pub fn build_messages(user: &str, page: Option<&PageBrief>, allow_origins: &[String]) -> Vec<Value> {
+    build_messages_ex(user, page, allow_origins, None)
+}
+
+pub fn build_messages_ex(
+    user: &str,
+    page: Option<&PageBrief>,
+    allow_origins: &[String],
+    human_summary: Option<&str>,
+) -> Vec<Value> {
     let page_val = match page {
         Some(p) => json!({
             "url": p.url,
@@ -623,11 +723,17 @@ pub fn build_messages(user: &str, page: Option<&PageBrief>, allow_origins: &[Str
         }),
         None => Value::Null,
     };
+    let human = human_summary
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| Value::String(redact_for_log(s)))
+        .unwrap_or(Value::Null);
     let user_obj = json!({
         "goal": redact_for_log(user),
         "page": page_val,
         "allow_origins": allow_origins,
         "max_actions": MAX_ACTIONS_PER_TURN,
+        "human_steps_summary": human,
     });
     vec![
         json!({"role": "system", "content": SYSTEM_PROMPT}),
@@ -746,13 +852,24 @@ pub fn plan_turn(
     }
 }
 
+#[allow(dead_code)]
 pub async fn run_llm_turn(
     llm: &dyn TeachLlm,
     user: &str,
     page: Option<&PageBrief>,
     allow_origins: &[String],
 ) -> Result<PlannedTurn> {
-    let messages = build_messages(user, page, allow_origins);
+    run_llm_turn_ex(llm, user, page, allow_origins, None).await
+}
+
+pub async fn run_llm_turn_ex(
+    llm: &dyn TeachLlm,
+    user: &str,
+    page: Option<&PageBrief>,
+    allow_origins: &[String],
+    human_summary: Option<&str>,
+) -> Result<PlannedTurn> {
+    let messages = build_messages_ex(user, page, allow_origins, human_summary);
     let text = llm.complete(&messages)?;
     let current = page.map(|p| p.origin.as_str()).filter(|s| !s.is_empty());
     Ok(plan_turn(&text, allow_origins, current))
@@ -844,11 +961,30 @@ where
 
 pub fn stub_shortcut(key: char) -> &'static str {
     match key {
-        't' | 'T' => "takeover is M3 (not implemented)",
-        'r' | 'R' => "resume is M3 (not implemented)",
         'e' | 'E' => "export is M4 (not implemented)",
         _ => "not implemented",
     }
+}
+
+pub fn human_steps_from_values(values: &[Value]) -> Vec<TeachAction> {
+    let mut out = Vec::new();
+    for v in values {
+        if let Ok(a) = validate_human_action(v) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+pub fn summarize_human(actions: &[TeachAction]) -> String {
+    if actions.is_empty() {
+        return "(no human steps)".into();
+    }
+    actions
+        .iter()
+        .map(|a| a.summary())
+        .collect::<Vec<_>>()
+        .join(" → ")
 }
 
 /// Apply a planned (or executed) turn onto the TUI session.
@@ -1056,8 +1192,20 @@ mod tests {
 
     #[test]
     fn stubs_point_at_later_milestones() {
-        assert!(stub_shortcut('t').contains("M3"));
         assert!(stub_shortcut('e').contains("M4"));
+    }
+
+    #[test]
+    fn human_press_select_allowed_llm_rejected() {
+        let p = validate_human_action(&json!({"action":"press","key":"Enter"})).unwrap();
+        assert_eq!(p.action, "press");
+        assert_eq!(p.source.as_deref(), Some("human"));
+        assert!(validate_action(&json!({"action":"press","key":"Enter"})).is_err());
+        let s = validate_human_action(&json!({
+            "action":"select","selector":"#c","value":"blue","source":"human"
+        }))
+        .unwrap();
+        assert_eq!(s.action, "select");
     }
 
     #[tokio::test]

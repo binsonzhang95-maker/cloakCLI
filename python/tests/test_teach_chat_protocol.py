@@ -11,6 +11,7 @@ from pathlib import Path
 
 from cloakcli_worker.teach_hub import (
     MAX_MESSAGE_BYTES,
+    TYPE_TAKEOVER_START,
     TeachHubClient,
     _redact,
     envelope,
@@ -312,6 +313,14 @@ class ExtensionSafetyTests(unittest.TestCase):
         self.assertIn("session_token", pairing)
         self.assertIn("page_state", pairing)
         self.assertIn('["session", "local"]', pairing)
+        self.assertIn("onHubMessage", pairing)
+        self.assertIn("takeover_start", bg)
+        self.assertIn("takeover_event", bg)
+        self.assertEqual(TYPE_TAKEOVER_START, "takeover_start")
+        content = (ROOT / "extensions" / "teach" / "content.js").read_text(encoding="utf-8")
+        self.assertIn("selector_candidates", content)
+        self.assertIn("redacted", content)
+        self.assertIn("keypress", content)
 
     def test_hub_client_redacts_token_cookie_password(self):
         raw = (

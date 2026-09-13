@@ -317,5 +317,87 @@ class TeachExecuteTests(unittest.TestCase):
         self.assertIsNone(client.on_action_request)
 
 
+    def test_takeover_start_pauses_and_stop_normalizes(self):
+        from cloakcli_worker.teach import _handle_takeover_stop
+        from cloakcli_worker.teach_hub import TeachHubClient
+
+        client = TeachHubClient("127.0.0.1", 1, "p", "c")
+        client._handle({"type": "takeover_start", "data": {"reason": "test"}})
+        self.assertTrue(client.executor_paused)
+        self.assertTrue(client.takeover_active)
+        sent = []
+
+        def capture(typ, data, request_id=None):
+            sent.append((typ, data, request_id))
+
+        client.send = capture  # type: ignore[method-assign]
+        client._handle(
+            {
+                "type": "action_request",
+                "request_id": "during",
+                "data": {"actions": [{"action": "click", "selector": "a"}]},
+            }
+        )
+        self.assertEqual(sent[0][0], "action_result")
+        self.assertEqual(sent[0][1]["error"], "executor_paused")
+
+        class _Client:
+            def __init__(self):
+                self.sent = []
+                self.executor_paused = True
+
+            def send(self, typ, data, request_id=None):
+                self.sent.append((typ, data, request_id))
+
+        page = FakePage()
+        page.elements["#go"] = {"text": "Go"}
+        page.selector_counts['[data-testid="go"]'] = 1
+        page.elements['[data-testid="go"]'] = {"text": "Go"}
+        page.elements["#pw"] = {"text": ""}
+        page.selector_counts["#pw"] = 1
+        c2 = _Client()
+        _handle_takeover_stop(
+            page,
+            c2,
+            {
+                "request_id": "t1",
+                "type": "takeover_stop",
+                "data": {
+                    "events": [
+                        {
+                            "kind": "click",
+                            "selector_candidates": {"testid": '[data-testid="go"]'},
+                            "candidate_unique": {"testid": True},
+                            "tag": "button",
+                            "frame": "main",
+                        },
+                        {
+                            "kind": "input",
+                            "selector": "#pw",
+                            "selector_candidates": {"id": "#pw"},
+                            "candidate_unique": {"css": True},
+                            "value": "hunter2-secret",
+                            "field": {"type": "password", "name": "password"},
+                            "redacted": True,
+                        },
+                    ]
+                },
+            },
+        )
+        self.assertEqual(c2.sent[0][0], "normalize_result")
+        payload = c2.sent[0][1]
+        self.assertTrue(payload["ok"])
+        steps = payload["steps"]
+        self.assertTrue(all(s.get("source") == "human" for s in steps))
+        self.assertTrue(all("action" in s for s in steps))
+        self.assertFalse(any(s.get("kind") for s in payload.get("exportable_steps") or steps))
+        blob = str(payload)
+        self.assertNotIn("hunter2-secret", blob)
+        self.assertTrue(any(s.get("action") == "fill" and "{{vars." in str(s.get("text")) for s in steps))
+
+        client._handle({"type": "resume", "data": {}})
+        self.assertFalse(client.executor_paused)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -132,6 +132,13 @@
         TeachHub.paired = false;
       }
     }
+    if (typeof TeachHub.onHubMessage === "function") {
+      try {
+        TeachHub.onHubMessage(env);
+      } catch {
+        /* background handler is best-effort */
+      }
+    }
   }
 
   function startHeartbeat() {

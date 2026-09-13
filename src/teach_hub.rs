@@ -3,8 +3,9 @@
 //! Listens on 127.0.0.1 only. Speaks WebSocket (MV3 extension) and JSONL
 //! (Python worker) with the same Envelope. Does not log tokens/cookies/passwords.
 //!
-//! M3: takeover_start must set `executor_paused` so the LLM/action executor
-//! cannot race the human on the same Playwright page.
+//! M3: takeover_start pauses the LLM/action executor so it cannot race the
+//! human on the same Playwright page. takeover_stop locally normalizes DOM
+//! events to the unified Playwright schema (`source=human`).
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -20,10 +21,11 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::teach_protocol::{
-    self, pairing_accept_from_data, pairing_offer_data, redact_action_payload, redact_for_log,
-    ClientRole, Envelope, PageState, ProtocolError, TeachMachine, MAX_MESSAGE_BYTES,
-    MAX_PAIRING_FAILURES, TYPE_ACTION_REQUEST, TYPE_ACTION_RESULT, TYPE_CANCEL, TYPE_HEARTBEAT,
-    TYPE_PAGE_STATE, TYPE_PAIRING_OFFER, TYPE_PAIRING_RESULT,
+    self, is_raw_dom_event, pairing_accept_from_data, pairing_offer_data, redact_action_payload,
+    redact_for_log, redact_takeover_event, ClientRole, Envelope, PageState, ProtocolError,
+    TeachMachine, MAX_MESSAGE_BYTES, MAX_PAIRING_FAILURES, TYPE_ACTION_REQUEST, TYPE_ACTION_RESULT,
+    TYPE_CANCEL, TYPE_HEARTBEAT, TYPE_NORMALIZE_RESULT, TYPE_PAGE_STATE, TYPE_PAIRING_OFFER,
+    TYPE_PAIRING_RESULT, TYPE_RESUME, TYPE_TAKEOVER_START, TYPE_TAKEOVER_STOP,
 };
 
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
@@ -308,12 +310,324 @@ impl TeachHubHandle {
         let _ = (request_id, delta, done);
         // Stream is consumed in-process by the TUI; not forwarded to the extension.
     }
+
+    pub async fn takeover_active(&self) -> bool {
+        self.inner.read().await.takeover_active
+    }
+
+    pub async fn takeover_event_count(&self) -> usize {
+        self.inner.read().await.takeover_events.len()
+    }
+
+    pub async fn last_human_summary(&self) -> String {
+        self.inner.read().await.last_human_summary.clone()
+    }
+
+    #[allow(dead_code)]
+    pub async fn pending_normalize_brief(&self) -> Option<(String, usize, usize)> {
+        let g = self.inner.read().await;
+        let p = g.pending_normalize.as_ref()?;
+        Some((p.request_id.clone(), p.needs_confirm.len(), p.non_exportable.len()))
+    }
+
+    /// Exportable Playwright steps only (no raw DOM). Used by tests / M4 stub.
+    #[allow(dead_code)]
+    pub async fn exportable_actions(&self) -> Vec<Value> {
+        let g = self.inner.read().await;
+        g.timeline
+            .iter()
+            .filter(|e| {
+                e.env.msg_type == TYPE_ACTION_REQUEST
+                    || e.env.data.get("event").and_then(|v| v.as_str()) == Some("human_action")
+            })
+            .flat_map(|e| {
+                e.env
+                    .data
+                    .get("actions")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter(|a| a.get("action").is_some() && !is_raw_dom_event(a))
+            .collect()
+    }
+
+    /// Pause the agent executor and tell the extension to start recording.
+    pub async fn start_takeover(&self, reason: &str) -> Result<()> {
+        let mut g = self.inner.write().await;
+        g.executor_paused = true;
+        g.takeover_active = true;
+        g.takeover_events.clear();
+        g.pending_normalize = None;
+        g.machine = TeachMachine::HumanTakeover;
+        g.seq += 1;
+        let seq = g.seq;
+        let session_id = g.session.session_id.clone();
+        let request_id = format!("takeover-{}", uuid::Uuid::new_v4());
+        g.takeover_request_id = Some(request_id.clone());
+        let env = Envelope::new(TYPE_TAKEOVER_START)
+            .with_session(&session_id)
+            .with_request(&request_id)
+            .with_seq(seq)
+            .with_data(json!({
+                "reason": reason,
+                "record": true,
+                "event": "takeover_start",
+                "state": "human_takeover",
+                "strategy": "dom_events",
+            }));
+        g.timeline.push(StoredEvent {
+            seq,
+            env: env.clone(),
+        });
+        trim_timeline(&mut g.timeline);
+        let ext = g.outbound.get(&ClientRole::Extension).cloned();
+        let wrk = g.outbound.get(&ClientRole::Worker).cloned();
+        let waiter = g.waiters.drain().collect::<Vec<_>>();
+        drop(g);
+        for (_, tx) in waiter {
+            let _ = tx.send(
+                Envelope::new(TYPE_ACTION_RESULT).with_data(json!({
+                    "ok": false,
+                    "cancelled": true,
+                    "error": "executor_paused",
+                    "results": [],
+                })),
+            );
+        }
+        if let Some(tx) = ext {
+            let _ = tx.send(env.clone());
+        }
+        if let Some(tx) = wrk {
+            let _ = tx.send(env.clone());
+        }
+        emit_event("takeover_start", json!({"request_id": request_id, "seq": seq}));
+        Ok(())
+    }
+
+    /// Stop recording and send buffered events to the worker for local normalize.
+    pub async fn stop_takeover(&self) -> Result<oneshot::Receiver<Envelope>> {
+        let (tx, rx) = oneshot::channel();
+        let mut g = self.inner.write().await;
+        if !g.takeover_active && g.takeover_events.is_empty() && g.pending_normalize.is_none() {
+            anyhow::bail!("takeover is not active");
+        }
+        g.takeover_active = false;
+        g.executor_paused = true;
+        g.seq += 1;
+        let seq = g.seq;
+        let session_id = g.session.session_id.clone();
+        let request_id = g
+            .takeover_request_id
+            .clone()
+            .unwrap_or_else(|| format!("takeover-{}", uuid::Uuid::new_v4()));
+        let events = std::mem::take(&mut g.takeover_events);
+        let n = events.len();
+        let observation_id = g
+            .session
+            .last_page_state
+            .as_ref()
+            .map(|p| p.observation_id.clone());
+        g.normalize_waiters.insert(request_id.clone(), tx);
+        let env_ext = Envelope::new(TYPE_TAKEOVER_STOP)
+            .with_session(&session_id)
+            .with_request(&request_id)
+            .with_seq(seq)
+            .with_data(json!({
+                "event": "takeover_stop",
+                "state": "human_takeover",
+                "event_count": n,
+            }));
+        let mut env_wrk = env_ext.clone();
+        env_wrk.data = json!({
+            "event": "takeover_stop",
+            "state": "human_takeover",
+            "event_count": n,
+            "events": events,
+            "observation_id": observation_id,
+        });
+        g.timeline.push(StoredEvent {
+            seq,
+            env: Envelope::new(TYPE_TAKEOVER_STOP)
+                .with_session(&session_id)
+                .with_request(&request_id)
+                .with_seq(seq)
+                .with_data(json!({
+                    "event": "takeover_stop",
+                    "state": "human_takeover",
+                    "event_count": n,
+                })),
+        });
+        trim_timeline(&mut g.timeline);
+        let ext = g.outbound.get(&ClientRole::Extension).cloned();
+        let wrk = g.outbound.get(&ClientRole::Worker).cloned();
+        drop(g);
+        if let Some(tx) = ext {
+            let _ = tx.send(env_ext);
+        }
+        let Some(wrk) = wrk else {
+            self.complete_normalize_waiter(
+                &request_id,
+                Envelope::new(TYPE_NORMALIZE_RESULT)
+                    .with_request(&request_id)
+                    .with_data(json!({
+                        "ok": false,
+                        "error": "worker_not_connected",
+                        "steps": [],
+                        "needs_confirm": [],
+                        "non_exportable": [],
+                    })),
+            )
+            .await;
+            anyhow::bail!("worker not connected");
+        };
+        wrk.send(env_wrk)
+            .map_err(|_| anyhow::anyhow!("worker outbound closed"))?;
+        emit_event(
+            "takeover_stop",
+            json!({"request_id": request_id, "event_count": n}),
+        );
+        Ok(rx)
+    }
+
+    pub async fn wait_normalize_result(
+        &self,
+        rx: oneshot::Receiver<Envelope>,
+        timeout: Duration,
+    ) -> Result<Envelope> {
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(env)) => Ok(env),
+            Ok(Err(_)) => anyhow::bail!("normalize waiter dropped"),
+            Err(_) => anyhow::bail!("normalize timeout"),
+        }
+    }
+
+    pub async fn resume_agent(&self) -> Result<()> {
+        let mut g = self.inner.write().await;
+        g.takeover_active = false;
+        g.executor_paused = false;
+        g.pending_normalize = None;
+        g.machine = TeachMachine::Chat;
+        g.seq += 1;
+        let seq = g.seq;
+        let session_id = g.session.session_id.clone();
+        let summary = g.last_human_summary.clone();
+        let env = Envelope::new(TYPE_RESUME)
+            .with_session(&session_id)
+            .with_seq(seq)
+            .with_data(json!({
+                "event": "resume",
+                "state": "chat",
+                "human_steps_summary": summary,
+            }));
+        g.timeline.push(StoredEvent {
+            seq,
+            env: env.clone(),
+        });
+        trim_timeline(&mut g.timeline);
+        let wrk = g.outbound.get(&ClientRole::Worker).cloned();
+        let ext = g.outbound.get(&ClientRole::Extension).cloned();
+        drop(g);
+        if let Some(tx) = wrk {
+            let _ = tx.send(env.clone());
+        }
+        if let Some(tx) = ext {
+            let _ = tx.send(env);
+        }
+        emit_event("resume", json!({"seq": seq}));
+        Ok(())
+    }
+
+    /// Y accepts proposed selectors (unstable/coords); N drops them as non-exportable.
+    pub async fn confirm_normalize(&self, accept: bool) -> Result<Vec<Value>> {
+        let mut g = self.inner.write().await;
+        let Some(pending) = g.pending_normalize.take() else {
+            anyhow::bail!("no normalize confirm pending");
+        };
+        let mut merged = pending.steps.clone();
+        if accept {
+            for item in &pending.needs_confirm {
+                if let Some(proposed) = item.get("proposed") {
+                    if proposed.get("action").is_some() && !is_raw_dom_event(proposed) {
+                        merged.push(proposed.clone());
+                    }
+                }
+            }
+        }
+        let redacted: Vec<Value> = merged.iter().map(redact_action_payload).collect();
+        if !redacted.is_empty() {
+            g.seq += 1;
+            let seq = g.seq;
+            let env = Envelope::new(TYPE_ACTION_REQUEST)
+                .with_session(&g.session.session_id)
+                .with_request(&pending.request_id)
+                .with_seq(seq)
+                .with_data(json!({
+                    "schema_version": 1,
+                    "origin": "human",
+                    "event": "human_action",
+                    "state": "resume",
+                    "actions": redacted.clone(),
+                    "confirmed": accept,
+                }));
+            g.timeline.push(StoredEvent { seq, env });
+            trim_timeline(&mut g.timeline);
+        }
+        g.last_human_summary = human_summary_from_actions(&redacted);
+        g.machine = TeachMachine::Resume;
+        drop(g);
+        Ok(redacted)
+    }
+
+    async fn complete_normalize_waiter(&self, request_id: &str, env: Envelope) {
+        let mut g = self.inner.write().await;
+        if let Some(tx) = g.normalize_waiters.remove(request_id) {
+            let _ = tx.send(env);
+        }
+    }
 }
 
 fn trim_timeline(tl: &mut Vec<StoredEvent>) {
     if tl.len() > TIMELINE_CAP {
         let drop_n = tl.len() - TIMELINE_CAP;
         tl.drain(0..drop_n);
+    }
+}
+
+fn human_summary_from_actions(actions: &[Value]) -> String {
+    let parts: Vec<String> = actions
+        .iter()
+        .filter_map(|a| {
+            let act = a.get("action")?.as_str()?;
+            Some(match act {
+                "goto" => format!(
+                    "goto {}",
+                    redact_for_log(a.get("url").and_then(|u| u.as_str()).unwrap_or(""))
+                ),
+                "click" => format!(
+                    "click {}",
+                    a.get("selector").and_then(|s| s.as_str()).unwrap_or("(coords)")
+                ),
+                "fill" | "type" => format!(
+                    "{act} {} [REDACTED]",
+                    a.get("selector").and_then(|s| s.as_str()).unwrap_or("")
+                ),
+                "press" => format!(
+                    "press {}",
+                    a.get("key").and_then(|s| s.as_str()).unwrap_or("")
+                ),
+                "select" => format!(
+                    "select {}",
+                    a.get("selector").and_then(|s| s.as_str()).unwrap_or("")
+                ),
+                other => other.to_string(),
+            })
+        })
+        .collect();
+    if parts.is_empty() {
+        "(no human steps)".into()
+    } else {
+        parts.join(" → ")
     }
 }
 
@@ -331,11 +645,25 @@ struct HubInner {
     timeline: Vec<StoredEvent>,
     reconnects: u32,
     machine: TeachMachine,
-    /// M3: takeover_start must set this so the agent cannot race the human.
+    /// takeover_start must set this so the agent cannot race the human.
     executor_paused: bool,
+    takeover_active: bool,
+    takeover_events: Vec<Value>,
+    takeover_request_id: Option<String>,
+    pending_normalize: Option<PendingNormalize>,
+    last_human_summary: String,
     outbound: HashMap<ClientRole, mpsc::UnboundedSender<Envelope>>,
     waiters: HashMap<String, oneshot::Sender<Envelope>>,
+    normalize_waiters: HashMap<String, oneshot::Sender<Envelope>>,
     conn_gen: HashMap<ClientRole, u64>,
+}
+
+struct PendingNormalize {
+    request_id: String,
+    steps: Vec<Value>,
+    needs_confirm: Vec<Value>,
+    #[allow(dead_code)]
+    non_exportable: Vec<Value>,
 }
 
 struct Session {
@@ -407,8 +735,14 @@ pub async fn spawn(opts: TeachHubOpts) -> Result<TeachHubHandle> {
         reconnects: 0,
         machine: TeachMachine::Chat,
         executor_paused: false,
+        takeover_active: false,
+        takeover_events: Vec::new(),
+        takeover_request_id: None,
+        pending_normalize: None,
+        last_human_summary: String::new(),
         outbound: HashMap::new(),
         waiters: HashMap::new(),
+        normalize_waiters: HashMap::new(),
         conn_gen: HashMap::new(),
     }));
 
@@ -668,8 +1002,11 @@ async fn handle_websocket(
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await?;
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, writer) = stream.into_split();
+    let (tx, rx) = mpsc::unbounded_channel::<Envelope>();
+    let write_task = tokio::spawn(pump_ws_writes(writer, rx));
     let mut authed: Option<ClientRole> = None;
+    let mut my_gen: u64 = 0;
     let mut incoming = initial_body;
 
     // Unauthenticated clients get a pairing_offer (code is for the human;
@@ -685,7 +1022,7 @@ async fn handle_websocket(
                 &expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             ));
         drop(g);
-        write_ws_text(&mut writer, &offer).await?;
+        let _ = tx.send(offer);
     }
 
     loop {
@@ -694,29 +1031,43 @@ async fn handle_websocket(
                 if text.len() > MAX_MESSAGE_BYTES {
                     let err =
                         ProtocolError::new("message_too_large", "message exceeds limit", false);
-                    write_ws_text(&mut writer, &err.to_envelope(None, None)).await?;
+                    let _ = tx.send(err.to_envelope(None, None));
                     continue;
                 }
                 match process_line(&inner, text.as_bytes(), &mut authed).await {
                     Ok(replies) => {
+                        if let Some(role) = authed {
+                            if my_gen == 0 {
+                                my_gen = register_outbound(&inner, role, tx.clone()).await;
+                            }
+                        }
                         for env in replies {
-                            write_ws_text(&mut writer, &env).await?;
+                            let _ = tx.send(env);
                         }
                     }
                     Err(err) => {
-                        write_ws_text(&mut writer, &err.to_envelope(None, None)).await?;
+                        let _ = tx.send(err.to_envelope(None, None));
                     }
                 }
             }
-            Ok(ws::WsMsg::Ping(p)) => {
-                let frame = ws::encode_pong(&p);
-                writer.write_all(&frame).await?;
-            }
-            Ok(ws::WsMsg::Pong) => {}
+            Ok(ws::WsMsg::Ping(_)) | Ok(ws::WsMsg::Pong) => {}
             Ok(ws::WsMsg::Close) | Err(_) => {
-                mark_disconnected(&inner, authed, 0).await;
+                mark_disconnected(&inner, authed, my_gen).await;
+                drop(tx);
+                let _ = write_task.await;
                 return Ok(());
             }
+        }
+    }
+}
+
+async fn pump_ws_writes<W: AsyncWriteExt + Unpin>(
+    mut writer: W,
+    mut rx: mpsc::UnboundedReceiver<Envelope>,
+) {
+    while let Some(env) = rx.recv().await {
+        if write_ws_text(&mut writer, &env).await.is_err() {
+            break;
         }
     }
 }
@@ -785,20 +1136,19 @@ async fn process_line(
             // Hub originates these; inbound copies are ignored.
             Ok(vec![])
         }
+        Some(teach_protocol::MsgType::TakeoverEvent) => {
+            require_auth(authed)?;
+            handle_takeover_event(inner, &env).await
+        }
+        Some(teach_protocol::MsgType::NormalizeResult) => {
+            require_auth(authed)?;
+            handle_normalize_result(inner, &env).await
+        }
         Some(teach_protocol::MsgType::TakeoverStart)
         | Some(teach_protocol::MsgType::TakeoverStop)
-        | Some(teach_protocol::MsgType::TakeoverEvent)
-        | Some(teach_protocol::MsgType::NormalizeResult)
         | Some(teach_protocol::MsgType::Resume) => {
-            // M3: takeover_start must set executor_paused so the agent cannot
-            // race the human on the same Playwright page.
-            Ok(vec![error_env(
-                "not_implemented",
-                "takeover/normalize is M3",
-                false,
-                env.session_id.as_deref(),
-                env.request_id.as_deref(),
-            )])
+            // Hub originates these; inbound copies from clients are ignored.
+            Ok(vec![])
         }
         Some(teach_protocol::MsgType::Export) | Some(teach_protocol::MsgType::ExportResult) => {
             Ok(vec![error_env(
@@ -1290,6 +1640,132 @@ async fn handle_chat_message(
     Ok(vec![stored])
 }
 
+async fn handle_takeover_event(
+    inner: &SharedHub,
+    env: &Envelope,
+) -> Result<Vec<Envelope>, ProtocolError> {
+    let mut g = inner.write().await;
+    if !g.takeover_active {
+        return Ok(vec![]);
+    }
+    let redacted = redact_takeover_event(&env.data);
+    // Buffer only. Raw DOM never joins the exportable timeline.
+    g.takeover_events.push(redacted);
+    Ok(vec![])
+}
+
+async fn handle_normalize_result(
+    inner: &SharedHub,
+    env: &Envelope,
+) -> Result<Vec<Envelope>, ProtocolError> {
+    let data = redact_action_payload(&env.data);
+    let request_id = env
+        .request_id
+        .clone()
+        .unwrap_or_else(|| "normalize".to_string());
+    let steps: Vec<Value> = data
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.get("action").is_some() && !is_raw_dom_event(s))
+        .map(|mut s| {
+            if let Some(obj) = s.as_object_mut() {
+                obj.insert("source".into(), json!("human"));
+                obj.remove("kind");
+                obj.remove("css");
+            }
+            redact_action_payload(&s)
+        })
+        .collect();
+    let needs_confirm: Vec<Value> = data
+        .get("needs_confirm")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let non_exportable: Vec<Value> = data
+        .get("non_exportable")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut g = inner.write().await;
+    g.seq += 1;
+    let seq = g.seq;
+    let session_id = g.session.session_id.clone();
+    if !steps.is_empty() {
+        let env_steps = Envelope::new(TYPE_ACTION_REQUEST)
+            .with_session(&session_id)
+            .with_request(&request_id)
+            .with_seq(seq)
+            .with_data(json!({
+                "schema_version": 1,
+                "origin": "human",
+                "event": "human_action",
+                "state": "human_takeover",
+                "actions": steps.clone(),
+            }));
+        g.timeline.push(StoredEvent {
+            seq,
+            env: env_steps,
+        });
+        trim_timeline(&mut g.timeline);
+    }
+    g.last_human_summary = human_summary_from_actions(&steps);
+    let mut stored = Envelope::new(TYPE_NORMALIZE_RESULT)
+        .with_session(&session_id)
+        .with_request(&request_id)
+        .with_seq(seq)
+        .with_data(json!({
+            "ok": data.get("ok").and_then(|v| v.as_bool()).unwrap_or(true),
+            "steps": steps.clone(),
+            "needs_confirm": needs_confirm.clone(),
+            "non_exportable": non_exportable.clone(),
+            "summary": g.last_human_summary.clone(),
+            "event": "normalize_result",
+            "origin": "worker",
+        }));
+    g.seq += 1;
+    let nseq = g.seq;
+    stored.seq = Some(nseq);
+    g.timeline.push(StoredEvent {
+        seq: nseq,
+        env: stored.clone(),
+    });
+    trim_timeline(&mut g.timeline);
+    if !needs_confirm.is_empty() {
+        g.pending_normalize = Some(PendingNormalize {
+            request_id: request_id.clone(),
+            steps: steps.clone(),
+            needs_confirm,
+            non_exportable,
+        });
+        g.machine = TeachMachine::HumanTakeover;
+    } else {
+        g.pending_normalize = None;
+        g.machine = TeachMachine::Resume;
+    }
+    let waiter_key = g.takeover_request_id.clone().unwrap_or_else(|| request_id.clone());
+    let waiter = g
+        .normalize_waiters
+        .remove(&request_id)
+        .or_else(|| g.normalize_waiters.remove(&waiter_key))
+        .or_else(|| g.normalize_waiters.drain().next().map(|(_, tx)| tx));
+    drop(g);
+    if let Some(tx) = waiter {
+        let _ = tx.send(stored.clone());
+    }
+    emit_event(
+        "normalize_result",
+        json!({
+            "request_id": request_id,
+            "n_steps": steps.len(),
+        }),
+    );
+    Ok(vec![stored])
+}
+
 async fn handle_human_confirm(
     inner: &SharedHub,
     env: &Envelope,
@@ -1594,7 +2070,7 @@ mod ws {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::teach_protocol::{TYPE_ERROR, TYPE_PAIRING_ACCEPT};
+    use crate::teach_protocol::{TYPE_ERROR, TYPE_PAIRING_ACCEPT, TYPE_TAKEOVER_EVENT};
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream as TokioTcp;
 
@@ -2129,5 +2605,141 @@ mod tests {
             "https://paste.example/doc"
         );
         drop(rx2);
+    }
+
+    #[tokio::test]
+    async fn takeover_pauses_executor_and_merges_human_steps() {
+        let hub = spawn(TeachHubOpts {
+            allow_origins: vec!["https://example.com".into()],
+        })
+        .await
+        .unwrap();
+        let mut wrk = jsonl_client(hub.addr).await;
+        send_line(
+            &mut wrk,
+            &accept_env(hub.pairing_code(), hub.pairing_id(), "worker", "n-to"),
+        )
+        .await;
+        let _ = read_env(&mut wrk).await;
+
+        hub.start_takeover("test").await.unwrap();
+        assert!(hub.executor_paused().await);
+        assert!(hub.takeover_active().await);
+        assert_eq!(hub.machine().await, TeachMachine::HumanTakeover);
+
+        let start = read_env(&mut wrk).await;
+        assert_eq!(start.msg_type, TYPE_TAKEOVER_START);
+
+        let err = hub
+            .dispatch_action_request(
+                "req-during",
+                vec![json!({"action":"click","selector":"a"})],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("executor_paused"), "{err}");
+
+        let mut ext = jsonl_client(hub.addr).await;
+        send_line(
+            &mut ext,
+            &accept_env(hub.pairing_code(), hub.pairing_id(), "extension", "n-ext"),
+        )
+        .await;
+        let _ = read_env(&mut ext).await;
+        send_line(
+            &mut ext,
+            &Envelope::new(TYPE_TAKEOVER_EVENT)
+                .with_session(hub.session_id())
+                .with_data(json!({
+                    "kind": "click",
+                    "selector": "#go",
+                    "selector_candidates": {"id": "#go"},
+                    "value": "should-not-export-raw",
+                    "field": {"type": "password", "name": "password"},
+                })),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(hub.takeover_event_count().await >= 1);
+
+        let rx = hub.stop_takeover().await.unwrap();
+        let stop = read_env(&mut wrk).await;
+        assert_eq!(stop.msg_type, TYPE_TAKEOVER_STOP);
+        let events = stop.data["events"].as_array().cloned().unwrap_or_default();
+        assert!(!events.is_empty());
+        let blob = events[0].to_string();
+        assert!(!blob.contains("should-not-export-raw"), "{blob}");
+
+        send_line(
+            &mut wrk,
+            &Envelope::new(TYPE_NORMALIZE_RESULT)
+                .with_request(stop.request_id.as_deref().unwrap_or(""))
+                .with_session(hub.session_id())
+                .with_data(json!({
+                    "ok": true,
+                    "steps": [{
+                        "schema_version": 1,
+                        "action": "click",
+                        "selector": "#go",
+                        "source": "human",
+                        "selector_strategy": "testid"
+                    }],
+                    "needs_confirm": [],
+                    "non_exportable": [],
+                    "summary": "click #go"
+                })),
+        )
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.msg_type, TYPE_NORMALIZE_RESULT);
+        let exportable = hub.exportable_actions().await;
+        assert!(
+            exportable.iter().any(|a| a["action"] == "click" && a["source"] == "human"),
+            "{exportable:?}"
+        );
+        assert!(
+            !exportable.iter().any(|a| a.get("kind").is_some() && a.get("action").is_none()),
+            "raw DOM must not be exportable: {exportable:?}"
+        );
+        hub.resume_agent().await.unwrap();
+        assert!(!hub.executor_paused().await);
+        assert_eq!(hub.machine().await, TeachMachine::Chat);
+    }
+
+    #[tokio::test]
+    async fn takeover_fill_redacted_on_buffer() {
+        let hub = spawn(TeachHubOpts {
+            allow_origins: vec!["https://example.com".into()],
+        })
+        .await
+        .unwrap();
+        let mut ext = jsonl_client(hub.addr).await;
+        send_line(
+            &mut ext,
+            &accept_env(hub.pairing_code(), hub.pairing_id(), "extension", "n-pw"),
+        )
+        .await;
+        let _ = read_env(&mut ext).await;
+        hub.start_takeover("pw").await.unwrap();
+        send_line(
+            &mut ext,
+            &Envelope::new(TYPE_TAKEOVER_EVENT)
+                .with_session(hub.session_id())
+                .with_data(json!({
+                    "kind": "input",
+                    "selector": "#pw",
+                    "value": "hunter2-secret",
+                    "field": {"type": "password", "name": "password"}
+                })),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snap = hub.timeline_snapshot().await;
+        let blob = serde_json::to_string(&snap).unwrap();
+        assert!(!blob.contains("hunter2-secret"), "{blob}");
     }
 }

@@ -128,6 +128,8 @@ class Action:
     key: str | None = None
     value: str | None = None
     source: str | None = None
+    selector_strategy: str | None = None
+    confidence: float | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -183,6 +185,10 @@ class Action:
             d["reason"] = self.reason[:MAX_REASON_LEN]
         if self.source:
             d["source"] = self.source
+        if self.selector_strategy:
+            d["selector_strategy"] = self.selector_strategy
+        if self.confidence is not None:
+            d["confidence"] = self.confidence
         return d
 
 
@@ -428,6 +434,12 @@ def validate_action(
         reason=reason,
         key=key_out,
         value=value_out,
+        selector_strategy=(
+            str(item["selector_strategy"]).strip()
+            if item.get("selector_strategy")
+            else None
+        ),
+        confidence=_opt_confidence(item.get("confidence")),
         source=source,
         raw=raw,
     )
@@ -709,6 +721,20 @@ def sanitize_action_url(url: str) -> str:
     origin = origin_of_url(url) or ""
     path = p.path or "/"
     return f"{origin}{path}"
+
+
+def _opt_confidence(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v < 0:
+        return 0.0
+    if v > 1:
+        return 1.0
+    return v
 
 
 def _canonical_selector(item: dict[str, Any]) -> str | None:

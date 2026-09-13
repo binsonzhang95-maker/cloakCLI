@@ -31,6 +31,11 @@ TYPE_ACTION_RESULT = "action_result"
 TYPE_CHAT_MESSAGE = "chat_message"
 TYPE_LLM_STREAM = "llm_stream"
 TYPE_HUMAN_CONFIRM = "human_confirm"
+TYPE_TAKEOVER_START = "takeover_start"
+TYPE_TAKEOVER_EVENT = "takeover_event"
+TYPE_TAKEOVER_STOP = "takeover_stop"
+TYPE_NORMALIZE_RESULT = "normalize_result"
+TYPE_RESUME = "resume"
 
 
 def selector_from_obj(obj: dict[str, Any] | None) -> str | None:
@@ -197,9 +202,10 @@ class TeachHubClient:
         # cancel. Playwright runs on the owner thread (see pop_action_request).
         self._action_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._playwright_page: Any = None
-        # M3: takeover_start must set this so the agent cannot race the human
-        # on the same Playwright page. M2 only exposes the hook/flag.
+        # takeover_start sets this so the agent cannot race the human
+        # on the same Playwright page.
         self.executor_paused = False
+        self.takeover_active = False
 
     def bind_playwright_page(self, page: Any) -> None:
         """Page owned by the exec thread; used only to interrupt on cancel."""
@@ -366,8 +372,25 @@ class TeachHubClient:
                     self.on_cancel(env)
                 except Exception:
                     pass
+        elif t == TYPE_TAKEOVER_START:
+            self.executor_paused = True
+            self.takeover_active = True
+            self._cancel.set()
+            self._interrupt_playwright()
+            self._reject_queued_actions("executor_paused")
+        elif t == TYPE_TAKEOVER_STOP:
+            self.executor_paused = True
+            self.takeover_active = False
+            self._cancel.set()
+            self._interrupt_playwright()
+            self._reject_queued_actions("executor_paused")
+            self._action_queue.put(env)
+        elif t == TYPE_RESUME:
+            self.takeover_active = False
+            self.executor_paused = False
+            self._cancel.clear()
         elif t == TYPE_ACTION_REQUEST:
-            if self.executor_paused:
+            if self.executor_paused or self.takeover_active:
                 self.send(
                     TYPE_ACTION_RESULT,
                     {
@@ -382,6 +405,27 @@ class TeachHubClient:
             self._cancel.clear()
             # Queue for the Playwright-owning exec path. Do not run sync
             # Playwright on the recv thread (it would block cancel messages).
+            self._action_queue.put(env)
+
+    def _reject_queued_actions(self, error: str) -> None:
+        kept: list[dict[str, Any]] = []
+        while True:
+            try:
+                env = self._action_queue.get_nowait()
+            except queue.Empty:
+                break
+            if env.get("type") != TYPE_ACTION_REQUEST:
+                kept.append(env)
+                continue
+            try:
+                self.send(
+                    TYPE_ACTION_RESULT,
+                    {"ok": False, "error": error, "results": []},
+                    request_id=env.get("request_id"),
+                )
+            except Exception:
+                pass
+        for env in kept:
             self._action_queue.put(env)
 
     def _interrupt_playwright(self) -> None:

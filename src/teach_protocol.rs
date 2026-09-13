@@ -189,6 +189,8 @@ pub enum TeachMachine {
     Chat,
     AgentActing,
     AwaitingConfirm,
+    HumanTakeover,
+    Resume,
     Cancel,
     Error,
 }
@@ -199,6 +201,8 @@ impl TeachMachine {
             Self::Chat => "chat",
             Self::AgentActing => "agent_acting",
             Self::AwaitingConfirm => "awaiting_confirm",
+            Self::HumanTakeover => "human_takeover",
+            Self::Resume => "resume",
             Self::Cancel => "cancel",
             Self::Error => "error",
         }
@@ -833,6 +837,78 @@ fn redact_action_payload_in_place(v: &mut Value) {
     }
 }
 
+/// Strip password/token plaintext from a temporary takeover DOM event.
+/// Never a substitute for the extension redacting first.
+pub fn redact_takeover_event(data: &Value) -> Value {
+    let mut v = data.clone();
+    let field_type = v
+        .pointer("/field/type")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let hay = format!(
+        "{field_type} {} {} {}",
+        v.get("label").and_then(|x| x.as_str()).unwrap_or(""),
+        v.pointer("/field/name")
+            .and_then(|x| x.as_str())
+            .unwrap_or(""),
+        v.pointer("/field/id").and_then(|x| x.as_str()).unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    let secret = v.get("redacted").and_then(|x| x.as_bool()).unwrap_or(false)
+        || field_type == "password"
+        || hay.contains("password")
+        || hay.contains("passwd")
+        || hay.contains("secret")
+        || hay.contains("token")
+        || hay.contains("authorization")
+        || hay.contains("cookie");
+    let Some(map) = v.as_object_mut() else {
+        return v;
+    };
+    if secret {
+        if let Some(Value::String(s)) = map.get("value") {
+            let len = s.len();
+            map.entry("value_len".to_string()).or_insert(json!(len));
+        }
+        map.insert("value".into(), json!(""));
+        map.insert("redacted".into(), json!(true));
+        if let Some(Value::String(t)) = map.get("text") {
+            let low = t.to_ascii_lowercase();
+            if low.contains("password") || low.contains("token") || low.contains("secret") {
+                map.insert("text".into(), json!("[REDACTED]"));
+            }
+        }
+    }
+    if let Some(url) = map.get("url").and_then(|x| x.as_str()).map(|s| s.to_string()) {
+        if let Ok(clean) = sanitize_page_url(&url) {
+            map.insert("url".into(), json!(clean));
+        }
+    }
+    v
+}
+
+pub fn is_raw_dom_event(v: &Value) -> bool {
+    if v.get("action").and_then(|x| x.as_str()).is_some() {
+        return false;
+    }
+    matches!(
+        v.get("kind").and_then(|x| x.as_str()).unwrap_or(""),
+        "click"
+            | "input"
+            | "fill"
+            | "type"
+            | "select"
+            | "navigation"
+            | "nav"
+            | "goto"
+            | "keypress"
+            | "keydown"
+            | "press"
+            | "change"
+    )
+}
+
 pub fn pairing_offer_data(pairing_id: &str, code: &str, expires_at: &str) -> Value {
     json!({
         "pairing_id": pairing_id,
@@ -841,8 +917,9 @@ pub fn pairing_offer_data(pairing_id: &str, code: &str, expires_at: &str) -> Val
         "capabilities": {
             "page_state": true,
             "pairing": true,
-            "takeover": false,
-            "actions": false
+            "takeover": true,
+            "actions": true,
+            "normalize": true,
         }
     })
 }
@@ -1056,6 +1133,22 @@ mod tests {
     }
 
     #[test]
+    fn redact_takeover_event_strips_password() {
+        let raw = json!({
+            "kind": "input",
+            "selector": "#pw",
+            "value": "hunter2-secret",
+            "field": {"type": "password", "name": "password"}
+        });
+        let red = redact_takeover_event(&raw);
+        assert_eq!(red["value"], "");
+        assert_eq!(red["redacted"], true);
+        assert!(!red.to_string().contains("hunter2-secret"));
+        assert!(!is_raw_dom_event(&json!({"action":"click","selector":"#x"})));
+        assert!(is_raw_dom_event(&json!({"kind":"click","selector":"#x"})));
+    }
+
+    #[test]
     fn pairing_accept_needs_nonce_and_role() {
         let err = pairing_accept_from_data(&json!({
             "pairing_id": "p",
@@ -1086,6 +1179,7 @@ mod tests {
         assert!(MsgType::ActionRequest.is_m2());
         assert!(MsgType::PageState.is_m1());
         assert!(!MsgType::TakeoverStart.is_m1());
+        assert!(MsgType::TakeoverStart.is_m3());
         assert!(!MsgType::Export.is_m1());
     }
 }

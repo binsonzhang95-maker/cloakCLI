@@ -184,6 +184,24 @@ CLOAKCLI_BIN=target/release/cloakcli python3 scripts/teach_m1_headed_smoke.py
 
 Requires a display (`DISPLAY` / `WAYLAND_DISPLAY`) or `xvfb-run`, a built `cloakcli`, and the CloakBrowser Chromium binary. The script starts two loopback origins (allow + deny), runs `cloakcli teach start`, and fails if hub events or worker JSON miss the M1 checks. Non-headed coverage (SW token reuse, worker reconnect, duplicate pairing) lives in `python/tests/test_teach_chat_protocol.py` and `cargo test`.
 
+### Teach Chat M3 — human takeover
+
+When the LLM is stuck, take over the headed browser. The extension records click/fill/press/select/navigate; on stop those DOM events are **locally** normalized to the same Playwright action schema as the LLM (`source=human`) and merged onto the timeline. Raw DOM events are never exportable steps. The agent executor is paused for the whole takeover (no concurrent Playwright).
+
+```bash
+cloakcli teach chat --profile demo --url https://example.com
+# in the TUI:
+#   Enter     send a goal (LLM plans ≤3 actions)
+#   Ctrl-T    start human takeover (REC=on, agent paused)
+#             use the browser: click, type, navigate
+#   Ctrl-T    stop → local normalize → Playwright steps source=human
+#   Y / N     accept or drop unstable/coords/iframe selectors
+#   Ctrl-R    resume the agent from the current page + human-step summary
+#   Ctrl-E    export skill draft (M4, not implemented)
+```
+
+Password/token fields are stored as type + length + `redacted` only; fills become `{{vars.PASSWORD}}` (or similar). Any `http(s)` goto is allowed; `javascript:` / `file:` / `data:` are rejected. Shadow DOM and missing selectors are non-exportable (never silent-saved as raw events).
+
 ## Skill format
 
 ```json

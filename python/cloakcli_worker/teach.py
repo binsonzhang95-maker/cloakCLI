@@ -18,7 +18,12 @@ from typing import Any
 from .browser import launch_context
 from .paths import PathTrustError, ensure_under_root, set_root
 from .redact import redact_any, redact_text
-from .teach_hub import TeachHubClient, TYPE_ACTION_RESULT
+from .teach_hub import (
+    TeachHubClient,
+    TYPE_ACTION_RESULT,
+    TYPE_NORMALIZE_RESULT,
+    TYPE_TAKEOVER_STOP,
+)
 
 
 def _require_headed(headed: bool) -> None:
@@ -89,14 +94,24 @@ def _run_until_closed(ctx, page: Any, hub_client: Any, smoke_seconds: float) -> 
             env = hub_client.pop_action_request(timeout=0.15)
             if env is not None:
                 try:
-                    _handle_action_request(page, hub_client, env)
+                    if env.get("type") == TYPE_TAKEOVER_STOP:
+                        _handle_takeover_stop(page, hub_client, env)
+                    else:
+                        _handle_action_request(page, hub_client, env)
                 except Exception as e:
                     try:
-                        hub_client.send(
-                            TYPE_ACTION_RESULT,
-                            {"ok": False, "error": type(e).__name__, "results": []},
-                            request_id=env.get("request_id"),
-                        )
+                        if env.get("type") == TYPE_TAKEOVER_STOP:
+                            hub_client.send(
+                                TYPE_NORMALIZE_RESULT,
+                                {"ok": False, "error": type(e).__name__, "steps": []},
+                                request_id=env.get("request_id"),
+                            )
+                        else:
+                            hub_client.send(
+                                TYPE_ACTION_RESULT,
+                                {"ok": False, "error": type(e).__name__, "results": []},
+                                request_id=env.get("request_id"),
+                            )
                     except Exception:
                         pass
                 continue
@@ -188,6 +203,32 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
     return 0
+
+
+def _handle_takeover_stop(page: Any, client: TeachHubClient, env: dict) -> None:
+    """Local normalize of buffered DOM events. Never executes them (human already did)."""
+    from .normalize import normalize_events
+    from .timeline import Timeline
+
+    request_id = env.get("request_id")
+    data = env.get("data") if isinstance(env.get("data"), dict) else {}
+    events = data.get("events") if isinstance(data.get("events"), list) else []
+    vp = None
+    try:
+        vp = getattr(page, "viewport_size", None)
+        if not isinstance(vp, dict):
+            vp = None
+    except Exception:
+        vp = None
+    obs = data.get("observation_id")
+    result = normalize_events(events, page=page, observation_id=obs, viewport=vp)
+    tl = Timeline()
+    tl.merge_human_steps(result.steps, request_id=str(request_id or "human"))
+    payload = result.to_public()
+    payload["timeline"] = [e.as_dict() for e in tl.events]
+    payload["summary"] = tl.human_summary()
+    payload["exportable_steps"] = tl.exportable_steps()
+    client.send(TYPE_NORMALIZE_RESULT, redact_any(payload), request_id=request_id)
 
 
 def _handle_action_request(page: Any, client: TeachHubClient, env: dict) -> None:
