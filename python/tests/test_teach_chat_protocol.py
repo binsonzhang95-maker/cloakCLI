@@ -333,14 +333,97 @@ class ExtensionSafetyTests(unittest.TestCase):
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        leaks = mod.scan_logs_for_leaks(
+        tok = "m1sent_tok_deadbeefcafebabe0123456789abcdef_NEVER_LOG"
+        pw = "m1sent_pw_deadbeefcafebabe0123456789abcdef_NEVER_LOG"
+        ck = "m1sent_ck_deadbeefcafebabe0123456789abcdef_NEVER_LOG"
+        sentinels = [tok, pw, ck]
+
+        field = mod.scan_logs_for_leaks(
             '{"session_token":"abc123secret","password":"hunter2","cookie":"cval"}'
         )
-        self.assertTrue(leaks)
+        self.assertTrue(field)
+
+        bare = mod.scan_logs_for_leaks(f"debug dump {tok} trailing", sentinels)
+        self.assertTrue(any("sentinel substring" in h for h in bare), bare)
+
+        query = mod.scan_logs_for_leaks(
+            f"GET /login?token={tok}&password={pw}&cookie={ck} HTTP/1.1",
+            sentinels,
+        )
+        self.assertTrue(any("sentinel" in h or "url-query" in h for h in query), query)
+        query_named = mod.scan_logs_for_leaks(
+            "GET /x?token=abc123secret&password=hunter2xyz"
+        )
+        self.assertTrue(any("url-query" in h for h in query_named), query_named)
+
+        nested = mod.scan_logs_for_leaks(
+            json.dumps({"outer": {"inner": {"note": tok, "auth": {"cookie": ck}}}}),
+            sentinels,
+        )
+        self.assertTrue(nested, nested)
+
+        nested_str = mod.scan_logs_for_leaks(
+            json.dumps({"payload": json.dumps({"token": tok})}),
+            sentinels,
+        )
+        self.assertTrue(nested_str, nested_str)
+
+        single = mod.scan_logs_for_leaks(
+            f"cfg = {{'password': '{pw}', 'token': '{tok}'}}",
+            sentinels,
+        )
+        self.assertTrue(
+            any("sentinel" in h or "single-quoted" in h for h in single),
+            single,
+        )
+        single_named = mod.scan_logs_for_leaks("auth={'cookie': 'cvalsecret'}")
+        self.assertTrue(any("single-quoted" in h for h in single_named), single_named)
+
         clean = mod.scan_logs_for_leaks(
-            '{"session_token":"[REDACTED]"} teach hub: paired role=worker page_state origin=https://example.com'
+            '{"session_token":"[REDACTED]"} teach hub: paired role=worker '
+            "page_state origin=https://example.com",
+            sentinels,
         )
         self.assertEqual(clean, [])
+
+    def test_inject_sentinel_secrets_fake_page(self):
+        from cloakcli_worker.teach_m1_smoke import inject_sentinel_secrets
+
+        class _Ctx:
+            def __init__(self) -> None:
+                self.cookies: list[dict] = []
+
+            def add_cookies(self, cookies: list[dict]) -> None:
+                self.cookies.extend(cookies)
+
+        class _Page:
+            def __init__(self) -> None:
+                self.context = _Ctx()
+                self.filled: dict[str, str] = {}
+                self.eval_arg = None
+
+            def fill(self, selector: str, value: str, **_kwargs: object) -> None:
+                self.filled[selector] = value
+
+            def evaluate(self, _script: str, arg: object = None) -> None:
+                self.eval_arg = arg
+
+        sentinels = {
+            "token": "m1sent_tok_unit_NEVER_LOG",
+            "password": "m1sent_pw_unit_NEVER_LOG",
+            "cookie": "m1sent_ck_unit_NEVER_LOG",
+        }
+        page = _Page()
+        self.assertTrue(
+            inject_sentinel_secrets(page, "http://127.0.0.1:9/", sentinels)
+        )
+        self.assertEqual(page.context.cookies[0]["value"], sentinels["cookie"])
+        self.assertEqual(page.filled["#pw"], sentinels["password"])
+        self.assertEqual(page.filled["#tok"], sentinels["token"])
+        self.assertEqual(page.eval_arg, sentinels)
+        self.assertFalse(
+            inject_sentinel_secrets(page, "http://127.0.0.1:9/", {})
+        )
 
     def test_pairing_reconnect_runtime(self):
         import shutil

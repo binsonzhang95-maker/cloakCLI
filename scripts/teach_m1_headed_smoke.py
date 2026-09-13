@@ -8,7 +8,8 @@ the real hub + MV3 extension + Python worker, then asserts:
 - page_state has url/origin/title/viewport/observation_id
 - deny origin: no content inject and no page_state
 - extension service-worker restart reconnects (no new session)
-- run logs contain no token/cookie/password values
+- known sentinel token/password/cookie values never appear in logs
+- field-name leak regex still flags unredacted secrets (defense-in-depth)
 
 Usage (from repo root):
 
@@ -28,27 +29,55 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import Any
+from urllib.parse import urlencode, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_PY = str(ROOT / "python")
+if _PY not in sys.path:
+    sys.path.insert(0, _PY)
+
+from cloakcli_worker.teach_m1_smoke import SENTINEL_ENV, make_smoke_sentinels  # noqa: E402
+
+SECRET_FIELDS = (
+    "session_token",
+    "token",
+    "cookie",
+    "cookies",
+    "password",
+    "passwd",
+    "secret",
+    "authorization",
+)
+_FIELD_ALT = "|".join(SECRET_FIELDS)
+_QUERY_KEYS = (
+    "session_token",
+    "token",
+    "access_token",
+    "password",
+    "passwd",
+    "cookie",
+    "authorization",
+    "secret",
+)
 
 LEAK_JSON = re.compile(
-    r'(?i)"(?:session_token|token|cookie|cookies|password|passwd|secret|authorization)"\s*:\s*"(?!\[REDACTED\]|\*{3})[^"]+"'
+    rf'(?i)"(?:{_FIELD_ALT})"\s*:\s*"(?!\[REDACTED\]|\*{{3}})[^"]+"'
+)
+LEAK_JSON_SINGLE = re.compile(
+    rf"(?i)'(?:{_FIELD_ALT})'\s*:\s*'(?!\[REDACTED\]|\*{{3}})[^']+'"
 )
 LEAK_ASSIGN = re.compile(
-    r"(?i)\b(?:password|passwd|cookie|authorization)\s*[:=]\s*(?!\[REDACTED\]|\*{3})(\S{4,})"
+    rf"(?i)\b(?:{_FIELD_ALT})\s*[:=]\s*(?!\[REDACTED\]|\*{{3}})(\S{{4,}})"
 )
-
-ALLOW_HTML = b"""<!doctype html>
-<html><head><title>M1 Allow</title></head>
-<body>
-  <h1>allow</h1>
-  <button id="go" type="button">Go</button>
-</body></html>
-"""
+LEAK_QUERY = re.compile(
+    rf"(?i)[?&](?:{'|'.join(_QUERY_KEYS)})=(?!\[REDACTED\]|\*{{3}})([^\s&#\"']{{4,}})"
+)
+_REDACTED_MARKERS = ("[REDACTED]", '"***"', "'***'", "=***")
 
 DENY_HTML = b"""<!doctype html>
 <html><head><title>M1 Deny</title></head>
@@ -58,13 +87,26 @@ DENY_HTML = b"""<!doctype html>
 
 class _Handler(BaseHTTPRequestHandler):
     page = b""
+    cookie_header = ""
 
     def do_GET(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        if path == "/probe":
+            # Query may carry sentinel secrets; never echo path or query.
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            if self.cookie_header:
+                self.send_header("Set-Cookie", self.cookie_header)
+            self.end_headers()
+            return
         body = self.page
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.cookie_header:
+            self.send_header("Set-Cookie", self.cookie_header)
         self.end_headers()
         self.wfile.write(body)
 
@@ -72,15 +114,51 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
-def _serve(html: bytes) -> tuple[ThreadingHTTPServer, str]:
+def _serve(html: bytes, set_cookie: str = "") -> tuple[ThreadingHTTPServer, str]:
     class H(_Handler):
         page = html
+        cookie_header = set_cookie
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     origin = f"http://127.0.0.1:{httpd.server_address[1]}"
     return httpd, origin
+
+
+def allow_html(sentinels: dict[str, str]) -> bytes:
+    """Allow-origin page that plants sentinels in nested JSON and a query href."""
+    nested = json.dumps(
+        {
+            "auth": {
+                "token": sentinels["token"],
+                "password": sentinels["password"],
+                "cookie": sentinels["cookie"],
+            }
+        },
+        separators=(",", ":"),
+    )
+    q = urlencode(
+        {
+            "token": sentinels["token"],
+            "password": sentinels["password"],
+            "cookie": sentinels["cookie"],
+        }
+    )
+    html = f"""<!doctype html>
+<html><head><title>M1 Allow</title></head>
+<body>
+  <h1>allow</h1>
+  <button id="go" type="button">Go</button>
+  <form id="login">
+    <input id="pw" name="password" type="password" autocomplete="current-password" />
+    <input id="tok" name="token" type="text" autocomplete="off" />
+  </form>
+  <a id="q" href="/probe?{q}">probe</a>
+  <script type="application/json" id="nested">{nested}</script>
+</body></html>
+"""
+    return html.encode("utf-8")
 
 
 def _has_display() -> bool:
@@ -131,15 +209,98 @@ def _ensure_profile(bin_path: Path, home: Path, name: str) -> None:
         raise SystemExit(f"profile create failed: {created.stdout}{created.stderr}")
 
 
-def scan_logs_for_leaks(text: str) -> list[str]:
+def _looks_redacted(snippet: str) -> bool:
+    return any(m in snippet for m in _REDACTED_MARKERS)
+
+
+def _clip(s: str, n: int = 160) -> str:
+    s = s.replace("\n", " ")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _secret_json_hits(obj: Any, sentinels: Iterable[str], path: str = "$") -> list[str]:
+    """Walk nested JSON (including JSON-in-string values) for leaks."""
     hits: list[str] = []
-    for m in LEAK_JSON.finditer(text):
-        snippet = m.group(0)
-        if "[REDACTED]" in snippet or '"***"' in snippet:
+    sentinel_list = [s for s in sentinels if s and len(s) >= 8]
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            child = f"{path}.{k}"
+            lk = str(k).lower()
+            if lk in SECRET_FIELDS and isinstance(v, str):
+                if v and v not in ("[REDACTED]", "***") and len(v) >= 4:
+                    shown = "***" if any(s in v for s in sentinel_list) else _clip(v, 24)
+                    hits.append(f"nested-json {child}={shown}")
+            hits.extend(_secret_json_hits(v, sentinel_list, child))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            hits.extend(_secret_json_hits(v, sentinel_list, f"{path}[{i}]"))
+    elif isinstance(obj, str):
+        s = obj.strip()
+        if s[:1] in "{[":
+            try:
+                hits.extend(_secret_json_hits(json.loads(s), sentinel_list, path + "(json)"))
+            except json.JSONDecodeError:
+                pass
+        for sent in sentinel_list:
+            if sent in obj:
+                hits.append(f"nested-json-string {path}: {_clip(obj.replace(sent, '***'))}")
+    return hits
+
+
+def scan_logs_for_leaks(text: str, sentinels: Iterable[str] | None = None) -> list[str]:
+    """Fail closed on secret leakage in hub/worker/extension logs.
+
+    1. Raw substring match for planted sentinel values (bare secrets).
+    2. Field-name regex (double-quoted JSON, single-quoted, assignments).
+    3. URL query (`?token=`, `password=`, `cookie=`).
+    4. Nested JSON objects and JSON-in-string values.
+    """
+    hits: list[str] = []
+    seen: set[str] = set()
+
+    def add(msg: str) -> None:
+        if msg not in seen:
+            seen.add(msg)
+            hits.append(msg)
+
+    sentinel_list = [s for s in (sentinels or ()) if s and len(s) >= 8]
+    for raw in sentinel_list:
+        start = 0
+        while True:
+            i = text.find(raw, start)
+            if i < 0:
+                break
+            lo = max(0, i - 40)
+            hi = min(len(text), i + len(raw) + 40)
+            snippet = text[lo:hi].replace(raw, "***")
+            add(f"sentinel substring: {_clip(snippet)}")
+            start = i + len(raw)
+
+    for rx, label in (
+        (LEAK_JSON, "json-field"),
+        (LEAK_JSON_SINGLE, "single-quoted-field"),
+        (LEAK_ASSIGN, "assign"),
+        (LEAK_QUERY, "url-query"),
+    ):
+        for m in rx.finditer(text):
+            snippet = m.group(0)
+            if _looks_redacted(snippet):
+                continue
+            for raw in sentinel_list:
+                if raw in snippet:
+                    snippet = snippet.replace(raw, "***")
+            add(f"{label}: {_clip(snippet)}")
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped[0] not in "{[":
             continue
-        hits.append(snippet[:160])
-    for m in LEAK_ASSIGN.finditer(text):
-        hits.append(m.group(0)[:160])
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        for item in _secret_json_hits(obj, sentinel_list):
+            add(item)
     return hits
 
 
@@ -176,7 +337,11 @@ def main() -> int:
         return 2
 
     bin_path = _bin()
-    allow_httpd, allow_origin = _serve(ALLOW_HTML)
+    sentinels = make_smoke_sentinels()
+    allow_httpd, allow_origin = _serve(
+        allow_html(sentinels),
+        set_cookie=f"m1_sentinel={sentinels['cookie']}; Path=/; HttpOnly",
+    )
     deny_httpd, deny_origin = _serve(DENY_HTML)
     allow_url = allow_origin + "/"
     deny_url = deny_origin + "/"
@@ -193,6 +358,9 @@ def main() -> int:
     env["CLOAKCLI_TEACH_SMOKE_DENY_URL"] = deny_url
     env["CLOAKCLI_TEACH_HUB_EVENTS"] = str(events_path)
     env["CLOAKCLI_TEACH_SMOKE_SECONDS"] = os.environ.get("CLOAKCLI_TEACH_SMOKE_SECONDS", "90")
+    env[SENTINEL_ENV["token"]] = sentinels["token"]
+    env[SENTINEL_ENV["password"]] = sentinels["password"]
+    env[SENTINEL_ENV["cookie"]] = sentinels["cookie"]
     env["PYTHONUNBUFFERED"] = "1"
     pp = str(ROOT / "python")
     if env.get("PYTHONPATH"):
@@ -285,6 +453,8 @@ def main() -> int:
             failures.append("extension service worker was not stopped")
         if not smoke_json.get("injected_allow_after_sw"):
             failures.append("content script not injected after SW restart")
+        if not smoke_json.get("sentinels_injected"):
+            failures.append("sentinel secrets were not injected into the headed session")
 
     roles = {e.get("data", {}).get("role") for e in events if e.get("event") == "paired"}
     if "extension" not in roles:
@@ -352,9 +522,9 @@ def main() -> int:
     leak_text = output
     if events_path.is_file():
         leak_text += "\n" + events_path.read_text(encoding="utf-8")
-    leaks = scan_logs_for_leaks(leak_text)
+    leaks = scan_logs_for_leaks(leak_text, sentinels=list(sentinels.values()))
     if leaks:
-        failures.append("secret leakage in logs: " + "; ".join(leaks[:5]))
+        failures.append("secret leakage in logs: " + "; ".join(leaks[:8]))
 
     print("== hub events ==", flush=True)
     for e in events:

@@ -2,6 +2,7 @@
 
 Driven by CLOAKCLI_TEACH_M1_SMOKE=1 (see scripts/e2e-teach-m1-smoke.sh).
 Does not log session tokens, cookies, or passwords.
+Plants known sentinel secrets so the orchestrator can substring-scan logs.
 """
 
 from __future__ import annotations
@@ -9,9 +10,93 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 from typing import Any
 
 from .teach_hub import TeachHubClient
+
+# Env keys used to plant fake secrets for the headed log scan. Values must
+# never be printed, returned in TEACH_M1_SMOKE_JSON, or written to hub events.
+SENTINEL_ENV = {
+    "token": "CLOAKCLI_TEACH_SMOKE_SENTINEL_TOKEN",
+    "password": "CLOAKCLI_TEACH_SMOKE_SENTINEL_PASSWORD",
+    "cookie": "CLOAKCLI_TEACH_SMOKE_SENTINEL_COOKIE",
+}
+
+
+def make_smoke_sentinels() -> dict[str, str]:
+    """Per-run fake token/password/cookie values. Unique so source is not a hit."""
+    nonce = uuid.uuid4().hex
+    return {
+        "token": f"m1sent_tok_{nonce}_NEVER_LOG",
+        "password": f"m1sent_pw_{nonce}_NEVER_LOG",
+        "cookie": f"m1sent_ck_{nonce}_NEVER_LOG",
+    }
+
+
+def sentinels_from_env() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for kind, key in SENTINEL_ENV.items():
+        val = os.environ.get(key, "").strip()
+        if val:
+            out[kind] = val
+    return out
+
+
+def inject_sentinel_secrets(
+    page: Any,
+    allow_url: str,
+    sentinels: dict[str, str] | None = None,
+) -> bool:
+    """Plant token/password/cookie sentinels into the headed session.
+
+    Covers cookies, password/token fields, nested JS objects, and a URL-query
+    fetch (`?token=&password=&cookie=`). Never logs the values.
+    """
+    sentinels = sentinels or sentinels_from_env()
+    token = (sentinels.get("token") or "").strip()
+    password = (sentinels.get("password") or "").strip()
+    cookie = (sentinels.get("cookie") or "").strip()
+    if not token or not password or not cookie:
+        return False
+    planted = 0
+    try:
+        page.context.add_cookies(
+            [{"name": "m1_sentinel", "value": cookie, "url": allow_url}]
+        )
+        planted += 1
+    except Exception:
+        pass
+    try:
+        page.fill("#pw", password, timeout=5000)
+        planted += 1
+    except Exception:
+        pass
+    try:
+        page.fill("#tok", token, timeout=5000)
+        planted += 1
+    except Exception:
+        pass
+    try:
+        page.evaluate(
+            """async (s) => {
+                window.__m1Sentinel = {
+                  nested: { token: s.token, password: s.password, cookie: s.cookie }
+                };
+                const q = new URLSearchParams({
+                  token: s.token,
+                  password: s.password,
+                  cookie: s.cookie,
+                });
+                await fetch("/probe?" + q.toString(), { credentials: "include" });
+                return true;
+            }""",
+            {"token": token, "password": password, "cookie": cookie},
+        )
+        planted += 1
+    except Exception:
+        pass
+    return planted >= 4
 
 
 def run_headed_smoke(ctx: Any, page: Any, allow_url: str | None, hub_client: TeachHubClient | None) -> dict[str, Any]:
@@ -24,6 +109,7 @@ def run_headed_smoke(ctx: Any, page: Any, allow_url: str | None, hub_client: Tea
         "injected_deny": True,  # fail closed until proven false
         "sw_stopped": False,
         "injected_allow_after_sw": False,
+        "sentinels_injected": False,
         "session_id": "",
         "error": "",
     }
@@ -52,6 +138,7 @@ def run_headed_smoke(ctx: Any, page: Any, allow_url: str | None, hub_client: Tea
         time.sleep(1.0)
         _goto(page, allow_url)
         result["injected_allow"] = _wait_injected(page, True, timeout=12.0)
+        planted = inject_sentinel_secrets(page, allow_url)
 
         _goto(page, deny_url)
         # New document: injected flag must stay false (content.js never loaded).
@@ -70,6 +157,8 @@ def run_headed_smoke(ctx: Any, page: Any, allow_url: str | None, hub_client: Tea
         # SW is alive again; reload so inject/page_state run on this document.
         _goto(page, allow_url)
         result["injected_allow_after_sw"] = _wait_injected(page, True, timeout=12.0)
+        planted_after = inject_sentinel_secrets(page, allow_url)
+        result["sentinels_injected"] = bool(planted and planted_after)
         time.sleep(2.0)
     except Exception as e:
         result["error"] = type(e).__name__
@@ -83,6 +172,7 @@ def run_headed_smoke(ctx: Any, page: Any, allow_url: str | None, hub_client: Tea
         and not result["injected_deny"]
         and result["sw_stopped"]
         and result["injected_allow_after_sw"]
+        and result["sentinels_injected"]
         and result["session_id"]
     )
     if not result["ok"] and not result["error"]:

@@ -7,7 +7,8 @@
 #   - non-allowlist origin: no content inject, no page_state
 #   - extension service-worker restart reuses the same session
 #   - worker reconnect + duplicate pairing rejection
-#   - run logs scanned for token / cookie / password leakage
+#   - run logs scanned for planted sentinel secrets (raw substring) plus
+#     field-name / URL-query / nested JSON / single-quoted leak patterns
 #
 # Requires: cargo-built cloakcli, CloakBrowser Chromium, DISPLAY or xvfb.
 #

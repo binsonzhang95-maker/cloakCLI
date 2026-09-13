@@ -174,7 +174,7 @@ Fixture round-trip: `fixtures/teach/recorded-events.json` → `fixtures/teach/ex
 
 ### Teach Chat M1 headed smoke
 
-Repeatable headed CloakBrowser acceptance for pairing, `page_state`, allowlist inject, service-worker restart, worker reconnect, duplicate pairing, and log leak scan:
+Repeatable headed CloakBrowser acceptance for pairing, `page_state`, allowlist inject, service-worker restart, worker reconnect, duplicate pairing, and log leak scan (planted sentinel token/password/cookie values must not appear as raw substrings; field-name / URL-query / nested JSON checks stay as defense-in-depth):
 
 ```bash
 ./scripts/e2e-teach-m1-smoke.sh

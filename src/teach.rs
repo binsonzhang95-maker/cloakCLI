@@ -452,6 +452,9 @@ async fn run_browser(
         "CLOAKCLI_TEACH_SMOKE_SECONDS",
         "CLOAKCLI_TEACH_M1_SMOKE",
         "CLOAKCLI_TEACH_SMOKE_DENY_URL",
+        "CLOAKCLI_TEACH_SMOKE_SENTINEL_TOKEN",
+        "CLOAKCLI_TEACH_SMOKE_SENTINEL_PASSWORD",
+        "CLOAKCLI_TEACH_SMOKE_SENTINEL_COOKIE",
     ] {
         if let Ok(v) = std::env::var(key) {
             if !v.is_empty() {
