@@ -767,6 +767,72 @@ fn redact_prefix_ci(s: &str, prefix: &str) -> String {
     out
 }
 
+/// Structured redaction for action events written to the hub timeline / TUI.
+/// Fill/type plaintext is replaced with `[REDACTED]` plus `text_len`, unless the
+/// value is already a `{{vars.NAME}}` placeholder. Canonical field is `selector`;
+/// `css` is dropped from objects that have an `action` key (read-compat only).
+pub fn is_var_placeholder(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with("{{vars.") && t.ends_with("}}") && t.len() <= 80 && !t.contains('\n')
+}
+
+pub fn redact_action_payload(data: &Value) -> Value {
+    let mut v = data.clone();
+    redact_action_payload_in_place(&mut v);
+    v
+}
+
+fn redact_secret_field(map: &mut serde_json::Map<String, Value>, key: &str) {
+    let Some(Value::String(s)) = map.get(key) else {
+        return;
+    };
+    let s = s.clone();
+    if is_var_placeholder(&s) {
+        return;
+    }
+    let len = s.len();
+    map.insert(key.to_string(), json!("[REDACTED]"));
+    if key == "text" {
+        map.entry("text_len".to_string()).or_insert(json!(len));
+    }
+}
+
+fn redact_action_payload_in_place(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            let atype = map
+                .get("action")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if atype == "fill" || atype == "type" {
+                redact_secret_field(map, "text");
+                redact_secret_field(map, "value");
+            }
+            if atype == "select" {
+                redact_secret_field(map, "value");
+                redact_secret_field(map, "text");
+            }
+            if !atype.is_empty() {
+                if map.contains_key("selector") {
+                    map.remove("css");
+                } else if let Some(css) = map.remove("css") {
+                    map.insert("selector".into(), css);
+                }
+            }
+            for (_, child) in map.iter_mut() {
+                redact_action_payload_in_place(child);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr {
+                redact_action_payload_in_place(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn pairing_offer_data(pairing_id: &str, code: &str, expires_at: &str) -> Value {
     json!({
         "pairing_id": pairing_id,
@@ -920,6 +986,30 @@ mod tests {
         assert!(u.contains("q=1"));
         assert!(sanitize_page_url("javascript:alert(1)").is_err());
         assert!(sanitize_page_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn redact_action_payload_strips_fill_text_and_css() {
+        let raw = json!({
+            "actions": [{
+                "action": "fill",
+                "selector": "#pw",
+                "css": "#pw",
+                "text": "super-secret-password"
+            }]
+        });
+        let red = redact_action_payload(&raw);
+        let a = &red["actions"][0];
+        assert_eq!(a["text"], "[REDACTED]");
+        assert_eq!(a["text_len"], 21);
+        assert_eq!(a["selector"], "#pw");
+        assert!(a.get("css").is_none(), "{a}");
+        let blob = red.to_string();
+        assert!(!blob.contains("super-secret-password"), "{blob}");
+
+        let placeholder = json!({"action":"fill","selector":"#pw","text":"{{vars.PASSWORD}}"});
+        let p = redact_action_payload(&placeholder);
+        assert_eq!(p["text"], "{{vars.PASSWORD}}");
     }
 
     #[test]

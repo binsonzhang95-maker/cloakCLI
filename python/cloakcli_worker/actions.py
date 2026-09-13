@@ -107,6 +107,10 @@ class ActionError(ValueError):
     """Illegal or malformed action."""
 
 
+class ActionCancelled(Exception):
+    """In-flight action aborted by Ctrl-C / hub cancel."""
+
+
 @dataclass
 class Action:
     type: str
@@ -136,10 +140,14 @@ class Action:
         self.selector = value
 
     def public_dict(self) -> dict[str, Any]:
+        """Canonical event payload. `selector` only (`css` is read-compat).
+
+        fill/type plaintext is never included: `[REDACTED]` + `text_len`, or a
+        `{{vars.NAME}}` placeholder.
+        """
         d: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "action": self.type}
         if self.selector:
             d["selector"] = self.selector
-            d["css"] = self.selector
         if self.x is not None:
             d["x"] = self.x
         if self.y is not None:
@@ -149,7 +157,14 @@ class Action:
         if self.observation_id:
             d["observation_id"] = self.observation_id
         if self.text is not None:
-            d["text"] = _redact_text_for_log(self.text)
+            if self.type in ("fill", "type"):
+                if _is_var_placeholder(self.text):
+                    d["text"] = self.text
+                else:
+                    d["text"] = "[REDACTED]"
+                    d["text_len"] = len(self.text)
+            else:
+                d["text"] = _redact_text_for_log(self.text)
         if self.type == "scroll":
             d["delta_x"] = self.delta_x
             d["delta_y"] = self.delta_y
@@ -160,7 +175,10 @@ class Action:
         if self.key:
             d["key"] = self.key
         if self.value is not None:
-            d["value"] = _redact_text_for_log(self.value)
+            if self.type in ("fill", "type"):
+                d["value"] = "[REDACTED]" if not _is_var_placeholder(self.value) else self.value
+            else:
+                d["value"] = _redact_text_for_log(self.value)
         if self.reason:
             d["reason"] = self.reason[:MAX_REASON_LEN]
         if self.source:
@@ -421,7 +439,11 @@ def goto_risk(
     allow_origins: list[str] | None,
     current_origin: str | None = None,
 ) -> tuple[str, str]:
-    """Return (ok|reject|needs_confirm, reason) for a goto URL."""
+    """Return (ok|reject|needs_confirm, reason) for a goto URL.
+
+    User policy: any http(s) goto is allowed. Allowlist / cross-origin must
+    not reject or force confirm. Dangerous schemes are still rejected.
+    """
     try:
         _reject_dangerous_url(url)
     except ActionError as e:
@@ -429,13 +451,9 @@ def goto_risk(
     dest = origin_of_url(url)
     if not dest:
         return "reject", "could not parse origin"
-    allow = [o.rstrip("/") for o in (allow_origins or []) if o]
-    if dest not in allow:
-        return "reject", "origin not in allowlist"
-    cur = (current_origin or "").rstrip("/")
-    if cur and dest != cur:
-        return "needs_confirm", "cross-origin navigation requires confirmation"
-    return "ok", "allowlist"
+    # allow_origins / current_origin are intentionally unused for blocking.
+    _ = (allow_origins, current_origin, dest)
+    return "ok", "http(s)"
 
 
 def execute_action(
@@ -470,6 +488,13 @@ def execute_action(
                 status="ask_human", reason=action.reason, action=action.public_dict()
             )
 
+        unsafe = _reject_unsafe_current_page(page, action, current_origin)
+        if unsafe is not None:
+            return unsafe
+
+        def _pw(fn: Callable[[], Any]) -> Any:
+            return _playwright_call(fn, cancel_check)
+
         if action.type == "goto":
             risk, reason = goto_risk(
                 action.url or "",
@@ -489,7 +514,7 @@ def execute_action(
                 )
             if cancel_check and cancel_check():
                 return ActionOutcome(status="cancelled", reason="cancelled", action=action.public_dict())
-            page.goto(action.url, wait_until="domcontentloaded", timeout=timeout)
+            _pw(lambda: page.goto(action.url, wait_until="domcontentloaded", timeout=timeout))
             return ActionOutcome(
                 status="ok",
                 reason=f"ok goto {origin_of_url(action.url)}",
@@ -499,7 +524,7 @@ def execute_action(
 
         if action.type == "click":
             if action.selector:
-                page.click(action.selector, timeout=timeout)
+                _pw(lambda: page.click(action.selector, timeout=timeout))
             else:
                 x, y = action.x, action.y
                 if x is None or y is None:
@@ -508,7 +533,7 @@ def execute_action(
                         reason="click requires selector or x/y",
                         action=action.public_dict(),
                     )
-                page.mouse.click(x, y)
+                _pw(lambda: page.mouse.click(x, y))
             return ActionOutcome(
                 status="ok",
                 reason="ok click",
@@ -518,7 +543,7 @@ def execute_action(
 
         if action.type == "press":
             key = action.key or "Enter"
-            page.keyboard.press(key)
+            _pw(lambda: page.keyboard.press(key))
             return ActionOutcome(
                 status="ok",
                 reason=f"ok press {key}",
@@ -533,9 +558,9 @@ def execute_action(
                 )
             value = action.value if action.value is not None else (action.text or "")
             if hasattr(page, "select_option"):
-                page.select_option(action.selector, value, timeout=timeout)
+                _pw(lambda: page.select_option(action.selector, value, timeout=timeout))
             else:
-                page.fill(action.selector, value, timeout=timeout)
+                _pw(lambda: page.fill(action.selector, value, timeout=timeout))
             return ActionOutcome(
                 status="ok",
                 reason="ok select",
@@ -547,28 +572,25 @@ def execute_action(
             text = action.text or ""
             if action.selector:
                 if action.type == "fill":
-                    page.fill(action.selector, text, timeout=timeout)
+                    _pw(lambda: page.fill(action.selector, text, timeout=timeout))
                 else:
-                    page.click(action.selector, timeout=timeout)
-                    page.keyboard.type(text, delay=20)
+                    _pw(lambda: page.click(action.selector, timeout=timeout))
+                    _pw(lambda: page.keyboard.type(text, delay=20))
             else:
-                page.keyboard.type(text, delay=20)
-            logged = dict(action.public_dict())
-            logged["text"] = "[REDACTED]"
-            logged["text_len"] = len(text)
+                _pw(lambda: page.keyboard.type(text, delay=20))
             return ActionOutcome(
                 status="ok",
                 reason=f"ok {action.type}",
-                action=logged,
+                action=action.public_dict(),
                 page=_page_snapshot(page),
             )
 
         if action.type == "scroll":
             if action.selector:
                 loc = page.locator(action.selector).first
-                loc.scroll_into_view_if_needed(timeout=timeout)
+                _pw(lambda: loc.scroll_into_view_if_needed(timeout=timeout))
             else:
-                page.mouse.wheel(action.delta_x, action.delta_y)
+                _pw(lambda: page.mouse.wheel(action.delta_x, action.delta_y))
             return ActionOutcome(
                 status="ok",
                 reason="ok scroll",
@@ -587,10 +609,10 @@ def execute_action(
                             action=action.public_dict(),
                         )
                     chunk = min(100, remaining)
-                    page.wait_for_timeout(chunk)
+                    _pw(lambda c=chunk: page.wait_for_timeout(c))
                     remaining -= chunk
             else:
-                page.wait_for_timeout(int(action.ms))
+                _pw(lambda: page.wait_for_timeout(int(action.ms)))
             return ActionOutcome(
                 status="ok",
                 reason=f"ok wait {action.ms}ms",
@@ -603,10 +625,17 @@ def execute_action(
             reason=f"unknown action {action.type}",
             action=action.public_dict(),
         )
+    except ActionCancelled:
+        return ActionOutcome(status="cancelled", reason="cancelled", action=action.public_dict())
     except ActionError as e:
         return ActionOutcome(status="rejected", reason=str(e), action=action.public_dict())
     except Exception as e:
+        if cancel_check and cancel_check():
+            return ActionOutcome(status="cancelled", reason="cancelled", action=action.public_dict())
         name = type(e).__name__
+        low = name.lower() + " " + str(e).lower()
+        if "cancel" in low:
+            return ActionOutcome(status="cancelled", reason="cancelled", action=action.public_dict())
         return ActionOutcome(
             status="rejected",
             reason=redact_text(f"action {action.type} error: {name}"),
@@ -777,6 +806,95 @@ def _redact_text_for_log(text: str) -> str:
     if len(text) > 80:
         text = text[:77] + "..."
     return redact_text(text)
+
+
+def _is_var_placeholder(text: str) -> bool:
+    t = (text or "").strip()
+    return t.startswith("{{vars.") and t.endswith("}}") and len(t) <= 80 and "\n" not in t
+
+
+_PAGE_MUTATING = {"click", "fill", "type", "scroll", "press", "select"}
+
+
+def _reject_unsafe_current_page(
+    page: Any,
+    action: Action,
+    current_origin: str | None,
+) -> ActionOutcome | None:
+    """Non-goto page actions may refuse non-http(s) pages.
+
+    Origin allowlist is never applied here and must never block `goto`.
+    """
+    if action.type == "goto" or action.type not in _PAGE_MUTATING:
+        return None
+    url = ""
+    try:
+        url = str(getattr(page, "url", "") or "")
+    except Exception:
+        url = ""
+    if not url and current_origin:
+        url = current_origin
+    if not url:
+        return None
+    low = url.strip().lower()
+    for scheme in ("javascript:", "file:", "data:", "vbscript:", "blob:"):
+        if low.startswith(scheme):
+            return ActionOutcome(
+                status="rejected",
+                reason=f"page scheme blocked: {scheme.rstrip(':')}",
+                action=action.public_dict(),
+            )
+    return None
+
+
+def _playwright_call(fn: Callable[[], Any], cancel_check: Callable[[], bool] | None) -> Any:
+    if cancel_check and cancel_check():
+        raise ActionCancelled()
+    try:
+        return fn()
+    except ActionCancelled:
+        raise
+    except Exception:
+        if cancel_check and cancel_check():
+            raise ActionCancelled()
+        raise
+
+
+def interrupt_playwright(page: Any) -> None:
+    """Best-effort abort of an in-flight Playwright sync call.
+
+    Safe to call from the hub recv thread. FakePage exposes `.interrupt()`.
+    Real Playwright: cancel pending asyncio tasks on the driver's loop via
+    `call_soon_threadsafe` (the sync API is bound to its dispatcher fiber).
+    """
+    fn = getattr(page, "interrupt", None)
+    if callable(fn):
+        try:
+            fn()
+        except Exception:
+            pass
+        return
+    impl = getattr(page, "_impl_obj", None)
+    if impl is None:
+        return
+    loop = getattr(impl, "_loop", None)
+    if loop is None:
+        return
+
+    def _cancel_pending() -> None:
+        try:
+            import asyncio
+
+            for task in asyncio.all_tasks(loop):
+                if not task.done():
+                    task.cancel()
+        except Exception:
+            pass
+
+    try:
+        loop.call_soon_threadsafe(_cancel_pending)
+    except Exception:
+        pass
 
 
 def _page_origin(page: Any) -> str | None:

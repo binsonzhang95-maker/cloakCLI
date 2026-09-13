@@ -19,11 +19,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::teach_chat::{
-    apply_plan, execute_planned, live_llm_from_root, mock_llm_from_env, plan_turn, run_llm_turn,
-    stub_shortcut, ChatSession, MockLlm, PageBrief, PlannedTurn, TeachLlm,
+    apply_plan, await_cancellable, execute_planned, live_llm_from_root, mock_llm_from_env, plan_turn,
+    run_llm_turn, stub_shortcut, ChatSession, MockLlm, PageBrief, PlannedTurn, TeachLlm,
 };
 use crate::teach_hub::TeachHubHandle;
 use crate::teach_protocol::TeachMachine;
+use uuid::Uuid;
 
 const BG: Color = Color::Rgb(22, 22, 24);
 const FG: Color = Color::Rgb(230, 230, 230);
@@ -454,6 +455,7 @@ async fn dedicated_loop(
         }
         match cmd {
             ChatCmd::Send => {
+                session.cancel.store(false, Ordering::SeqCst);
                 let allow = hub.allow_origins().await;
                 let planned = if let Some(m) = mock {
                     let goal = session.input.clone();
@@ -461,12 +463,25 @@ async fn dedicated_loop(
                     session.input.clear();
                     plan_turn(&m.text, &allow, Some(session.page_origin.as_str()).filter(|s| !s.is_empty()))
                 } else if let Some(llm) = live {
-                    live_send(session, llm, &allow).await?
+                    let cancel = session.cancel.clone();
+                    await_cancellable(
+                        &cancel,
+                        live_send(session, llm, &allow),
+                        poll_ctrl_c,
+                    )
+                    .await?
                 } else {
                     session.push_system("no LLM configured and no --mock-json / CLOAKCLI_TEACH_CHAT_MOCK");
                     session.phase = TeachMachine::Chat;
                     continue;
                 };
+                if session.cancel.load(Ordering::SeqCst) {
+                    session.phase = TeachMachine::Chat;
+                    session.status = "cancelled".into();
+                    session.push_system("cancelled in-flight action");
+                    pending = None;
+                    continue;
+                }
                 if mock.is_some() {
                     apply_plan(session, &planned);
                 }
@@ -507,7 +522,19 @@ async fn dispatch_now(
         t.status = "running".into();
     }
     session.cancel.store(false, Ordering::SeqCst);
-    match execute_planned(hub, planned, &session.cancel, confirmed).await {
+    let request_id = planned
+        .needs_confirm
+        .as_ref()
+        .map(|c| c.request_id.clone())
+        .unwrap_or_else(|| format!("req-{}", Uuid::new_v4()));
+    session.last_request_id = Some(request_id.clone());
+    let cancel = session.cancel.clone();
+    match await_cancellable(
+        &cancel,
+        execute_planned(hub, planned, &cancel, confirmed, Some(&request_id)),
+        poll_ctrl_c,
+    )
+    .await {
         Ok(v) => {
             let cancelled = v.get("cancelled").and_then(|x| x.as_bool()).unwrap_or(false);
             if cancelled {
@@ -551,6 +578,22 @@ fn apply_results(session: &mut ChatSession, data: &serde_json::Value) {
             }
         }
         session.push_system(&format!("results: {} step(s)", arr.len()));
+    }
+}
+
+/// Non-blocking-ish Ctrl-C poll for in-flight live_send / dispatch.
+/// Must not wait long: this is called from `await_cancellable` ticks.
+fn poll_ctrl_c() -> bool {
+    if !event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        return false;
+    }
+    match event::read() {
+        Ok(Event::Key(key)) => {
+            key.kind == KeyEventKind::Press
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+        }
+        _ => false,
     }
 }
 
@@ -609,5 +652,11 @@ mod tests {
         assert!(!apply_cmd_local(&mut s, ChatCmd::Cancel));
         assert!(s.ctrl_c_armed);
         assert!(apply_cmd_local(&mut s, ChatCmd::Cancel));
+    }
+
+    #[test]
+    fn poll_ctrl_c_ignores_idle_terminal() {
+        // No event queued in tests; must not panic or report a hit.
+        assert!(!poll_ctrl_c());
     }
 }

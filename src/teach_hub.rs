@@ -20,10 +20,10 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::teach_protocol::{
-    self, pairing_accept_from_data, pairing_offer_data, redact_for_log, ClientRole, Envelope,
-    PageState, ProtocolError, TeachMachine, MAX_MESSAGE_BYTES, MAX_PAIRING_FAILURES,
-    TYPE_ACTION_REQUEST, TYPE_ACTION_RESULT, TYPE_CANCEL, TYPE_HEARTBEAT, TYPE_PAGE_STATE,
-    TYPE_PAIRING_OFFER, TYPE_PAIRING_RESULT,
+    self, pairing_accept_from_data, pairing_offer_data, redact_action_payload, redact_for_log,
+    ClientRole, Envelope, PageState, ProtocolError, TeachMachine, MAX_MESSAGE_BYTES,
+    MAX_PAIRING_FAILURES, TYPE_ACTION_REQUEST, TYPE_ACTION_RESULT, TYPE_CANCEL, TYPE_HEARTBEAT,
+    TYPE_PAGE_STATE, TYPE_PAIRING_OFFER, TYPE_PAIRING_RESULT,
 };
 
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
@@ -146,7 +146,8 @@ impl TeachHubHandle {
     }
 
     /// Send validated actions to the paired worker. Raw model text must already
-    /// have been parsed; this method only forwards schema JSON.
+    /// have been parsed; this method re-validates every action with the unified
+    /// Rust schema before forwarding. Timeline stores a redacted copy only.
     pub async fn dispatch_action_request(
         &self,
         request_id: &str,
@@ -159,6 +160,15 @@ impl TeachHubHandle {
         if actions.len() > 3 {
             anyhow::bail!("too many actions (max 3)");
         }
+        let mut validated = Vec::with_capacity(actions.len());
+        for (i, raw) in actions.iter().enumerate() {
+            match crate::teach_chat::validate_action(raw) {
+                Ok(a) => validated.push(a),
+                Err(e) => anyhow::bail!("hub re-validate actions[{i}]: {e}"),
+            }
+        }
+        let wire_actions: Vec<Value> = validated.iter().map(|a| a.to_value()).collect();
+        let timeline_actions: Vec<Value> = validated.iter().map(|a| a.to_event_value()).collect();
         let (tx, rx) = oneshot::channel();
         let mut g = self.inner.write().await;
         if g.executor_paused {
@@ -175,23 +185,35 @@ impl TeachHubHandle {
                 "title": p.title,
             })
         });
-        let env = Envelope::new(TYPE_ACTION_REQUEST)
-            .with_session(&g.session.session_id)
+        let allow_origins = g.session.allow_origins.clone();
+        let session_id = g.session.session_id.clone();
+        let machine = g.machine.as_str().to_string();
+        let meta = json!({
+            "schema_version": 1,
+            "allow_origins": allow_origins,
+            "confirmed": confirmed,
+            "page": page,
+            "state": machine,
+            "origin": "llm",
+            "event": "action_request",
+        });
+        let mut wire_data = meta.clone();
+        wire_data["actions"] = json!(wire_actions);
+        let mut timeline_data = meta;
+        timeline_data["actions"] = json!(timeline_actions);
+        let env_wire = Envelope::new(TYPE_ACTION_REQUEST)
+            .with_session(&session_id)
             .with_request(request_id)
             .with_seq(seq)
-            .with_data(json!({
-                "schema_version": 1,
-                "actions": actions,
-                "allow_origins": g.session.allow_origins,
-                "confirmed": confirmed,
-                "page": page,
-                "state": g.machine.as_str(),
-                "origin": "llm",
-                "event": "action_request",
-            }));
+            .with_data(wire_data);
+        let env_timeline = Envelope::new(TYPE_ACTION_REQUEST)
+            .with_session(&session_id)
+            .with_request(request_id)
+            .with_seq(seq)
+            .with_data(timeline_data);
         g.timeline.push(StoredEvent {
             seq,
-            env: env.clone(),
+            env: env_timeline,
         });
         trim_timeline(&mut g.timeline);
         let worker = g.outbound.get(&ClientRole::Worker).cloned();
@@ -201,7 +223,7 @@ impl TeachHubHandle {
             json!({
                 "request_id": request_id,
                 "seq": seq,
-                "n": actions.len(),
+                "n": validated.len(),
             }),
         );
         let Some(worker) = worker else {
@@ -215,7 +237,7 @@ impl TeachHubHandle {
             anyhow::bail!("worker not connected");
         };
         worker
-            .send(env)
+            .send(env_wire)
             .map_err(|_| anyhow::anyhow!("worker outbound closed"))?;
         Ok(rx)
     }
@@ -1170,7 +1192,7 @@ async fn handle_action_result(
     let mut stored = Envelope::new(TYPE_ACTION_RESULT)
         .with_session(&g.session.session_id)
         .with_seq(seq)
-        .with_data(env.data.clone());
+        .with_data(redact_action_payload(&env.data));
     if let Some(id) = env.request_id.as_deref() {
         stored = stored.with_request(id);
     }
@@ -2003,5 +2025,109 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("executor_paused"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn hub_revalidates_every_action_before_dispatch() {
+        let hub = spawn(TeachHubOpts {
+            allow_origins: vec!["https://example.com".into()],
+        })
+        .await
+        .unwrap();
+        let mut wrk = jsonl_client(hub.addr).await;
+        send_line(
+            &mut wrk,
+            &accept_env(hub.pairing_code(), hub.pairing_id(), "worker", "n-reval"),
+        )
+        .await;
+        let _ = read_env(&mut wrk).await;
+
+        let err = hub
+            .dispatch_action_request(
+                "req-shell",
+                vec![json!({"action":"shell","cmd":"id"})],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("re-validate") || err.to_string().contains("forbidden"),
+            "{err}"
+        );
+        let err = hub
+            .dispatch_action_request(
+                "req-js",
+                vec![json!({"action":"goto","url":"javascript:alert(1)"})],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("javascript") || err.to_string().contains("re-validate"), "{err}");
+        let snap = hub.timeline_snapshot().await;
+        assert!(
+            !snap.iter().any(|e| e["type"] == "action_request"),
+            "rejected actions must not be stored on the timeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeline_redacts_fill_text_any_https_goto_ok() {
+        let hub = spawn(TeachHubOpts {
+            allow_origins: vec!["https://example.com".into()],
+        })
+        .await
+        .unwrap();
+        let mut wrk = jsonl_client(hub.addr).await;
+        send_line(
+            &mut wrk,
+            &accept_env(hub.pairing_code(), hub.pairing_id(), "worker", "n-redact"),
+        )
+        .await;
+        let _ = read_env(&mut wrk).await;
+
+        let rx = hub
+            .dispatch_action_request(
+                "req-fill",
+                vec![json!({
+                    "action": "fill",
+                    "selector": "#pw",
+                    "css": "#legacy",
+                    "text": "super-secret-password"
+                })],
+                false,
+            )
+            .await
+            .unwrap();
+        let req = read_env(&mut wrk).await;
+        assert_eq!(req.msg_type, TYPE_ACTION_REQUEST);
+        // Worker still receives plaintext so fill can execute.
+        assert_eq!(req.data["actions"][0]["text"], "super-secret-password");
+        let snap = hub.timeline_snapshot().await;
+        let stored = snap
+            .iter()
+            .find(|e| e["type"] == "action_request")
+            .expect("action_request on timeline");
+        let blob = stored.to_string();
+        assert!(!blob.contains("super-secret-password"), "{blob}");
+        assert_eq!(stored["data"]["actions"][0]["text"], "[REDACTED]");
+        assert_eq!(stored["data"]["actions"][0]["selector"], "#pw");
+        assert!(stored["data"]["actions"][0].get("css").is_none());
+        drop(rx);
+
+        let rx2 = hub
+            .dispatch_action_request(
+                "req-goto",
+                vec![json!({"action":"goto","url":"https://paste.example/doc"})],
+                false,
+            )
+            .await
+            .unwrap();
+        let req2 = read_env(&mut wrk).await;
+        assert_eq!(req2.msg_type, TYPE_ACTION_REQUEST);
+        assert_eq!(
+            req2.data["actions"][0]["url"],
+            "https://paste.example/doc"
+        );
+        drop(rx2);
     }
 }

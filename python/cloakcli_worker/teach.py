@@ -56,20 +56,23 @@ def _validate_extension(path: Path) -> Path:
 
 
 def _wait_closed(ctx, smoke_seconds: float) -> None:
-    if smoke_seconds > 0:
-        deadline = time.time() + smoke_seconds
-        while time.time() < deadline:
-            try:
-                _ = list(ctx.pages)
-            except Exception:
-                return
-            time.sleep(0.2)
-        try:
-            ctx.close()
-        except Exception:
-            pass
-        return
+    _run_until_closed(ctx, None, None, smoke_seconds)
+
+
+def _run_until_closed(ctx, page: Any, hub_client: Any, smoke_seconds: float) -> None:
+    """Playwright-owning loop: drain queued action_request while the browser lives.
+
+    Recv/hub thread never calls Playwright; this path does, and can be interrupted
+    via hub cancel → interrupt_playwright.
+    """
+    deadline = time.time() + smoke_seconds if smoke_seconds > 0 else None
     while True:
+        if deadline is not None and time.time() >= deadline:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            return
         try:
             pages = list(ctx.pages)
         except Exception:
@@ -82,10 +85,26 @@ def _wait_closed(ctx, smoke_seconds: float) -> None:
             except Exception:
                 return
             continue
-        try:
-            pages[0].wait_for_timeout(400)
-        except Exception:
-            return
+        if hub_client is not None:
+            env = hub_client.pop_action_request(timeout=0.15)
+            if env is not None:
+                try:
+                    _handle_action_request(page, hub_client, env)
+                except Exception as e:
+                    try:
+                        hub_client.send(
+                            TYPE_ACTION_RESULT,
+                            {"ok": False, "error": type(e).__name__, "results": []},
+                            request_id=env.get("request_id"),
+                        )
+                    except Exception:
+                        pass
+                continue
+        else:
+            try:
+                pages[0].wait_for_timeout(400)
+            except Exception:
+                return
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -145,9 +164,7 @@ def main(argv: list[str] | None = None) -> int:
 
         page = get_page(ctx)
         if hub_client is not None:
-            hub_client.on_action_request = lambda env: _handle_action_request(
-                page, hub_client, env
-            )
+            hub_client.bind_playwright_page(page)
             hub_thread = threading.Thread(target=hub_client.run, name="teach-hub", daemon=True)
             hub_thread.start()
             hub_client.wait_paired(timeout=5.0)
@@ -162,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
                 page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
                 print(f"teach goto warning: {type(e).__name__}", file=sys.stderr)
-        _wait_closed(ctx, smoke)
+        _run_until_closed(ctx, page, hub_client, smoke)
     finally:
         if hub_client is not None:
             hub_client.stop()
@@ -174,14 +191,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _handle_action_request(page: Any, client: TeachHubClient, env: dict) -> None:
-    """Validate then execute schema actions. Never runs raw model text."""
-    from .actions import execute_actions, parse_actions_payload
+    """Re-validate inbound payload then execute. Never runs raw model text."""
+    from .actions import ActionError, execute_actions, parse_actions_payload, validate_action
 
     request_id = env.get("request_id")
     data = env.get("data") if isinstance(env.get("data"), dict) else {}
     # Refuse a raw LLM string even if a caller stuffed it into data.text.
     parsed = parse_actions_payload(data)
-    if parsed.errors and not parsed.actions:
+    if parsed.errors:
         client.send(
             TYPE_ACTION_RESULT,
             redact_any(
@@ -194,6 +211,28 @@ def _handle_action_request(page: Any, client: TeachHubClient, env: dict) -> None
             request_id=request_id,
         )
         return
+    raw_items: list[Any] = []
+    if isinstance(data, dict):
+        if isinstance(data.get("actions"), list):
+            raw_items = data["actions"]
+        elif "action" in data:
+            raw_items = [data]
+    for i, item in enumerate(raw_items):
+        try:
+            validate_action(item)
+        except ActionError as e:
+            client.send(
+                TYPE_ACTION_RESULT,
+                redact_any(
+                    {
+                        "ok": False,
+                        "error": f"actions[{i}]: {e}"[:300],
+                        "results": [],
+                    }
+                ),
+                request_id=request_id,
+            )
+            return
 
     allow = data.get("allow_origins") if isinstance(data.get("allow_origins"), list) else []
     allow = [str(o) for o in allow if isinstance(o, str)]

@@ -15,7 +15,8 @@ use crate::llm;
 use crate::llm_client;
 use crate::teach_hub::TeachHubHandle;
 use crate::teach_protocol::{
-    origin_of, origin_allowed, redact_for_log, sanitize_page_url, selector_from_value, TeachMachine,
+    origin_of, redact_action_payload, redact_for_log, sanitize_page_url, selector_from_value,
+    TeachMachine,
 };
 
 pub const MAX_ACTIONS_PER_TURN: usize = 3;
@@ -58,7 +59,8 @@ pub const SYSTEM_PROMPT: &str = r##"You are CloakCLI Teach Chat. Output JSON onl
 At most 3 actions per turn. Canonical field is "selector" (legacy "css" is accepted).
 {"schema_version":1,"actions":[{"action":"click","selector":"#ok"}]}
 Allowed actions: goto, click, fill, type, scroll, wait, done, fail, ask_human.
-goto.url must be http(s) and on the origin allowlist. Never file:/javascript:/data:.
+goto.url must be http(s). Any http(s) URL is allowed (no allowlist / no confirm gate).
+Never file:/javascript:/data: or similar non-http schemes.
 You CANNOT run shell, eval, evaluate, Python, file I/O, or arbitrary JavaScript.
 fill/type text for passwords should use {{vars.PASSWORD}} when the value is unknown.
 done/fail/ask_human require reason.
@@ -106,8 +108,14 @@ pub struct TeachAction {
 }
 
 impl TeachAction {
+    /// Wire payload for the worker (includes fill/type plaintext so it can execute).
     pub fn to_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or_else(|_| json!({"action": self.action}))
+    }
+
+    /// Timeline / TUI / log payload: fill/type text redacted; selector canonical.
+    pub fn to_event_value(&self) -> Value {
+        redact_action_payload(&self.to_value())
     }
 
     pub fn summary(&self) -> String {
@@ -153,6 +161,8 @@ pub struct ParseResult {
 pub enum GotoRisk {
     Ok,
     Reject,
+    /// Kept for non-goto high-risk flows (M3+). http(s) goto never uses this.
+    #[allow(dead_code)]
     NeedsConfirm,
 }
 
@@ -565,18 +575,10 @@ pub fn goto_risk(
     let Some(dest) = origin_of(url) else {
         return (GotoRisk::Reject, "could not parse origin".into());
     };
-    if !origin_allowed(&dest, allow_origins) {
-        return (GotoRisk::Reject, "origin not in allowlist".into());
-    }
-    if let Some(cur) = current_origin.map(str::trim).filter(|s| !s.is_empty()) {
-        if dest != cur.trim_end_matches('/') && dest != cur {
-            return (
-                GotoRisk::NeedsConfirm,
-                "cross-origin navigation requires confirmation".into(),
-            );
-        }
-    }
-    (GotoRisk::Ok, "allowlist".into())
+    // User policy: any http(s) goto is allowed. Origin allowlist must not
+    // reject or force confirm. Soft-log only (callers may record dest).
+    let _ = (allow_origins, current_origin, dest);
+    (GotoRisk::Ok, "http(s)".into())
 }
 
 fn extract_json(text: &str) -> Option<Value> {
@@ -762,6 +764,7 @@ pub async fn execute_planned(
     planned: &PlannedTurn,
     cancel: &AtomicBool,
     confirmed: bool,
+    request_id: Option<&str>,
 ) -> Result<Value> {
     if !planned.errors.is_empty() {
         bail!("{}", planned.errors.join("; "));
@@ -772,10 +775,9 @@ pub async fn execute_planned(
     if planned.needs_confirm.is_some() && !confirmed {
         bail!("high-risk navigation requires confirmation");
     }
-    let request_id = planned
-        .needs_confirm
-        .as_ref()
-        .map(|c| c.request_id.clone())
+    let request_id = request_id
+        .map(|s| s.to_string())
+        .or_else(|| planned.needs_confirm.as_ref().map(|c| c.request_id.clone()))
         .unwrap_or_else(|| format!("req-{}", uuid::Uuid::new_v4()));
     hub.set_machine(TeachMachine::AgentActing).await;
     let actions: Vec<Value> = planned.actions.iter().map(|a| a.to_value()).collect();
@@ -814,6 +816,29 @@ async fn wait_cancel(flag: &AtomicBool) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
+/// Poll `poll_cancel` while `fut` runs. On a true poll, sets `cancel` so
+/// in-flight hub/worker work can abort; still waits for `fut` to finish.
+pub async fn await_cancellable<T, Fut, P>(cancel: &AtomicBool, fut: Fut, mut poll_cancel: P) -> T
+where
+    Fut: std::future::Future<Output = T>,
+    P: FnMut() -> bool,
+{
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            r = &mut fut => return r,
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                if cancel.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if poll_cancel() {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            }
+        }
     }
 }
 
@@ -966,27 +991,60 @@ mod tests {
     }
 
     #[test]
-    fn high_risk_cross_origin_confirm() {
-        let allow = vec!["https://example.com".into(), "https://other.example".into()];
+    fn https_goto_any_origin_ok_no_allowlist_or_confirm() {
+        let allow = vec!["https://example.com".into()];
         let (risk, _) = goto_risk(
             "https://other.example/login",
             &allow,
             Some("https://example.com"),
         );
-        assert_eq!(risk, GotoRisk::NeedsConfirm);
-        let (risk, reason) = goto_risk(
+        assert_eq!(risk, GotoRisk::Ok);
+        let (risk, _) = goto_risk(
             "https://evil.example/",
             &allow,
             Some("https://example.com"),
         );
+        assert_eq!(risk, GotoRisk::Ok);
+        let (risk, _) = goto_risk("https://paste.example/x", &[], None);
+        assert_eq!(risk, GotoRisk::Ok);
+        let (risk, reason) = goto_risk("javascript:alert(1)", &allow, None);
         assert_eq!(risk, GotoRisk::Reject);
-        assert!(reason.contains("allowlist"));
-        let (risk, _) = goto_risk(
-            "https://example.com/next",
-            &allow,
+        assert!(reason.contains("javascript"));
+        let (risk, _) = goto_risk("file:///etc/passwd", &allow, None);
+        assert_eq!(risk, GotoRisk::Reject);
+        let (risk, _) = goto_risk("data:text/html,hi", &allow, None);
+        assert_eq!(risk, GotoRisk::Reject);
+    }
+
+    #[test]
+    fn plan_turn_http_goto_skips_confirm() {
+        let p = plan_turn(
+            r#"{"schema_version":1,"actions":[{"action":"goto","url":"https://other.example/login"}]}"#,
+            &["https://example.com".into()],
             Some("https://example.com"),
         );
-        assert_eq!(risk, GotoRisk::Ok);
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+        assert!(p.needs_confirm.is_none());
+        assert_eq!(p.actions[0].action, "goto");
+    }
+
+    #[test]
+    fn fill_event_value_redacts_text() {
+        let a = validate_action(&json!({
+            "action": "fill",
+            "selector": "#pw",
+            "text": "super-secret-password"
+        }))
+        .unwrap();
+        let ev = a.to_event_value();
+        assert_eq!(ev["text"], "[REDACTED]");
+        assert_eq!(ev["selector"], "#pw");
+        assert!(ev.get("css").is_none());
+        assert!(!ev.to_string().contains("super-secret-password"));
+        assert!(a.summary().contains("[REDACTED]"));
+        assert!(!a.summary().contains("super-secret-password"));
+        // Wire value still has plaintext for the worker.
+        assert_eq!(a.to_value()["text"], "super-secret-password");
     }
 
     #[test]
@@ -1000,5 +1058,32 @@ mod tests {
     fn stubs_point_at_later_milestones() {
         assert!(stub_shortcut('t').contains("M3"));
         assert!(stub_shortcut('e').contains("M4"));
+    }
+
+    #[tokio::test]
+    async fn cancel_during_wait_polls_ctrl_c() {
+        use std::sync::atomic::AtomicUsize;
+        let cancel = AtomicBool::new(false);
+        let ticks = AtomicUsize::new(0);
+        let start = std::time::Instant::now();
+        let out = await_cancellable(
+            &cancel,
+            async {
+                loop {
+                    if cancel.load(Ordering::SeqCst) {
+                        return "cancelled";
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            || {
+                let n = ticks.fetch_add(1, Ordering::SeqCst) + 1;
+                n >= 3
+            },
+        )
+        .await;
+        assert_eq!(out, "cancelled");
+        assert!(cancel.load(Ordering::SeqCst));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

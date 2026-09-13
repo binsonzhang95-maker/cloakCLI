@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import threading
 import time
@@ -192,9 +193,23 @@ class TeachHubClient:
         self.last_error: str | None = None
         self._cancel = threading.Event()
         self._current_request_id: str | None = None
+        # Dedicated exec path: recv thread only queues action_request and sets
+        # cancel. Playwright runs on the owner thread (see pop_action_request).
+        self._action_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._playwright_page: Any = None
         # M3: takeover_start must set this so the agent cannot race the human
         # on the same Playwright page. M2 only exposes the hook/flag.
         self.executor_paused = False
+
+    def bind_playwright_page(self, page: Any) -> None:
+        """Page owned by the exec thread; used only to interrupt on cancel."""
+        self._playwright_page = page
+
+    def pop_action_request(self, timeout: float = 0.2) -> dict[str, Any] | None:
+        try:
+            return self._action_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
     def stop(self) -> None:
         self._stop.set()
@@ -343,7 +358,9 @@ class TeachHubClient:
                     self.session_token = str(data["session_token"])
                 self.paired.set()
         elif t == TYPE_CANCEL:
+            # Recv thread must set cancel immediately — never wait on Playwright.
             self._cancel.set()
+            self._interrupt_playwright()
             if self.on_cancel:
                 try:
                     self.on_cancel(env)
@@ -361,21 +378,22 @@ class TeachHubClient:
                     request_id=env.get("request_id"),
                 )
                 return
-            if self.on_action_request:
-                self._current_request_id = env.get("request_id")
-                self._cancel.clear()
-                try:
-                    self.on_action_request(env)
-                except Exception as e:
-                    self.send(
-                        TYPE_ACTION_RESULT,
-                        {
-                            "ok": False,
-                            "error": type(e).__name__,
-                            "results": [],
-                        },
-                        request_id=env.get("request_id"),
-                    )
+            self._current_request_id = env.get("request_id")
+            self._cancel.clear()
+            # Queue for the Playwright-owning exec path. Do not run sync
+            # Playwright on the recv thread (it would block cancel messages).
+            self._action_queue.put(env)
+
+    def _interrupt_playwright(self) -> None:
+        page = self._playwright_page
+        if page is None:
+            return
+        try:
+            from .actions import interrupt_playwright
+
+            interrupt_playwright(page)
+        except Exception:
+            pass
 
     def _write(self, env: dict[str, Any], sock: socket.socket | None = None) -> None:
         raw = (json.dumps(env, ensure_ascii=False) + "\n").encode("utf-8")

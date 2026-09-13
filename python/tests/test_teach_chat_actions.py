@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 
 from cloakcli_worker.actions import (
@@ -28,6 +29,7 @@ class TeachActionSchemaTests(unittest.TestCase):
         self.assertEqual(b.selector, "button.submit")
         d = a.public_dict()
         self.assertEqual(d["selector"], "#go")
+        self.assertNotIn("css", d)
 
     def test_max_three_actions_per_turn(self):
         self.assertEqual(MAX_ACTIONS_PER_TURN, 3)
@@ -113,13 +115,28 @@ class TeachExecuteTests(unittest.TestCase):
         self.assertEqual([r.status for r in results], ["ok", "ok", "done"])
         self.assertEqual(page.clicked, ["a", "#submit"])
 
-    def test_goto_allowlist_only(self):
-        page = FakePage()
+    def test_https_goto_any_origin_no_allowlist_or_confirm(self):
+        page = FakePage(url="https://example.com/")
         a = validate_action({"action": "goto", "url": "https://evil.example/x"})
         out = execute_action(page, a, allow_origins=["https://example.com"])
-        self.assertEqual(out.status, "rejected")
-        self.assertIn("allowlist", out.reason)
-        self.assertEqual(page.gotos, [])
+        self.assertEqual(out.status, "ok")
+        self.assertEqual(page.gotos, ["https://evil.example/x"])
+        risk, _ = goto_risk(
+            "https://paste.example/doc",
+            allow_origins=["https://example.com"],
+            current_origin="https://example.com",
+        )
+        self.assertEqual(risk, "ok")
+        a2 = validate_action({"action": "goto", "url": "https://other.example/login"})
+        out2 = execute_action(
+            page,
+            a2,
+            allow_origins=["https://example.com"],
+            current_origin="https://example.com",
+            confirmed=False,
+        )
+        self.assertEqual(out2.status, "ok")
+        self.assertIn("https://other.example/login", page.gotos)
 
     def test_same_origin_goto_ok(self):
         page = FakePage(url="https://example.com/app")
@@ -134,34 +151,15 @@ class TeachExecuteTests(unittest.TestCase):
         self.assertEqual(page.gotos, ["https://example.com/next"])
         self.assertEqual(out.page["origin"], "https://example.com")
 
-    def test_high_risk_cross_origin_needs_confirm(self):
-        page = FakePage(url="https://example.com/")
-        a = validate_action({"action": "goto", "url": "https://other.example/login"})
-        risk, reason = goto_risk(
-            a.url or "",
-            allow_origins=["https://example.com", "https://other.example"],
-            current_origin="https://example.com",
-        )
-        self.assertEqual(risk, "needs_confirm")
-        self.assertIn("cross-origin", reason)
-        out = execute_action(
-            page,
-            a,
-            allow_origins=["https://example.com", "https://other.example"],
-            current_origin="https://example.com",
-            confirmed=False,
-        )
-        self.assertEqual(out.status, "needs_confirm")
+    def test_goto_still_rejects_dangerous_schemes(self):
+        page = FakePage()
+        for url in ("javascript:alert(1)", "file:///etc/passwd", "data:text/html,hi"):
+            with self.assertRaises(ActionError):
+                validate_action({"action": "goto", "url": url})
+            risk, reason = goto_risk(url, allow_origins=["https://example.com"])
+            self.assertEqual(risk, "reject")
+            self.assertTrue(reason)
         self.assertEqual(page.gotos, [])
-        out2 = execute_action(
-            page,
-            a,
-            allow_origins=["https://example.com", "https://other.example"],
-            current_origin="https://example.com",
-            confirmed=True,
-        )
-        self.assertEqual(out2.status, "ok")
-        self.assertEqual(page.gotos, ["https://other.example/login"])
 
     def test_cancel_stops_in_flight_wait(self):
         page = FakePage()
@@ -170,6 +168,44 @@ class TeachExecuteTests(unittest.TestCase):
         a = validate_action({"action": "wait", "ms": 5000})
         out = execute_action(page, a, cancel_check=cancelled.is_set)
         self.assertEqual(out.status, "cancelled")
+
+    def test_cancel_during_wait_interrupts(self):
+        from cloakcli_worker.actions import interrupt_playwright
+
+        page = FakePage()
+        cancelled = threading.Event()
+        a = validate_action({"action": "wait", "ms": 5000})
+        out: dict[str, str] = {}
+
+        def run() -> None:
+            result = execute_action(page, a, cancel_check=cancelled.is_set)
+            out["status"] = result.status
+
+        t = threading.Thread(target=run)
+        t.start()
+        self.assertTrue(page.entered_call.wait(1.0))
+        cancelled.set()
+        interrupt_playwright(page)
+        t.join(2.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(out.get("status"), "cancelled")
+
+    def test_non_goto_does_not_block_https_off_allowlist(self):
+        page = FakePage(url="https://evil.example/")
+        a = validate_action({"action": "click", "selector": "a"})
+        page.elements["a"] = {"text": "x"}
+        out = execute_action(page, a, allow_origins=["https://example.com"])
+        self.assertEqual(out.status, "ok")
+        self.assertEqual(page.clicked, ["a"])
+
+    def test_non_goto_rejects_file_page(self):
+        page = FakePage(url="file:///etc/passwd")
+        a = validate_action({"action": "click", "selector": "a"})
+        page.elements["a"] = {"text": "x"}
+        out = execute_action(page, a, allow_origins=["https://example.com"])
+        self.assertEqual(out.status, "rejected")
+        self.assertIn("scheme", out.reason)
+        self.assertEqual(page.clicked, [])
 
     def test_executor_paused_rejects(self):
         page = FakePage()
@@ -187,6 +223,10 @@ class TeachExecuteTests(unittest.TestCase):
         self.assertEqual(out.status, "ok")
         self.assertEqual(page.filled, [("#pw", "super-secret-password")])
         self.assertEqual(out.action["text"], "[REDACTED]")
+        self.assertEqual(out.action["text_len"], len("super-secret-password"))
+        self.assertNotIn("css", out.action)
+        self.assertEqual(out.action["selector"], "#pw")
+        self.assertNotIn("super-secret-password", str(out.action))
 
     def test_page_change_on_timeline_snapshot(self):
         page = FakePage()
@@ -241,6 +281,40 @@ class TeachExecuteTests(unittest.TestCase):
         )
         self.assertEqual(page.clicked, ["a"])
         self.assertTrue(client.sent[-1][1]["ok"])
+
+    def test_recv_thread_queues_action_and_cancel_is_immediate(self):
+        from cloakcli_worker.teach_hub import TeachHubClient
+
+        client = TeachHubClient("127.0.0.1", 1, "p", "c")
+        started = threading.Event()
+        finished = threading.Event()
+
+        def exec_loop() -> None:
+            env = client._action_queue.get(timeout=2)
+            started.set()
+            while not client.cancel_requested():
+                time.sleep(0.01)
+            finished.set()
+            _ = env
+
+        t = threading.Thread(target=exec_loop)
+        t.start()
+        t0 = time.monotonic()
+        client._handle(
+            {
+                "type": "action_request",
+                "request_id": "r1",
+                "data": {"actions": [{"action": "wait", "ms": 5000}]},
+            }
+        )
+        self.assertTrue(started.wait(2.0))
+        client._handle({"type": "cancel", "request_id": "r1", "data": {}})
+        self.assertTrue(client.cancel_requested())
+        self.assertTrue(finished.wait(2.0))
+        t.join(1.0)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        # Recv thread must not invoke Playwright/on_action_request.
+        self.assertIsNone(client.on_action_request)
 
 
 if __name__ == "__main__":

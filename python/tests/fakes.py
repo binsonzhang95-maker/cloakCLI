@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +102,23 @@ class FakePage:
         self.nav_on_click: dict[str, str] = {}
         self.keyboard = FakeKeyboard(self)
         self.mouse = FakeMouse(self)
+        self._interrupt = threading.Event()
+        self.entered_call = threading.Event()
+        self.block_next = 0.0
+
+    def interrupt(self) -> None:
+        self._interrupt.set()
+
+    def _maybe_block(self) -> None:
+        hold = self.block_next
+        if hold <= 0:
+            return
+        self.entered_call.set()
+        deadline = time.monotonic() + hold
+        while time.monotonic() < deadline:
+            if self._closed or self._interrupt.is_set():
+                raise FakeTimeoutError("interrupted")
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
     def is_closed(self) -> bool:
         return self._closed
@@ -123,6 +142,7 @@ class FakePage:
         self.focused = sel
 
     def click(self, sel: str, timeout: int = 0) -> None:
+        self._maybe_block()
         if sel not in self.elements:
             raise FakeTimeoutError(f"TimeoutError: waiting for {sel}")
         self.clicked.append(sel)
@@ -130,6 +150,7 @@ class FakePage:
         self._maybe_nav_on_click(sel)
 
     def fill(self, sel: str, text: str, timeout: int = 0) -> None:
+        self._maybe_block()
         if sel not in self.elements:
             raise FakeTimeoutError(f"TimeoutError: waiting for {sel}")
         self.filled.append((sel, text))
@@ -137,11 +158,19 @@ class FakePage:
         self.focused = sel
 
     def goto(self, url: str, wait_until: str = "domcontentloaded", timeout: int = 0) -> None:
+        self._maybe_block()
         self.gotos.append(url)
         self.url = url
 
     def wait_for_timeout(self, ms: int) -> None:
-        return
+        self.entered_call.set()
+        if ms <= 0:
+            return
+        deadline = time.monotonic() + ms / 1000.0
+        while time.monotonic() < deadline:
+            if self._closed or self._interrupt.is_set():
+                raise FakeTimeoutError("interrupted")
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
     def locator(self, sel: str) -> FakeLocator:
         return FakeLocator(self, sel)

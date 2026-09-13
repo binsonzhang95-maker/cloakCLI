@@ -126,8 +126,6 @@ fn turn_validates_mock_json_and_rejects_danger() {
             "go elsewhere",
             "--allow-origin",
             "https://example.com",
-            "--allow-origin",
-            "https://other.example",
             "--current-origin",
             "https://example.com",
             "--mock-json",
@@ -137,7 +135,43 @@ fn turn_validates_mock_json_and_rejects_danger() {
         .expect("run");
     assert!(cross.status.success(), "{}", combined(&cross));
     let t = combined(&cross);
-    assert!(t.contains("NEEDS_CONFIRM"), "{t}");
+    assert!(t.contains("VALIDATE_OK"), "{t}");
+    assert!(!t.contains("NEEDS_CONFIRM"), "{t}");
+
+    let any_https = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "turn",
+            "--goal",
+            "paste url",
+            "--allow-origin",
+            "https://example.com",
+            "--mock-json",
+            r#"{"schema_version":1,"actions":[{"action":"goto","url":"https://paste.example/doc"}]}"#,
+        ])
+        .output()
+        .expect("run");
+    assert!(any_https.status.success(), "{}", combined(&any_https));
+    let t = combined(&any_https);
+    assert!(t.contains("VALIDATE_OK"), "{t}");
+    assert!(t.contains("goto"), "{t}");
+
+    let js = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "turn",
+            "--goal",
+            "pwn",
+            "--mock-json",
+            r#"{"schema_version":1,"actions":[{"action":"goto","url":"javascript:alert(1)"}]}"#,
+        ])
+        .output()
+        .expect("run");
+    assert!(!js.status.success(), "{}", combined(&js));
+    let t = combined(&js);
+    assert!(t.contains("VALIDATE_FAIL") || t.contains("javascript"), "{t}");
     let _ = fs::remove_dir_all(&home);
 }
 
