@@ -1,4 +1,4 @@
-"""Runtime origin allowlist: unapproved second origin is not injected/recorded."""
+"""Runtime origin allowlist: inject/page_state gated; http(s) goto still recorded."""
 
 from __future__ import annotations
 
@@ -39,7 +39,10 @@ class TeachAllowlistTests(unittest.TestCase):
         out = (proc.stdout or "") + (proc.stderr or "")
         self.assertEqual(proc.returncode, 0, out)
         self.assertIn("unapproved second origin not injected", out)
-        self.assertIn("unapproved second origin not recorded", out)
+        self.assertIn("unapproved second origin http(s) navigation recorded", out)
+        self.assertIn("unapproved origin click not recorded", out)
+        self.assertIn("blocked schemes not recorded", out)
+        self.assertIn("takeover records off-allowlist http(s) goto", out)
 
     def test_background_does_not_auto_add_on_navigation(self):
         text = BG.read_text(encoding="utf-8")

@@ -1,6 +1,10 @@
 /* CloakCLI Teach — service worker.
  * Origin allowlist: CLI --url origin from session.json, plus origins the
  * user explicitly Allows in the popup. Navigating does not silent-add.
+ * Allowlist still gates content-script injection and page_state.
+ * Product rule: any http(s) navigation (goto) is recorded even when the
+ * origin is not allowlisted, so takeover → Playwright can emit goto.
+ * javascript:/file:/data: and other non-http schemes are rejected.
  */
 importScripts("pairing.js");
 
@@ -17,13 +21,22 @@ const state = {
 
 let configLoad = null;
 
-function isHttpOrigin(origin) {
+function isHttpUrl(url) {
   try {
-    const u = new URL(origin);
+    const u = new URL(url);
     return u.protocol === "http:" || u.protocol === "https:";
   } catch {
     return false;
   }
+}
+
+function isHttpOrigin(origin) {
+  return isHttpUrl(origin);
+}
+
+function isNavigationKind(kind) {
+  const k = String(kind || "").toLowerCase();
+  return k === "navigation" || k === "nav" || k === "goto";
 }
 
 function originOf(url) {
@@ -172,10 +185,10 @@ function record(event) {
   if (!state.recording && !state.takeover) return;
   if (!event || typeof event !== "object") return;
   const kind = String(event.kind || "").toLowerCase();
-  if (kind === "navigation") {
+  if (isNavigationKind(kind)) {
     const url = String(event.url || "");
-    const origin = originOf(url);
-    if (!originAllowed(origin)) return;
+    // Any http(s) goto is recorded even off-allowlist. Reject other schemes.
+    if (!isHttpUrl(url)) return;
   }
   const stored = state.takeover ? redactTakeoverEvent(event) : event;
   if (state.recording) state.events.push(stored);
@@ -212,21 +225,24 @@ function handleHubMessage(env) {
     broadcastTakeover(true);
     (async () => {
       const tab = await activeHttpTab();
-      if (tab && originAllowed(originOf(tab.url))) {
-        record({
-          kind: "navigation",
-          url: tab.url,
-          origin: originOf(tab.url),
-          ts: new Date().toISOString(),
-          frame: "main",
-        });
-        await inject(tab.id, tab.url);
-        await requestPageState(tab.id, tab.url);
-        try {
-          await chrome.tabs.sendMessage(tab.id, { type: "takeover", on: true });
-        } catch {
-          /* ignore */
-        }
+      if (!tab) return;
+      record({
+        kind: "navigation",
+        url: tab.url,
+        origin: originOf(tab.url),
+        ts: new Date().toISOString(),
+        frame: "main",
+      });
+      if (!originAllowed(originOf(tab.url))) {
+        noteIgnored(originOf(tab.url));
+        return;
+      }
+      await inject(tab.id, tab.url);
+      await requestPageState(tab.id, tab.url);
+      try {
+        await chrome.tabs.sendMessage(tab.id, { type: "takeover", on: true });
+      } catch {
+        /* ignore */
       }
     })();
     return;
@@ -262,14 +278,20 @@ if (chrome.runtime.onStartup) {
 chrome.webNavigation.onCommitted.addListener(async (d) => {
   if (d.frameId !== 0) return;
   await loadConfig();
+  if (!isHttpUrl(d.url)) return;
   const origin = originOf(d.url);
-  if (!isHttpOrigin(origin)) return;
-  if (!originAllowed(origin)) {
-    if (state.recording) noteIgnored(origin);
-    return;
+  if (state.recording || state.takeover) {
+    record({
+      kind: "navigation",
+      url: d.url,
+      origin,
+      ts: new Date().toISOString(),
+      frame: "main",
+    });
   }
-  if (state.recording) {
-    record({ kind: "navigation", url: d.url });
+  if (!originAllowed(origin)) {
+    if (state.recording || state.takeover) noteIgnored(origin);
+    return;
   }
   await inject(d.tabId, d.url);
   await requestPageState(d.tabId, d.url);
@@ -308,6 +330,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     if (type === "record") {
+      const ev = msg.event;
+      const kind = ev && String(ev.kind || "").toLowerCase();
+      if (isNavigationKind(kind)) {
+        const url = String((ev && ev.url) || sender.url || sender.tab?.url || "");
+        if (!isHttpUrl(url)) {
+          sendResponse({ ok: false, error: "blocked scheme" });
+          return;
+        }
+        record({ ...(typeof ev === "object" && ev ? ev : {}), kind: "navigation", url });
+        sendResponse({ ok: true, n: state.events.length, takeover: state.takeover });
+        return;
+      }
       const origin = originOf(sender.url || sender.tab?.url || "");
       if (!originAllowed(origin)) {
         sendResponse({ ok: false, error: "origin not allowlisted" });
@@ -351,8 +385,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const tab = await activeHttpTab();
       if (tab) {
         const origin = originOf(tab.url);
+        if (isHttpUrl(tab.url)) {
+          record({ kind: "navigation", url: tab.url, origin });
+        }
         if (originAllowed(origin)) {
-          record({ kind: "navigation", url: tab.url });
           await inject(tab.id, tab.url);
           await requestPageState(tab.id, tab.url);
         } else {

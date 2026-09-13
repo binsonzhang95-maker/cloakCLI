@@ -13,10 +13,10 @@ Do not pass an arbitrary `--load-extension` path on the CLI.
 ## Safety
 
 - No default `<all_urls>` content script. Host access is `http://127.0.0.1/*` (export) plus optional `http(s)` origins from CLI `--url` or **Allow this origin** in the popup. Visiting a site does not silent-add it.
-- Content script refuses non-allowlisted origins; unapproved origins are not injected or recorded.
+- Content script refuses non-allowlisted origins; unapproved origins are not injected. Click/fill/page_state stay allowlist-gated. Any `http(s)` navigation is still recorded as goto (javascript:/file:/data: rejected).
 - Password / token / secret fields export as `{{vars.NAME}}` unless `--allow-secrets`.
 - Master and fleet do not teach; they only run exported skills.
 
 ## Teach Chat takeover (M3)
 
-`cloakcli teach chat` sends `takeover_start` / `takeover_stop` over the hub. While recording, this extension emits `takeover_event` with selector candidates (`data-testid`, role+name, label, text, CSS, coords last). Password fields send type/length/`redacted` only. The Python worker locally normalizes events to Playwright actions (`source=human`); raw DOM is never an exportable step.
+`cloakcli teach chat` sends `takeover_start` / `takeover_stop` over the hub. While recording, this extension emits `takeover_event` with selector candidates in plan-C order (`id` → `data-testid` → `name` → aria/role → text → CSS path → coords last). Password fields send type/length/`redacted` only. Any `http(s)` goto is recorded even off the initial allowlist; `javascript:` / `file:` / `data:` are dropped. The Python worker locally normalizes events to Playwright actions (`source=human`); raw DOM is never an exportable step.

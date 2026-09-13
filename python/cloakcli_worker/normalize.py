@@ -3,8 +3,8 @@
 Zero-token post-process on takeover_stop. Never emits raw DOM events as
 exportable skill steps. Canonical field is `selector` (css is read-compat).
 
-Selector priority (locked):
-  data-testid → role+name → label → stable text → CSS; coords last.
+Selector priority (plan C, locked):
+  id → data-testid → name → aria/role → text → CSS path → coords.
 
 Failures (non-unique, shadow, iframe, missing selector) go to confirm or
 non-exportable. Silent raw-event save is forbidden.
@@ -61,15 +61,25 @@ SECRET_QUERY_KEYS = {
 UNSTABLE_RE = re.compile(r":nth-(?:child|of-type)", re.I)
 HUMAN_EXTRA = set(RECOVER_EXTRA_ACTIONS)
 
-# Priority used when ranking candidate selectors (user/product lock).
+# Priority used when ranking candidate selectors (plan C / product lock).
+# Coords are not CSS selectors; pick_selector falls through to them last.
 STRATEGY_ORDER = (
+    "id",
     "testid",
-    "role_name",
-    "label",
+    "name",
+    "aria",
     "text",
     "css",
     "coords",
 )
+UNIQUE_ALIASES = {
+    "id": ("id",),
+    "testid": ("testid", "data-testid", "data-test"),
+    "name": ("name",),
+    "aria": ("aria", "role_name", "label"),
+    "text": ("text",),
+    "css": ("css", "css_path"),
+}
 
 
 @dataclass
@@ -274,15 +284,29 @@ def _candidate_unique(event: dict[str, Any], key: str, selector: str, page: Any)
     if live is not None:
         return live == 1
     uniq = event.get("candidate_unique")
-    if isinstance(uniq, dict) and key in uniq:
+    uniq = uniq if isinstance(uniq, dict) else {}
+    cands = event.get("selector_candidates")
+    if isinstance(cands, dict):
+        for ck, cv in cands.items():
+            cand_sel = _cand_str({ck: cv}, ck)
+            if cand_sel != selector:
+                continue
+            if ck in uniq:
+                v = uniq[ck]
+                if isinstance(v, bool):
+                    return v
+            if isinstance(cv, dict) and "unique" in cv:
+                return bool(cv["unique"])
+            break
+    for alias in UNIQUE_ALIASES.get(key, (key,)):
+        if alias in uniq:
+            v = uniq[alias]
+            if isinstance(v, bool):
+                return v
+    if key in uniq:
         v = uniq[key]
         if isinstance(v, bool):
             return v
-    cands = event.get("selector_candidates")
-    if isinstance(cands, dict):
-        item = cands.get(key)
-        if isinstance(item, dict) and "unique" in item:
-            return bool(item["unique"])
     return None
 
 
@@ -296,9 +320,32 @@ def _cand_str(cands: dict[str, Any], key: str) -> str:
     return ""
 
 
+def _strategy_for_sel(sel: str) -> str:
+    """Classify a raw selector string into a plan-C strategy bucket."""
+    s = (sel or "").strip()
+    if not s:
+        return "css"
+    if re.match(r"^#[^\s\[\]>+~.,#]+$", s):
+        return "id"
+    low = s.lower()
+    if "data-testid=" in low or "data-test=" in low:
+        return "testid"
+    if re.search(r"\[name\s*=", low):
+        return "name"
+    if "aria-label=" in low or "[role=" in low:
+        return "aria"
+    if ":has-text(" in low:
+        return "text"
+    return "css"
+
+
 def collect_candidates(event: dict[str, Any]) -> list[tuple[str, str]]:
-    """Return (strategy, selector) in priority order, de-duplicated."""
-    out: list[tuple[str, str]] = []
+    """Return (strategy, selector) in plan-C priority order, de-duplicated.
+
+    Order: id → data-testid → name → aria/role → text → CSS path.
+    Uniqueness is re-checked by pick_selector against the live page.
+    """
+    buckets: dict[str, list[str]] = {k: [] for k in STRATEGY_ORDER}
     seen: set[str] = set()
 
     def add(strategy: str, sel: str) -> None:
@@ -309,69 +356,98 @@ def collect_candidates(event: dict[str, Any]) -> list[tuple[str, str]]:
             return
         if len(sel) > 500:
             return
+        if strategy not in buckets or strategy == "coords":
+            strategy = "css"
         seen.add(sel)
-        out.append((strategy, sel))
+        buckets[strategy].append(sel)
 
     cands = event.get("selector_candidates")
     if not isinstance(cands, dict):
         cands = {}
 
-    add("testid", _cand_str(cands, "testid") or _cand_str(cands, "data-testid"))
-    testid = ""
     field = event.get("field") if isinstance(event.get("field"), dict) else {}
-    testid = str((field or {}).get("testid") or event.get("testid") or "")
-    if testid:
-        key = "data-testid"
-        add("testid", f'[{key}="{css_attr(testid)}"]')
+    tag = str(event.get("tag") or (field or {}).get("tag") or "").strip().lower()
 
+    # 1. id
+    add("id", _cand_str(cands, "id"))
+    el_id = str((field or {}).get("id") or event.get("id") or "")
+    if el_id:
+        add("id", "#" + _css_ident(el_id))
+
+    # 2. data-testid / data-test
+    add(
+        "testid",
+        _cand_str(cands, "testid")
+        or _cand_str(cands, "data-testid")
+        or _cand_str(cands, "data-test"),
+    )
+    testid = str(
+        (field or {}).get("testid")
+        or event.get("testid")
+        or event.get("data-testid")
+        or event.get("data-test")
+        or ""
+    )
+    if testid:
+        attr = "data-test" if _cand_str(cands, "data-test") and not (
+            _cand_str(cands, "testid") or _cand_str(cands, "data-testid")
+        ) else "data-testid"
+        add("testid", f'[{attr}="{css_attr(testid)}"]')
+
+    # 3. name + tag
+    add("name", _cand_str(cands, "name"))
+    fname = str((field or {}).get("name") or event.get("name") or "")
+    if fname and tag:
+        add("name", f'{tag}[name="{css_attr(fname)}"]')
+    elif fname:
+        add("name", f'[name="{css_attr(fname)}"]')
+
+    # 4. aria-label / role combo
+    add("aria", _cand_str(cands, "role_name"))
     role = str(event.get("role") or "").strip()
-    name = str(
+    acc_name = str(
         event.get("accessible_name")
-        or event.get("label")
         or event.get("aria_label")
+        or event.get("label")
         or event.get("text")
         or ""
     ).strip()
-    add("role_name", _cand_str(cands, "role_name") or _cand_str(cands, "aria"))
-    if role and name and len(name) <= MAX_TEXT_SEL:
-        add("role_name", f'[role="{css_attr(role)}"][aria-label="{css_attr(name)}"]')
-        tag = str(event.get("tag") or "").strip().lower()
+    if role and acc_name and len(acc_name) <= MAX_TEXT_SEL:
+        add("aria", f'[role="{css_attr(role)}"][aria-label="{css_attr(acc_name)}"]')
         if tag:
-            add("role_name", f'{tag}[aria-label="{css_attr(name)}"]')
-
-    add("label", _cand_str(cands, "label") or _cand_str(cands, "aria"))
+            add("aria", f'{tag}[aria-label="{css_attr(acc_name)}"]')
+    add("aria", _cand_str(cands, "aria") or _cand_str(cands, "label"))
     aria = str(event.get("aria_label") or event.get("label") or "").strip()
-    tag = str(event.get("tag") or "").strip().lower()
     if aria and tag:
-        add("label", f'{tag}[aria-label="{css_attr(aria)}"]')
+        add("aria", f'{tag}[aria-label="{css_attr(aria)}"]')
     if aria:
-        add("label", f'[aria-label="{css_attr(aria)}"]')
+        add("aria", f'[aria-label="{css_attr(aria)}"]')
 
+    # 5. stable text (never secret field values)
     add("text", _cand_str(cands, "text"))
-    text = str(event.get("text") or event.get("label") or "").strip()
+    text = str(event.get("text") or "").strip()
     if text and 0 < len(text) <= MAX_TEXT_SEL and not looks_secret_field(field, text):
         tsel_tag = tag or "button"
         add("text", f'{tsel_tag}:has-text("{css_attr(text)}")')
 
-    # CSS bucket: unique id, name+tag, then css_path / primary selector.
-    add("css", _cand_str(cands, "id"))
-    el_id = str((field or {}).get("id") or event.get("id") or "")
-    if el_id:
-        add("css", "#" + _css_ident(el_id))
-    add("css", _cand_str(cands, "name"))
-    fname = str((field or {}).get("name") or event.get("name") or "")
-    if fname and tag:
-        add("css", f'{tag}[name="{css_attr(fname)}"]')
+    # 6. CSS path (id/name already emitted above)
+    add("css", _cand_str(cands, "autocomplete"))
     add("css", _cand_str(cands, "css_path") or _cand_str(cands, "css"))
     primary = selector_from_obj(event) or str(event.get("selector") or "").strip()
     if primary:
-        add("css", primary)
+        add(_strategy_for_sel(primary), primary)
     extras = event.get("selectors")
     if isinstance(extras, list):
         for s in extras:
             if isinstance(s, str):
-                add("css", s)
+                add(_strategy_for_sel(s), s)
 
+    out: list[tuple[str, str]] = []
+    for strategy in STRATEGY_ORDER:
+        if strategy == "coords":
+            continue
+        for sel in buckets[strategy]:
+            out.append((strategy, sel))
     return out
 
 
@@ -399,9 +475,10 @@ def pick_selector(
                 best_unstable = (strategy, sel)
             continue
         conf = {
+            "id": 0.98,
             "testid": 0.95,
-            "role_name": 0.9,
-            "label": 0.85,
+            "name": 0.9,
+            "aria": 0.88,
             "text": 0.75,
             "css": 0.7,
         }.get(strategy, 0.6)

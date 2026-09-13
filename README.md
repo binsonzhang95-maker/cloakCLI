@@ -200,7 +200,7 @@ cloakcli teach chat --profile demo --url https://example.com
 #   Ctrl-E    export skill draft (M4, not implemented)
 ```
 
-Password/token fields are stored as type + length + `redacted` only; fills become `{{vars.PASSWORD}}` (or similar). Any `http(s)` goto is allowed; `javascript:` / `file:` / `data:` are rejected. Shadow DOM and missing selectors are non-exportable (never silent-saved as raw events).
+Password/token fields are stored as type + length + `redacted` only; fills become `{{vars.PASSWORD}}` (or similar). Any `http(s)` goto is recorded even off the teach allowlist; `javascript:` / `file:` / `data:` are rejected. Selectors prefer `id` → `data-testid` → `name` → aria/role → text → CSS path → coords (re-checked unique on the page). Shadow DOM and missing selectors are non-exportable (never silent-saved as raw events).
 
 ## Skill format
 

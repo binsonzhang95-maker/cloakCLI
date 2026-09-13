@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /**
  * Runtime allowlist test for extensions/teach/background.js.
- * Proves an unapproved second origin is not injected or recorded.
+ * Proves an unapproved second origin is not injected, and that click /
+ * page_state stay allowlist-gated, while http(s) navigation (goto) is
+ * recorded even off-allowlist. javascript:/file:/data: stay rejected.
  */
 "use strict";
 
@@ -248,8 +250,11 @@ async function complete(tabId, url) {
 
   const st2 = await send({ type: "status" });
   assert(
-    st2.n === nBeforeEvil,
-    "unapproved second origin must not be recorded, n=" + st2.n + " want " + nBeforeEvil
+    st2.n === nBeforeEvil + 1,
+    "unapproved second origin http(s) navigation must be recorded as goto, n=" +
+      st2.n +
+      " want " +
+      (nBeforeEvil + 1)
   );
   assert(
     injected.length === injectBeforeEvil,
@@ -301,7 +306,43 @@ async function complete(tabId, url) {
     "record error should mention allowlist, got " + rec.error
   );
   const st3 = await send({ type: "status" });
-  assert(st3.n === nBeforeEvil, "rejected record must not append events");
+  assert(st3.n === st2.n, "rejected click record must not append events");
+
+  const recNav = await send(
+    {
+      type: "record",
+      event: { kind: "navigation", url: "https://paste.example/doc?q=1" },
+    },
+    { url: "https://paste.example/doc?q=1", tab: { id: 3, url: "https://paste.example/doc?q=1" } }
+  );
+  assert(
+    recNav.ok === true,
+    "http(s) navigation record from off-allowlist origin must succeed: " +
+      JSON.stringify(recNav)
+  );
+  const stNav = await send({ type: "status" });
+  assert(stNav.n === st3.n + 1, "off-allowlist http(s) goto appends an event");
+
+  const nBeforeBlocked = stNav.n;
+  for (const bad of ["javascript:alert(1)", "file:///etc/passwd", "data:text/html,hi"]) {
+    const blocked = await send(
+      { type: "record", event: { kind: "navigation", url: bad } },
+      { url: bad, tab: { id: 9, url: bad } }
+    );
+    assert(
+      blocked.ok === false,
+      "blocked scheme record must fail for " + bad + ", got " + JSON.stringify(blocked)
+    );
+    await commit(bad, 1);
+  }
+  const stBlocked = await send({ type: "status" });
+  assert(
+    stBlocked.n === nBeforeBlocked,
+    "javascript:/file:/data: navigations must not be recorded, n=" +
+      stBlocked.n +
+      " want " +
+      nBeforeBlocked
+  );
 
   const fromContent = await send(
     { type: "approveOrigin", origin: "https://evil.example" },
@@ -355,14 +396,71 @@ async function complete(tabId, url) {
     "hub should receive allowlisted page_state"
   );
 
+  const nAfterApproveFlow = (await send({ type: "status" })).n;
+  const injectBeforeTakeover = injected.length;
+  const hubNavBefore = hubSent.filter(
+    (h) => h.type === "takeover_event" && h.data && h.data.kind === "navigation"
+  ).length;
+  vm.runInContext('handleHubMessage({ type: "takeover_start", data: {} })', sandbox);
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  tabs[0].active = true;
+  await commit("https://neworigin.example/page", 1);
+  const hubNav = hubSent.filter(
+    (h) => h.type === "takeover_event" && h.data && h.data.kind === "navigation"
+  );
+  assert(
+    hubNav.length > hubNavBefore,
+    "takeover must emit navigation takeover_event"
+  );
+  assert(
+    hubNav.some((h) => String((h.data && h.data.url) || "").startsWith("https://neworigin.example")),
+    "takeover records off-allowlist http(s) goto, events=" +
+      JSON.stringify(hubNav.map((h) => h.data && h.data.url))
+  );
+  assert(
+    injected.length === injectBeforeTakeover,
+    "takeover http(s) goto must not inject off-allowlist origin"
+  );
+  const stTake = await send({ type: "status" });
+  assert(
+    !stTake.allowlist.includes("https://neworigin.example"),
+    "takeover goto must not silent-add origin"
+  );
+  assert(stTake.n > nAfterApproveFlow, "takeover http(s) goto is stored");
+
+  const nBeforeTakeoverBlocked = stTake.n;
+  const hubNavCount = hubSent.filter(
+    (h) => h.type === "takeover_event" && h.data && h.data.kind === "navigation"
+  ).length;
+  await commit("javascript:alert(1)", 1);
+  await commit("file:///etc/passwd", 1);
+  await commit("data:text/html,hi", 1);
+  const stTakeBlocked = await send({ type: "status" });
+  assert(
+    stTakeBlocked.n === nBeforeTakeoverBlocked,
+    "takeover must not record javascript:/file:/data:"
+  );
+  const hubNavAfterBad = hubSent.filter(
+    (h) => h.type === "takeover_event" && h.data && h.data.kind === "navigation"
+  ).length;
+  assert(
+    hubNavAfterBad === hubNavCount,
+    "takeover must not hub-send javascript:/file:/data: navigation"
+  );
+
   console.log("PASS: CLI origin injected+recorded");
   console.log("PASS: unapproved second origin not injected");
-  console.log("PASS: unapproved second origin not recorded");
+  console.log("PASS: unapproved second origin http(s) navigation recorded");
+  console.log("PASS: unapproved origin click not recorded");
   console.log("PASS: unapproved origin not added to allowlist");
   console.log("PASS: navigation does not call permissions.request");
   console.log("PASS: explicit popup approve then injects+records");
   console.log("PASS: unapproved origin does not send page_state");
   console.log("PASS: allowlisted origin forwards page_state");
+  console.log("PASS: blocked schemes not recorded");
+  console.log("PASS: takeover records off-allowlist http(s) goto");
   process.exit(0);
 })().catch((e) => {
   console.error("FAIL:", e && e.stack ? e.stack : e);

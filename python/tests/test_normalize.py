@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 
 from cloakcli_worker.normalize import (
+    STRATEGY_ORDER,
+    collect_candidates,
     is_raw_dom_event,
     normalize_events,
     pick_selector,
@@ -28,15 +30,74 @@ def ev_click(**kw):
 
 
 class SelectorPriorityTests(unittest.TestCase):
-    def test_testid_beats_css_and_id(self):
+    def test_collect_candidates_plan_c_order(self):
+        self.assertEqual(
+            STRATEGY_ORDER,
+            ("id", "testid", "name", "aria", "text", "css", "coords"),
+        )
+        ev = ev_click(
+            selector="form > button:nth-of-type(1)",
+            role="button",
+            accessible_name="Go",
+            text="Go",
+            tag="button",
+            selector_candidates={
+                "id": "#go",
+                "testid": '[data-testid="submit"]',
+                "name": 'button[name="go"]',
+                "role_name": '[role="button"][aria-label="Go"]',
+                "aria": 'button[aria-label="Go"]',
+                "text": 'button:has-text("Go")',
+                "css_path": "form > button:nth-of-type(1)",
+            },
+        )
+        ranked = collect_candidates(ev)
+        strategies = [s for s, _ in ranked]
+        self.assertEqual(strategies[0], "id")
+        self.assertEqual(strategies[1], "testid")
+        self.assertEqual(strategies[2], "name")
+        self.assertEqual(strategies[3], "aria")
+        self.assertIn("text", strategies)
+        self.assertEqual(strategies[-1], "css")
+        self.assertLess(strategies.index("id"), strategies.index("testid"))
+        self.assertLess(strategies.index("testid"), strategies.index("name"))
+        self.assertLess(strategies.index("name"), strategies.index("aria"))
+        self.assertLess(strategies.index("aria"), strategies.index("text"))
+        self.assertLess(strategies.index("text"), strategies.index("css"))
+
+    def test_id_beats_testid_name_aria_and_css(self):
         ev = ev_click(
             selector="div > button:nth-of-type(3)",
             selector_candidates={
                 "id": "#go",
                 "testid": '[data-testid="submit"]',
+                "name": 'button[name="go"]',
+                "aria": 'button[aria-label="Go"]',
                 "css_path": "form > button:nth-of-type(1)",
             },
-            candidate_unique={"testid": True, "id": True, "css": True},
+            candidate_unique={
+                "id": True,
+                "testid": True,
+                "name": True,
+                "aria": True,
+                "css": True,
+            },
+        )
+        sel, strategy, conf, fail = pick_selector(ev)
+        self.assertEqual(sel, "#go")
+        self.assertEqual(strategy, "id")
+        self.assertGreater(conf, 0.8)
+        self.assertEqual(fail, "")
+
+    def test_testid_beats_name_when_no_id(self):
+        ev = ev_click(
+            selector="div > button:nth-of-type(3)",
+            selector_candidates={
+                "testid": '[data-testid="submit"]',
+                "name": 'button[name="go"]',
+                "css_path": "form > button:nth-of-type(1)",
+            },
+            candidate_unique={"testid": True, "name": True, "css": True},
         )
         sel, strategy, conf, fail = pick_selector(ev)
         self.assertEqual(sel, '[data-testid="submit"]')
@@ -44,7 +105,23 @@ class SelectorPriorityTests(unittest.TestCase):
         self.assertGreater(conf, 0.8)
         self.assertEqual(fail, "")
 
-    def test_role_name_before_label_and_css(self):
+    def test_name_beats_aria_and_text(self):
+        ev = ev_click(
+            tag="button",
+            text="Save",
+            selector_candidates={
+                "name": 'button[name="save"]',
+                "role_name": '[role="button"][aria-label="Save"]',
+                "text": 'button:has-text("Save")',
+                "css_path": "div > button:nth-of-type(2)",
+            },
+            candidate_unique={"name": True, "role_name": True, "text": True},
+        )
+        sel, strategy, *_ = pick_selector(ev)
+        self.assertEqual(strategy, "name")
+        self.assertEqual(sel, 'button[name="save"]')
+
+    def test_aria_role_before_text_and_css(self):
         ev = ev_click(
             role="button",
             accessible_name="Save",
@@ -59,7 +136,7 @@ class SelectorPriorityTests(unittest.TestCase):
             candidate_unique={"role_name": True, "label": True},
         )
         sel, strategy, *_ = pick_selector(ev)
-        self.assertEqual(strategy, "role_name")
+        self.assertEqual(strategy, "aria")
         self.assertIn("role", sel)
 
     def test_label_before_text_and_css(self):
@@ -72,7 +149,7 @@ class SelectorPriorityTests(unittest.TestCase):
             candidate_unique={"label": True},
         )
         sel, strategy, *_ = pick_selector(ev)
-        self.assertEqual(strategy, "label")
+        self.assertEqual(strategy, "aria")
         self.assertEqual(sel, 'button[aria-label="Continue"]')
 
     def test_stable_text_before_css_path(self):
@@ -86,6 +163,23 @@ class SelectorPriorityTests(unittest.TestCase):
         sel, strategy, *_ = pick_selector(ev)
         self.assertEqual(strategy, "text")
         self.assertIn("has-text", sel)
+
+    def test_page_uniqueness_skips_non_unique_id_then_testid(self):
+        page = FakePage()
+        page.selector_counts["#dup"] = 2
+        page.selector_counts['[data-testid="one"]'] = 1
+        page.elements['[data-testid="one"]'] = {"text": "x"}
+        ev = ev_click(
+            selector="#dup",
+            selector_candidates={
+                "id": "#dup",
+                "testid": '[data-testid="one"]',
+                "name": 'button[name="one"]',
+            },
+        )
+        sel, strategy, *_ = pick_selector(ev, page=page)
+        self.assertEqual(strategy, "testid")
+        self.assertEqual(sel, '[data-testid="one"]')
 
     def test_page_uniqueness_skips_non_unique_testid(self):
         page = FakePage()
@@ -101,7 +195,7 @@ class SelectorPriorityTests(unittest.TestCase):
             },
         )
         sel, strategy, *_ = pick_selector(ev, page=page)
-        self.assertEqual(strategy, "label")
+        self.assertEqual(strategy, "aria")
         self.assertEqual(sel, 'button[aria-label="Only"]')
 
 
@@ -286,6 +380,8 @@ class NormalizePipelineTests(unittest.TestCase):
         self.assertEqual(len(r.steps), 1)
         self.assertEqual(r.steps[0]["action"], "goto")
         self.assertTrue(r.steps[0]["url"].startswith("https://paste.example/doc"))
+        self.assertEqual(r.steps[0]["source"], "human")
+        self.assertFalse(is_raw_dom_event(r.steps[0]))
 
     def test_file_and_data_nav_rejected(self):
         for url in ("file:///etc/passwd", "data:text/html,hi"):
