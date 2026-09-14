@@ -9,9 +9,9 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io;
 use std::path::Path;
@@ -27,15 +27,7 @@ use crate::teach_hub::TeachHubHandle;
 use crate::teach_protocol::TeachMachine;
 use uuid::Uuid;
 
-const BG: Color = Color::Rgb(22, 22, 24);
-const FG: Color = Color::Rgb(230, 230, 230);
-const MUTED: Color = Color::Rgb(120, 120, 128);
-const ACCENT: Color = Color::Rgb(217, 119, 87);
-const INFO: Color = Color::Rgb(96, 165, 250);
-const OK: Color = Color::Rgb(74, 222, 128);
-const WARN: Color = Color::Rgb(251, 191, 36);
-const ERR: Color = Color::Rgb(248, 113, 113);
-const PURPLE: Color = Color::Rgb(167, 139, 250);
+use super::theme::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatCmd {
@@ -56,6 +48,7 @@ pub enum ChatCmd {
 }
 
 pub fn draw(f: &mut Frame, area: Rect, session: &ChatSession, profile: &str, session_id: &str) {
+    fill_bg(f, area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -78,17 +71,6 @@ pub fn draw(f: &mut Frame, area: Rect, session: &ChatSession, profile: &str, ses
     draw_input(f, chunks[3], session);
 }
 
-fn bordered(title: &str, focused: bool) -> Block<'static> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if focused { ACCENT } else { MUTED }))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(if focused { ACCENT } else { MUTED }),
-        ))
-        .style(Style::default().bg(BG).fg(FG))
-}
-
 fn draw_header(f: &mut Frame, area: Rect, profile: &str, session_id: &str, session: &ChatSession) {
     let sid = if session_id.is_empty() {
         "(local)"
@@ -96,9 +78,15 @@ fn draw_header(f: &mut Frame, area: Rect, profile: &str, session_id: &str, sessi
         session_id
     };
     let line = Line::from(vec![
-        Span::styled(" Teach Chat ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("profile={profile}  session={sid}  "), Style::default().fg(MUTED)),
-        Span::styled(session.phase.as_str(), Style::default().fg(INFO)),
+        Span::styled(
+            " Teach Chat ",
+            Style::default().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("profile={profile}  session={sid}  "),
+            Style::default().fg(MUTED).bg(BG),
+        ),
+        Span::styled(session.phase.as_str(), Style::default().fg(MUTED).bg(BG)),
     ]);
     f.render_widget(Paragraph::new(line).block(bordered("session", false)), area);
 }
@@ -107,25 +95,31 @@ fn draw_dialogue(f: &mut Frame, area: Rect, session: &ChatSession) {
     let mut lines: Vec<Line> = Vec::new();
     for m in &session.messages {
         let (tag, color) = match m.role.as_str() {
-            "user" => ("User", ACCENT),
-            "assistant" => ("Assistant", INFO),
+            "user" => ("User", FG),
+            "assistant" => ("Assistant", FG),
             _ => ("System", MUTED),
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{tag}: "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(m.text.clone(), Style::default().fg(FG)),
+            Span::styled(
+                format!("{tag}: "),
+                Style::default().fg(color).bg(BG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(m.text.clone(), Style::default().fg(FG).bg(BG)),
         ]));
     }
     if !session.stream.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("Assistant: ", Style::default().fg(INFO).add_modifier(Modifier::BOLD)),
-            Span::styled(session.stream.clone(), Style::default().fg(MUTED)),
+            Span::styled(
+                "Assistant: ",
+                Style::default().fg(FG).bg(BG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(session.stream.clone(), Style::default().fg(MUTED).bg(BG)),
         ]));
     }
     if session.recording {
         lines.push(Line::from(Span::styled(
             "REC: human actions are not exported until you stop takeover (Ctrl-T). They will be normalized to Playwright steps.",
-            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            Style::default().fg(WARN).bg(BG).add_modifier(Modifier::BOLD),
         )));
     }
     if let Some(p) = &session.pending_normalize {
@@ -136,7 +130,7 @@ fn draw_dialogue(f: &mut Frame, area: Rect, session: &ChatSession) {
                 p.needs_confirm,
                 p.non_exportable
             ),
-            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            Style::default().fg(WARN).bg(BG).add_modifier(Modifier::BOLD),
         )));
     }
     if let Some(c) = &session.confirm {
@@ -145,7 +139,7 @@ fn draw_dialogue(f: &mut Frame, area: Rect, session: &ChatSession) {
                 "CONFIRM nav {} → {}  (Y=yes, N/Esc=no; Enter does not confirm)",
                 c.from_origin, c.to_origin
             ),
-            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            Style::default().fg(WARN).bg(BG).add_modifier(Modifier::BOLD),
         )));
     }
     let inner = area.height.saturating_sub(2) as usize;
@@ -167,7 +161,7 @@ fn draw_tools(f: &mut Frame, area: Rect, session: &ChatSession) {
     if session.tools.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no actions this turn)",
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED).bg(BG),
         )));
     } else {
         for t in &session.tools {
@@ -185,9 +179,9 @@ fn draw_tools(f: &mut Frame, area: Rect, session: &ChatSession) {
                 "[LLM] "
             };
             lines.push(Line::from(vec![
-                Span::styled(tag, Style::default().fg(PURPLE)),
-                Span::styled(t.summary.clone(), Style::default().fg(FG)),
-                Span::styled(format!("  {}", t.status), Style::default().fg(color)),
+                Span::styled(tag, Style::default().fg(MUTED).bg(BG)),
+                Span::styled(t.summary.clone(), Style::default().fg(FG).bg(BG)),
+                Span::styled(format!("  {}", t.status), Style::default().fg(color).bg(BG)),
             ]));
         }
     }
@@ -224,14 +218,17 @@ fn draw_status_bar(f: &mut Frame, area: Rect, session: &ChatSession) {
     let rec = if session.recording { "REC=on" } else { "REC=off" };
     let rec_color = if session.recording { WARN } else { MUTED };
     let line = Line::from(vec![
-        Span::styled(format!(" {url} "), Style::default().fg(INFO)),
-        Span::styled("|", Style::default().fg(MUTED)),
-        Span::styled(format!(" {origin} "), Style::default().fg(FG)),
-        Span::styled("|", Style::default().fg(MUTED)),
-        Span::styled(format!(" {hub} {ext} {wrk} "), Style::default().fg(MUTED)),
-        Span::styled("|", Style::default().fg(MUTED)),
-        Span::styled(format!(" {rec} {} ", session.mode), Style::default().fg(rec_color)),
-        Span::styled(&session.status, Style::default().fg(MUTED)),
+        Span::styled(format!(" {url} "), Style::default().fg(FG).bg(BG)),
+        Span::styled("|", Style::default().fg(BORDER).bg(BG)),
+        Span::styled(format!(" {origin} "), Style::default().fg(FG).bg(BG)),
+        Span::styled("|", Style::default().fg(BORDER).bg(BG)),
+        Span::styled(format!(" {hub} {ext} {wrk} "), Style::default().fg(MUTED).bg(BG)),
+        Span::styled("|", Style::default().fg(BORDER).bg(BG)),
+        Span::styled(
+            format!(" {rec} {} ", session.mode),
+            Style::default().fg(rec_color).bg(BG),
+        ),
+        Span::styled(&session.status, Style::default().fg(MUTED).bg(BG)),
     ]);
     f.render_widget(Paragraph::new(line).block(bordered("status", false)), area);
 }
@@ -261,7 +258,8 @@ fn draw_input(f: &mut Frame, area: Rect, session: &ChatSession) {
     };
     let fg = if session.input.is_empty() { MUTED } else { FG };
     f.render_widget(
-        Paragraph::new(Span::styled(shown, Style::default().fg(fg))).block(bordered("input", true)),
+        Paragraph::new(Span::styled(shown, Style::default().fg(fg).bg(BG)))
+            .block(bordered("input", true)),
         area,
     );
 }

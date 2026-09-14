@@ -3,6 +3,7 @@
 //! register via outbound connections to the embedded master hub.
 
 pub mod chat;
+mod theme;
 mod ui;
 
 use anyhow::Result;
