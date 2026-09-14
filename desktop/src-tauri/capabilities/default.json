@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: custom chrome, read-only catalog DTOs, and the fixed cloakcli tui PTY (Diagnostics only). No shell/fs/opener APIs.",
+  "description": "Main window: catalog DTOs, teach-chat JSONL adapter, and the fixed cloakcli tui PTY (Diagnostics only). No shell/fs/opener APIs.",
   "windows": ["main"],
   "permissions": [
     "core:event:default",
@@ -21,6 +21,14 @@
     "allow-pty-stop",
     "allow-list-profiles",
     "allow-list-skills",
-    "allow-ops-status"
+    "allow-ops-status",
+    "allow-teach-chat-start",
+    "allow-teach-chat-send",
+    "allow-teach-chat-cancel",
+    "allow-teach-chat-confirm",
+    "allow-teach-chat-status",
+    "allow-teach-chat-stop",
+    "allow-job-start",
+    "allow-job-cancel"
   ]
 }

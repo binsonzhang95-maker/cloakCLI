@@ -1,4 +1,4 @@
-import { getState } from "../store.js";
+import { getState, selectSkill } from "../store.js";
 
 function esc(s) {
   return String(s ?? "")
@@ -8,14 +8,14 @@ function esc(s) {
 }
 
 export function renderSkills(root) {
-  const { skills, skillsInvalid } = getState();
+  const { skills, skillsInvalid, selectedSkill } = getState();
   root.innerHTML = `
     <div class="page-head">
       <div>
         <div class="page-kicker">SKILLS</div>
         <div class="page-title">Catalog</div>
       </div>
-      <div class="page-sub">${skills.length} skill(s) · steps not sent to UI</div>
+      <div class="page-sub">${skills.length} skill(s) · selected ${esc(selectedSkill || "—")} · steps not sent to UI</div>
     </div>
     <div class="table" id="skill-table"></div>
   `;
@@ -25,15 +25,16 @@ export function renderSkills(root) {
     return;
   }
   const rows = skills
-    .map(
-      (s) => `
-      <div class="row skills-row">
+    .map((s) => {
+      const sel = selectedSkill === s.name ? " is-selected" : "";
+      return `
+      <div class="row skills-row${sel}" data-name="${esc(s.name)}" role="button" tabindex="0">
         <div class="row-name">${esc(s.name)}</div>
         <div class="row-meta">${esc(s.description || "—")}</div>
         <div class="row-meta">${s.step_count} steps</div>
         <div class="row-meta">${esc(s.on_stall || "fail")}</div>
-      </div>`,
-    )
+      </div>`;
+    })
     .join("");
   const invalid = skillsInvalid
     .map(
@@ -47,4 +48,13 @@ export function renderSkills(root) {
     )
     .join("");
   table.innerHTML = rows + invalid;
+  table.querySelectorAll(".skills-row[data-name]").forEach((row) => {
+    row.addEventListener("click", () => selectSkill(row.dataset.name));
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        selectSkill(row.dataset.name);
+      }
+    });
+  });
 }

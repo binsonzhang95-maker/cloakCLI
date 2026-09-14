@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-teach-chat-confirm"
+description = "Enables the teach_chat_confirm command without any pre-configured scope."
+commands.allow = ["teach_chat_confirm"]
+
+[[permission]]
+identifier = "deny-teach-chat-confirm"
+description = "Denies the teach_chat_confirm command without any pre-configured scope."
+commands.deny = ["teach_chat_confirm"]

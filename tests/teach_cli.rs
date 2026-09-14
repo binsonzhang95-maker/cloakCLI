@@ -2,9 +2,10 @@
 //! lock-conflicts clearly, and headed smoke is skipped without a display.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_cloakcli"))
@@ -58,6 +59,8 @@ fn help_lists_teach_start() {
     assert!(chat.status.success(), "{}", combined(&chat));
     let c = combined(&chat);
     assert!(c.contains("mock-json") || c.contains("mock_json") || c.contains("Chat"), "{c}");
+    assert!(c.contains("events"), "{c}");
+    assert!(c.contains("no-browser"), "{c}");
     let turn = bin()
         .args(["teach", "turn", "--help"])
         .output()
@@ -444,4 +447,99 @@ fn headed_smoke_or_skip() {
         "expected teach banner: {t}"
     );
     let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn events_no_browser_mock_turn_and_redacts() {
+    let home = tmp_home();
+    let created = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args(["profile", "create", "demo"])
+        .output()
+        .expect("create");
+    assert!(created.status.success(), "{}", combined(&created));
+
+    let mock = r#"{"schema_version":1,"actions":[{"action":"click","selector":"a"},{"action":"done","reason":"ok"}]}"#;
+    let mut child = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "chat",
+            "--profile",
+            "demo",
+            "--events",
+            "--no-browser",
+            "--mock-json",
+            mock,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn events");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut session_line = String::new();
+    reader
+        .read_line(&mut session_line)
+        .expect("session event");
+    assert!(
+        session_line.contains("\"kind\":\"session\"") || session_line.contains("\"kind\": \"session\""),
+        "first event should be session: {session_line}"
+    );
+    assert!(session_line.contains("demo"), "{session_line}");
+
+    writeln!(
+        stdin,
+        r#"{{"cmd":"send","goal":"click the link token=abc123SECRETVALUE","profile":"demo"}}"#
+    )
+    .unwrap();
+    writeln!(stdin, r#"{{"cmd":"stop"}}"#).unwrap();
+    drop(stdin);
+
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child
+        .wait_timeout()
+        .unwrap_or_else(|_| child.wait().expect("wait"));
+    let stderr = {
+        let mut s = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut err, &mut s);
+        }
+        s
+    };
+    let all = format!("{session_line}{rest}");
+    assert!(status.success(), "events exit {:?}\n{all}\n{stderr}", status.code());
+    assert!(all.contains("\"kind\":\"user\"") || all.contains("\"kind\": \"user\""), "{all}");
+    assert!(all.contains("\"kind\":\"assistant\"") || all.contains("\"kind\": \"assistant\""), "{all}");
+    assert!(all.contains("\"kind\":\"job\"") || all.contains("\"kind\": \"job\""), "{all}");
+    assert!(all.contains("\"kind\":\"closed\"") || all.contains("\"kind\": \"closed\""), "{all}");
+    assert!(!all.contains("abc123SECRETVALUE"), "secret leaked: {all}");
+    assert!(!stderr.contains("abc123SECRETVALUE"), "secret on stderr: {stderr}");
+    let _ = fs::remove_dir_all(&home);
+}
+
+trait WaitTimeout {
+    fn wait_timeout(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+impl WaitTimeout for std::process::Child {
+    fn wait_timeout(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match self.try_wait()? {
+                Some(st) => return Ok(st),
+                None => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = self.kill();
+                        return self.wait();
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
 }

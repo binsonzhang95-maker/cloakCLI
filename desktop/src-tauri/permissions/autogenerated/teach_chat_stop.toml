@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-teach-chat-stop"
+description = "Enables the teach_chat_stop command without any pre-configured scope."
+commands.allow = ["teach_chat_stop"]
+
+[[permission]]
+identifier = "deny-teach-chat-stop"
+description = "Denies the teach_chat_stop command without any pre-configured scope."
+commands.deny = ["teach_chat_stop"]

@@ -59,6 +59,15 @@ pub fn inherited_env() -> BTreeMap<OsString, OsString> {
 }
 
 pub fn is_whitelisted(name: &str) -> bool {
+    if name == "CLOAKCLI_BIN" {
+        return false;
+    }
+    if name == "OPENAI_API_KEY" {
+        return true;
+    }
+    if name.starts_with("CLOAKCLI_") {
+        return true;
+    }
     EXACT.iter().any(|k| *k == name)
 }
 
@@ -71,6 +80,9 @@ mod tests {
         assert!(is_whitelisted("PATH"));
         assert!(is_whitelisted("CLOAKCLI_PYTHON"));
         assert!(is_whitelisted("CLOAKCLI_MASTER_TOKEN"));
+        assert!(is_whitelisted("CLOAKCLI_LLM_API_KEY"));
+        assert!(is_whitelisted("CLOAKCLI_TEACH_CHAT_MOCK"));
+        assert!(is_whitelisted("OPENAI_API_KEY"));
     }
 
     #[test]

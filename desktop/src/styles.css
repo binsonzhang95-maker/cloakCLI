@@ -530,6 +530,70 @@ html.shimmer .row.is-selected {
   word-break: break-word;
 }
 
+.chat-pair {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.pair-lamps,
+.pair-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pair-meta {
+  color: var(--muted);
+  margin-left: auto;
+}
+
+.pair-ids {
+  color: var(--chrome);
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.pair-actions input[type="text"] {
+  flex: 1;
+  min-width: 160px;
+  background: var(--bg-raised);
+  border: 1px solid var(--line-strong);
+  padding: 4px 8px;
+  outline: none;
+}
+
+.pair-actions input[type="text"]:focus {
+  border-color: var(--cyan);
+}
+
+.pair-actions button {
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--cyan);
+  background: transparent;
+  color: var(--cyan);
+  cursor: pointer;
+}
+
+.pair-actions button.ghost,
+.job-card button.ghost {
+  border-color: var(--line-strong);
+  color: var(--muted);
+}
+
+.check-row.compact {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .job-card {
   margin: 0 12px 8px;
   border: 1px solid var(--line);
@@ -541,6 +605,54 @@ html.shimmer .row.is-selected {
 .job-card strong {
   color: var(--text);
   font-weight: 650;
+}
+
+.job-card.is-running {
+  border-color: var(--cyan);
+}
+
+.job-card.is-failed {
+  border-color: var(--err);
+}
+
+.job-card.is-done {
+  border-color: var(--ok);
+}
+
+.job-card.is-cancelled {
+  border-color: var(--warn);
+}
+
+.job-card.is-needs_confirm {
+  border-color: var(--warn);
+}
+
+.job-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.job-head button {
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--cyan);
+  background: transparent;
+  color: var(--cyan);
+  cursor: pointer;
+}
+
+.job-tool {
+  display: grid;
+  grid-template-columns: 88px 1fr;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.job-hint {
+  margin-top: 4px;
+  color: var(--chrome);
 }
 
 .chat-input {

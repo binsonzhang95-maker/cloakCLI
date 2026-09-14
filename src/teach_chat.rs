@@ -721,11 +721,35 @@ pub fn build_messages(user: &str, page: Option<&PageBrief>, allow_origins: &[Str
     build_messages_ex(user, page, allow_origins, None)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TurnContext<'a> {
+    pub human_summary: Option<&'a str>,
+    pub profile: Option<&'a str>,
+    pub skill: Option<&'a str>,
+}
+
 pub fn build_messages_ex(
     user: &str,
     page: Option<&PageBrief>,
     allow_origins: &[String],
     human_summary: Option<&str>,
+) -> Vec<Value> {
+    build_messages_ctx(
+        user,
+        page,
+        allow_origins,
+        TurnContext {
+            human_summary,
+            ..TurnContext::default()
+        },
+    )
+}
+
+pub fn build_messages_ctx(
+    user: &str,
+    page: Option<&PageBrief>,
+    allow_origins: &[String],
+    ctx: TurnContext<'_>,
 ) -> Vec<Value> {
     let page_val = match page {
         Some(p) => json!({
@@ -735,18 +759,25 @@ pub fn build_messages_ex(
         }),
         None => Value::Null,
     };
-    let human = human_summary
+    let human = ctx
+        .human_summary
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| Value::String(redact_for_log(s)))
         .unwrap_or(Value::Null);
-    let user_obj = json!({
+    let mut user_obj = json!({
         "goal": redact_for_log(user),
         "page": page_val,
         "allow_origins": allow_origins,
         "max_actions": MAX_ACTIONS_PER_TURN,
         "human_steps_summary": human,
     });
+    if let Some(p) = ctx.profile.map(str::trim).filter(|s| !s.is_empty()) {
+        user_obj["profile"] = json!(p);
+    }
+    if let Some(s) = ctx.skill.map(str::trim).filter(|s| !s.is_empty()) {
+        user_obj["skill"] = json!(s);
+    }
     vec![
         json!({"role": "system", "content": SYSTEM_PROMPT}),
         json!({"role": "user", "content": user_obj.to_string()}),
@@ -881,7 +912,27 @@ pub async fn run_llm_turn_ex(
     allow_origins: &[String],
     human_summary: Option<&str>,
 ) -> Result<PlannedTurn> {
-    let messages = build_messages_ex(user, page, allow_origins, human_summary);
+    run_llm_turn_ctx(
+        llm,
+        user,
+        page,
+        allow_origins,
+        TurnContext {
+            human_summary,
+            ..TurnContext::default()
+        },
+    )
+    .await
+}
+
+pub async fn run_llm_turn_ctx(
+    llm: &dyn TeachLlm,
+    user: &str,
+    page: Option<&PageBrief>,
+    allow_origins: &[String],
+    ctx: TurnContext<'_>,
+) -> Result<PlannedTurn> {
+    let messages = build_messages_ctx(user, page, allow_origins, ctx);
     let text = llm.complete(&messages)?;
     let current = page.map(|p| p.origin.as_str()).filter(|s| !s.is_empty());
     Ok(plan_turn(&text, allow_origins, current))
@@ -1122,6 +1173,24 @@ pub fn format_plan(planned: &PlannedTurn) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_includes_profile_and_skill() {
+        let msgs = build_messages_ctx(
+            "click go",
+            None,
+            &[],
+            TurnContext {
+                profile: Some("demo"),
+                skill: Some("hello"),
+                human_summary: None,
+            },
+        );
+        let content = msgs[1]["content"].as_str().unwrap();
+        assert!(content.contains("demo"), "{content}");
+        assert!(content.contains("hello"), "{content}");
+        assert!(content.contains("click go"), "{content}");
+    }
 
     #[test]
     fn parse_rejects_raw_prose() {

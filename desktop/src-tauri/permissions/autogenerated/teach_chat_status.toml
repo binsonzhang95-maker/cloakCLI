@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-teach-chat-status"
+description = "Enables the teach_chat_status command without any pre-configured scope."
+commands.allow = ["teach_chat_status"]
+
+[[permission]]
+identifier = "deny-teach-chat-status"
+description = "Denies the teach_chat_status command without any pre-configured scope."
+commands.deny = ["teach_chat_status"]

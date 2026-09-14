@@ -73,3 +73,40 @@ export function mockAckPreview(summary) {
     `secrets: ${summary.hadSecrets ? "omitted" : "none"}`,
   ].join("\n");
 }
+
+const EVENT_ID_KEYS = new Set([
+  "kind",
+  "v",
+  "role",
+  "code",
+  "phase",
+  "state",
+  "job_id",
+  "session_id",
+  "pairing_id",
+  "pairing_code",
+  "hub_url",
+  "profile",
+  "spawn_browser",
+  "hub",
+  "worker",
+  "extension",
+  "busy",
+  "ok",
+  "mode",
+  "last_request_id",
+  "running",
+]);
+
+/** Defense in depth: redact free-text fields on teach_chat_event payloads. */
+export function redactEventPayload(payload) {
+  if (payload == null) return payload;
+  if (typeof payload === "string") return redactText(payload);
+  if (Array.isArray(payload)) return payload.map(redactEventPayload);
+  if (typeof payload !== "object") return payload;
+  const out = {};
+  for (const [k, v] of Object.entries(payload)) {
+    out[k] = EVENT_ID_KEYS.has(k) ? v : redactEventPayload(v);
+  }
+  return out;
+}

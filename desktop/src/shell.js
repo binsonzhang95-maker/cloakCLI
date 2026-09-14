@@ -12,7 +12,7 @@ import {
   subscribe,
   toggleInspector,
 } from "./store.js";
-import { renderChat } from "./features/teach-chat.js";
+import { ensureChatEvents, renderChat, updateChatChrome } from "./features/teach-chat.js";
 import { renderProfiles } from "./features/profiles.js";
 import { renderSkills } from "./features/skills.js";
 import { renderRuns } from "./features/runs.js";
@@ -88,6 +88,7 @@ function paintInspector(state) {
       <span>proxy</span><span>${escapeHtml(p.proxy || "direct")}</span>
       <span>cookies</span><span>${p.cookie_present ? `${p.cookie_count} (${p.cookie_valid} valid)` : "none"}</span>
       <span>notes</span><span>${escapeHtml(p.notes || "—")}</span>
+      <span>skill</span><span>${escapeHtml(state.selectedSkill || "—")}</span>
     </div>`;
   }
   const skills = state.skills.slice(0, 8).map((s) => s.name);
@@ -129,6 +130,7 @@ function paintRoute(state) {
 
 let lastRoute = null;
 let lastProfile = null;
+let lastSkill = null;
 let lastCatalogSig = "";
 
 function onState(state) {
@@ -139,10 +141,37 @@ function onState(state) {
     e: state.error,
     j: state.status?.jobs_recent?.length,
   });
-  if (state.route !== lastRoute || state.selectedProfile !== lastProfile || sig !== lastCatalogSig) {
+  const routeChanged = state.route !== lastRoute;
+  if (routeChanged) {
     paintRoute(state);
     lastRoute = state.route;
     lastProfile = state.selectedProfile;
+    lastSkill = state.selectedSkill;
+    lastCatalogSig = sig;
+    return;
+  }
+  if (state.route === "chat") {
+    if (state.selectedProfile !== lastProfile || state.selectedSkill !== lastSkill) {
+      updateChatChrome();
+      lastProfile = state.selectedProfile;
+      lastSkill = state.selectedSkill;
+    }
+    return;
+  }
+  if (state.route === "profiles" && state.selectedProfile !== lastProfile) {
+    renderProfiles($("page-profiles"));
+    lastProfile = state.selectedProfile;
+    return;
+  }
+  if (state.route === "skills" && (state.selectedSkill !== lastSkill || sig !== lastCatalogSig)) {
+    renderSkills($("page-skills"));
+    lastSkill = state.selectedSkill;
+    lastCatalogSig = sig;
+    return;
+  }
+  if (sig !== lastCatalogSig) {
+    if (state.route === "runs") renderRuns($("page-runs"));
+    if (state.route === "profiles") renderProfiles($("page-profiles"));
     lastCatalogSig = sig;
   }
 }
@@ -241,6 +270,7 @@ export async function bootShell() {
 
   window.addEventListener("resize", () => syncMaximizeIcon());
   await syncMaximizeIcon();
+  await ensureChatEvents();
   await refreshCatalog();
 }
 

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   looksLikeSecret,
   mockAckPreview,
+  redactEventPayload,
   redactText,
   summarizeUserMessage,
 } from "./redact.js";
@@ -60,6 +61,22 @@ test("plain teach messages are stored, not sliced into the ack", () => {
   assert.equal(ack.includes(raw), false);
   assert.equal(ack.includes("preview: [omitted]"), true);
   assert.equal(ack.includes("secrets: none"), true);
+});
+
+test("redactEventPayload redacts free-text and keeps pairing ids", () => {
+  const ev = redactEventPayload({
+    kind: "assistant",
+    pairing_code: "K7Q2MX",
+    session_id: "sess-1",
+    text: "Authorization: Bearer sk-secretTEST99abc cookie=SESSIONID_SUPER_SECRET",
+    summary: "token=abc123SECRETVALUE",
+  });
+  assert.equal(ev.kind, "assistant");
+  assert.equal(ev.pairing_code, "K7Q2MX");
+  assert.equal(ev.session_id, "sess-1");
+  assert.equal(ev.text.includes("sk-secretTEST99abc"), false, ev.text);
+  assert.equal(ev.text.includes("SESSIONID_SUPER_SECRET"), false, ev.text);
+  assert.equal(ev.summary.includes("abc123SECRETVALUE"), false, ev.summary);
 });
 
 test("redactText strips remaining secret values", () => {

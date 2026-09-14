@@ -687,7 +687,11 @@ fn redact_secret_keys(text: &str) -> String {
     s = redact_prefix_value(&s, "Bearer ");
     s = redact_prefix_value(&s, "bearer ");
     s = redact_prefix_ci(&s, "authorization:");
+    s = redact_prefix_ci(&s, "authorization=");
     s = redact_prefix_ci(&s, "cookie:");
+    s = redact_prefix_ci(&s, "cookie=");
+    s = redact_prefix_ci(&s, "token=");
+    s = redact_prefix_ci(&s, "token:");
     s = redact_prefix_ci(&s, "password=");
     s
 }

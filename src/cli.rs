@@ -221,6 +221,12 @@ pub enum TeachCmd {
         /// Mock model JSON (skip network). Env CLOAKCLI_TEACH_CHAT_MOCK also works.
         #[arg(long)]
         mock_json: Option<String>,
+        /// JSONL stdin/stdout instead of the TUI (desktop adapter).
+        #[arg(long)]
+        events: bool,
+        /// Skip headed CloakBrowser (hub-only). Requires --events.
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Export a Teach Chat skill.json draft from unified Playwright steps (M4)
     Export {
@@ -1174,7 +1180,12 @@ pub async fn handle_teach(root: &Path, action: TeachCmd) -> Result<()> {
             profile,
             url,
             mock_json,
+            events,
+            no_browser,
         } => {
+            if no_browser && !events {
+                anyhow::bail!("--no-browser requires --events");
+            }
             crate::teach::start_chat(
                 root,
                 crate::teach::TeachStartOpts {
@@ -1184,6 +1195,8 @@ pub async fn handle_teach(root: &Path, action: TeachCmd) -> Result<()> {
                     smart_optimize: false,
                 },
                 mock_json,
+                events,
+                !no_browser,
             )
             .await
         }

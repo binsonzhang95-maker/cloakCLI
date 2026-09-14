@@ -8,6 +8,7 @@ const state = {
   skills: [],
   skillsInvalid: [],
   selectedProfile: null,
+  selectedSkill: null,
   status: null,
   shell: null,
   error: null,
@@ -58,6 +59,11 @@ export function setCatalog({ profiles, skills, skillsInvalid, status, shell, err
 
 export function selectProfile(name) {
   state.selectedProfile = name;
+  emit();
+}
+
+export function selectSkill(name) {
+  state.selectedSkill = name;
   emit();
 }
 

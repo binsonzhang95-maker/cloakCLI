@@ -3,6 +3,7 @@ mod env_inherit;
 mod paths;
 mod pty;
 mod redact;
+mod teach;
 
 use catalog::{OpsStatus, ProfileDto, SkillListDto};
 use pty::SharedPty;
@@ -11,9 +12,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::menu::Menu;
 use tauri::{AppHandle, Manager, WindowEvent};
+use teach::{JobStartDto, SharedTeach, TeachStartDto, TeachStatusDto};
 
 struct AppState {
     pty: SharedPty,
+    teach: SharedTeach,
     config_dir: PathBuf,
 }
 
@@ -114,6 +117,75 @@ fn list_skills(state: tauri::State<AppState>) -> Result<SkillListDto, String> {
 }
 
 #[tauri::command]
+fn teach_chat_start(
+    app: AppHandle,
+    profile: String,
+    url: Option<String>,
+    spawn_browser: Option<bool>,
+) -> Result<TeachStartDto, String> {
+    let state = app.state::<AppState>();
+    let exe = current_exe()?;
+    let stored = paths::load_stored_config(&state.config_dir);
+    let bin = paths::resolve_bin(&exe)?;
+    let home = paths::resolve_home(stored.cloakcli_home.as_deref(), &exe)?;
+    let spawn = spawn_browser.unwrap_or_else(teach::default_spawn_browser);
+    teach::start(
+        &state.teach,
+        app.clone(),
+        &bin,
+        &home,
+        &profile,
+        url.as_deref(),
+        spawn,
+    )
+}
+
+#[tauri::command]
+fn teach_chat_send(
+    state: tauri::State<AppState>,
+    goal: String,
+    profile: Option<String>,
+    skill: Option<String>,
+) -> Result<(), String> {
+    teach::send(
+        &state.teach,
+        &goal,
+        profile.as_deref(),
+        skill.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn teach_chat_cancel(state: tauri::State<AppState>) -> Result<(), String> {
+    teach::cancel(&state.teach)
+}
+
+#[tauri::command]
+fn teach_chat_confirm(state: tauri::State<AppState>, yes: bool) -> Result<(), String> {
+    teach::confirm(&state.teach, yes)
+}
+
+#[tauri::command]
+fn teach_chat_status(state: tauri::State<AppState>) -> Result<TeachStatusDto, String> {
+    teach::request_status(&state.teach)
+}
+
+#[tauri::command]
+fn teach_chat_stop(state: tauri::State<AppState>) -> Result<(), String> {
+    teach::stop(&state.teach)
+}
+
+#[tauri::command]
+fn job_start(state: tauri::State<AppState>) -> JobStartDto {
+    teach::job_start_dto(&state.teach)
+}
+
+#[tauri::command]
+fn job_cancel(state: tauri::State<AppState>) -> Result<(), String> {
+    teach::cancel(&state.teach)
+}
+
+#[tauri::command]
 fn ops_status(state: tauri::State<AppState>) -> OpsStatus {
     let exe = current_exe().ok();
     let stored = paths::load_stored_config(&state.config_dir);
@@ -144,6 +216,7 @@ fn ops_status(state: tauri::State<AppState>) -> OpsStatus {
 fn terminate_pty(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         let _ = pty::stop(&state.pty, Some(app));
+        let _ = teach::stop(&state.teach);
     }
 }
 
@@ -160,6 +233,7 @@ pub fn run() {
                 .unwrap_or_else(|_| std::env::temp_dir().join("cloakcli-desktop"));
             app.manage(AppState {
                 pty: Arc::new(Mutex::new(None)),
+                teach: Arc::new(Mutex::new(None)),
                 config_dir,
             });
             Ok(())
@@ -173,7 +247,15 @@ pub fn run() {
             pty_stop,
             list_profiles,
             list_skills,
-            ops_status
+            ops_status,
+            teach_chat_start,
+            teach_chat_send,
+            teach_chat_cancel,
+            teach_chat_confirm,
+            teach_chat_status,
+            teach_chat_stop,
+            job_start,
+            job_cancel
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

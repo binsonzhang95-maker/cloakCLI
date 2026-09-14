@@ -15,6 +15,7 @@ mod skills;
 mod state;
 mod teach;
 mod teach_chat;
+mod teach_events;
 mod teach_hub;
 mod teach_optimize;
 mod teach_protocol;

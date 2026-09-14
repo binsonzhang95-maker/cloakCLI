@@ -38,3 +38,43 @@ export async function ptyResize(cols, rows) {
 export async function ptyStop() {
   return invoke("pty_stop");
 }
+
+export async function teachChatStart(profile, url, spawnBrowser) {
+  return invoke("teach_chat_start", {
+    profile,
+    url: url || null,
+    spawnBrowser: spawnBrowser ?? null,
+  });
+}
+
+export async function teachChatSend(goal, profile, skill) {
+  return invoke("teach_chat_send", {
+    goal,
+    profile: profile || null,
+    skill: skill || null,
+  });
+}
+
+export async function teachChatCancel() {
+  return invoke("teach_chat_cancel");
+}
+
+export async function teachChatConfirm(yes) {
+  return invoke("teach_chat_confirm", { yes });
+}
+
+export async function teachChatStatus() {
+  return invoke("teach_chat_status");
+}
+
+export async function teachChatStop() {
+  return invoke("teach_chat_stop");
+}
+
+export async function jobStart() {
+  return invoke("job_start");
+}
+
+export async function jobCancel() {
+  return invoke("job_cancel");
+}

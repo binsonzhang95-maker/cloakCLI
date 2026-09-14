@@ -1,17 +1,18 @@
 # CloakCLI desktop shell
 
-Tauri 2 **geek ops console** (M1). The Web UI is the product home: Teach Chat, Profiles, Skills, Runs, and a collapsible inspector. **xterm.js + PTY is Diagnostics only** (`cloakcli tui`) and is not started on first paint.
+Tauri 2 **geek ops console** (M2). The Web UI is the product home: Teach Chat, Profiles, Skills, Runs, and a collapsible inspector. **xterm.js + PTY is Diagnostics only** (`cloakcli tui`) and is not started on first paint.
 
 The desktop crate does **not** reimplement CLI, TUI, worker, Playwright, or LLM logic. It:
 
 - draws custom chrome (drag / minimize / maximize / close)
 - renders a dense monospace ops UI (`#0b0d10`, 1px separators, cyan/coral accents)
-- calls read-only Tauri commands (`list_profiles`, `list_skills`, `ops_status`) that return structured DTOs from the same on-disk layout as the CLI (`profiles/`, `skills/`, `data/`)
+- calls read-only catalog commands (`list_profiles`, `list_skills`, `ops_status`) that return structured DTOs from the same on-disk layout as the CLI (`profiles/`, `skills/`, `data/`)
+- starts **Teach Chat** by spawning the resolved `cloakcli` binary with a **fixed argv** (`teach chat --events [--profile …] [--url …] [--no-browser]`) and speaking JSONL on stdin/stdout
 - lazy-loads **xterm.js** on the Diagnostics route and opens a real **PTY** for the fixed command `cloakcli tui`
 
-The frontend cannot spawn arbitrary commands. There is no shell plugin. Proxy userinfo is redacted; cookie **values are never copied** into DTOs, events, or logs.
+The frontend cannot spawn arbitrary commands. There is no shell plugin. Proxy userinfo is redacted; cookie **values are never copied** into DTOs, events, or logs. All free-text teach events are redacted (token / Authorization / cookie / bearer / api_key / `sk-` / proxy userinfo).
 
-Teach Chat in M1 is a **local protocol mock** (`teach_chat_send` / `teach_chat_event`). Live hub streaming is M2.
+Teach Chat is **live** (not a mock): `teach_chat_start` / `teach_chat_send` / `teach_chat_event` / cancel / confirm / status / reconnect. LLM, hub, and Playwright stay in `cloakcli`.
 
 ## Layout
 
@@ -58,7 +59,9 @@ export CLOAKCLI_HOME="$(cd .. && pwd)"                  # absolute repo root
 npm run tauri dev
 ```
 
-`npm run tauri dev` opens an ~1280×800 undecorated window on **Teach Chat**. It does **not** start a PTY. Profiles / skills / hub+worker status come from the catalog commands.
+`npm run tauri dev` opens an ~1280×800 undecorated window on **Teach Chat**. It does **not** start a PTY. Click **Start** (or send a goal) to spawn `cloakcli teach chat --events`. Uncheck **browser** when there is no display — hub-only mode still plans turns (`--mock-json` / `CLOAKCLI_TEACH_CHAT_MOCK` or a configured LLM) and reports `worker_not_connected` until the headed worker pairs.
+
+Headed loop (Mac / a box with a display): leave **browser** checked so CloakBrowser + teach extension start, pair, execute actions, and stream job/tool events back.
 
 Keyboard (also printed on the status bar):
 
@@ -121,8 +124,8 @@ On macOS an empty application menu (app name only) may still appear — there is
 
 - window chrome: drag, minimize, maximize/restore, close, is-maximized
 - events for PTY I/O
-- app commands: `shell_status`, `set_home`, `list_profiles`, `list_skills`, `ops_status`, `pty_start`, `pty_write`, `pty_resize`, `pty_stop`
-- `pty-status` is emitted when stop/reclaim finishes so Diagnostics Start/Stop/Restart can update
+- app commands: `shell_status`, `set_home`, `list_profiles`, `list_skills`, `ops_status`, `pty_start`, `pty_write`, `pty_resize`, `pty_stop`, `teach_chat_start`, `teach_chat_send`, `teach_chat_cancel`, `teach_chat_confirm`, `teach_chat_status`, `teach_chat_stop`, `job_start`, `job_cancel`
+- events: `teach_chat_event` (JSONL kinds: session/status/user/assistant/system/tool/job/error/closed), `pty-status` / `pty-exit`
 
 No `shell`, `os`, `fs`, or `opener` plugins. `pty_start` always execs the resolved `cloakcli` binary with the single argument `tui`. Catalog commands read files under `CLOAKCLI_HOME`; they never scrape terminal text.
 
@@ -142,8 +145,9 @@ PTY reads are decoded with a stateful UTF-8 buffer so a CJK or emoji scalar spli
 
 ## Known limits (this phase)
 
-- M1: Teach Chat is a static/mock protocol; Profiles/Skills/Runs are read-only.
-- Hub status is an honest file probe (control socket / `master.json`), not a live token-authenticated connection.
+- Teach Chat is live JSONL to `cloakcli`; Profiles/Skills catalogs stay read-only except selection (profile + optional skill are passed into the turn context).
+- Fleet `master submit` job start is **not wired** in the desktop (`job_start` returns an honest stub). The job card is the in-flight teach turn (start/progress/cancel via teach-chat).
+- Top-bar hub/worker lamps remain an honest file probe of the **master** control socket / `worker.pid`. Teach hub/worker/extension lamps live on the Chat pair strip.
 - Raw TUI still exists on Diagnostics; ratatui is not the product home.
 - No formal packaging, code signing, notarization, DMG, AppImage, or Windows installer.
 - Linux needs WebKitGTK 4.1 + GTK 3 **dev** packages to compile.
@@ -175,10 +179,24 @@ cd desktop/src-tauri && cargo test
 
 Catalog tests assert proxy userinfo is redacted, cookie values never appear in serialized DTOs, and free-text fields (`notes`, `description`, `on_stall`) redact token / Authorization / cookie samples.
 
-Frontend redaction (Teach Chat mock never stores or echoes pasted secrets):
+Frontend redaction (pasted secrets never stored/echoed; event payloads redacted):
 
 ```bash
 cd desktop && npm test
+```
+
+JSONL teach-chat smoke (no display, mock model):
+
+```bash
+./scripts/desktop-m2-smoke.sh
+```
+
+CLI events protocol (same as the desktop child):
+
+```bash
+cloakcli teach chat --profile demo --events --no-browser --mock-json '{"schema_version":1,"actions":[{"action":"click","selector":"a"},{"action":"done","reason":"ok"}]}'
+# stdin: {"cmd":"send","goal":"click the link","profile":"demo"}
+#         {"cmd":"stop"}
 ```
 
 `desktop/src-tauri/Cargo.lock` is pinned so **rustc 1.85** can compile Tauri 2 (newer transitive crates want 1.88). Do not blindly `cargo update` on that crate without checking `rustc --version`.

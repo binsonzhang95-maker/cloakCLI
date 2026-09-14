@@ -412,29 +412,34 @@ pub async fn start(root: &Path, opts: TeachStartOpts) -> Result<()> {
     result
 }
 
-/// M2: headed browser + Teach Chat TUI in the same process as the hub.
+/// Teach Chat: hub (+ optional headed browser) with TUI or JSONL `--events`.
 pub async fn start_chat(
     root: &Path,
     opts: TeachStartOpts,
     mock_json: Option<String>,
+    events: bool,
+    spawn_browser: bool,
 ) -> Result<()> {
-    require_headed(true)?;
     util::validate_name(&opts.profile, "profile")?;
     let prof = profiles::get(root, &opts.profile)?;
-    let ext_src = resolve_extension_dir(root)?;
-    if manifest_has_all_urls(&ext_src)? {
-        bail!("teach extension manifest must not use <all_urls>");
-    }
-    if !ext_src.join("background.js").is_file() || !ext_src.join("content.js").is_file() {
-        bail!("teach extension at {} is incomplete", ext_src.display());
+
+    if spawn_browser {
+        require_headed(true)?;
+        let ext_src = resolve_extension_dir(root)?;
+        if manifest_has_all_urls(&ext_src)? {
+            bail!("teach extension manifest must not use <all_urls>");
+        }
+        if !ext_src.join("background.js").is_file() || !ext_src.join("content.js").is_file() {
+            bail!("teach extension at {} is incomplete", ext_src.display());
+        }
+        let udir = PathBuf::from(&prof.user_data_dir);
+        let _ = util::ensure_under_root(root, &udir)?;
+        fs::create_dir_all(&udir)?;
+        let py = python_bin()?;
+        preflight_browser_binary(&py)?;
     }
 
-    let udir = PathBuf::from(&prof.user_data_dir);
-    let _ = util::ensure_under_root(root, &udir)?;
-    fs::create_dir_all(&udir)?;
     let _lock = acquire_teach_lock(root, &prof.name).await?;
-    let py = python_bin()?;
-    preflight_browser_binary(&py)?;
 
     let mut allow_origins = Vec::new();
     if let Some(ref u) = opts.url {
@@ -450,67 +455,89 @@ pub async fn start_chat(
     .context("start teach hub on 127.0.0.1")?;
     let hub_url = format!("ws://127.0.0.1:{}", hub.port());
 
-    let staged = stage_extension(
-        root,
-        &ext_src,
-        &ExtConfig {
-            export_origin: "http://127.0.0.1:0".into(),
-            token: uuid::Uuid::new_v4().simple().to_string(),
-            allow_origins,
-            allow_secrets: false,
-            smart_optimize: false,
-            profile: prof.name.clone(),
-            hub_url: Some(hub_url.clone()),
-            pairing_code: Some(hub.pairing_code().to_string()),
-            pairing_id: Some(hub.pairing_id().to_string()),
-        },
-    )?;
-
-    let mut cmd = teach_browser_command(
-        root,
-        &prof.user_data_dir,
-        &staged,
-        opts.url.as_deref(),
-        prof.proxy.as_deref(),
-        Some(HubConnect {
-            addr: format!("127.0.0.1:{}", hub.port()),
-            pairing_id: hub.pairing_id().to_string(),
-            pairing_code: hub.pairing_code().to_string(),
-        }),
-    )?;
-    let log_path = state::data_dir(root).join("teach").join("chat-worker.log");
-    if let Some(parent) = log_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    match fs::File::create(&log_path) {
-        Ok(f) => {
-            cmd.stdout(Stdio::from(f.try_clone()?));
-            cmd.stderr(Stdio::from(f));
+    let mut staged: Option<PathBuf> = None;
+    let mut child = None;
+    if spawn_browser {
+        let ext_src = resolve_extension_dir(root)?;
+        let dest = stage_extension(
+            root,
+            &ext_src,
+            &ExtConfig {
+                export_origin: "http://127.0.0.1:0".into(),
+                token: uuid::Uuid::new_v4().simple().to_string(),
+                allow_origins,
+                allow_secrets: false,
+                smart_optimize: false,
+                profile: prof.name.clone(),
+                hub_url: Some(hub_url.clone()),
+                pairing_code: Some(hub.pairing_code().to_string()),
+                pairing_id: Some(hub.pairing_id().to_string()),
+            },
+        )?;
+        let mut cmd = teach_browser_command(
+            root,
+            &prof.user_data_dir,
+            &dest,
+            opts.url.as_deref(),
+            prof.proxy.as_deref(),
+            Some(HubConnect {
+                addr: format!("127.0.0.1:{}", hub.port()),
+                pairing_id: hub.pairing_id().to_string(),
+                pairing_code: hub.pairing_code().to_string(),
+            }),
+        )?;
+        let log_path = state::data_dir(root).join("teach").join("chat-worker.log");
+        if let Some(parent) = log_path.parent() {
+            let _ = fs::create_dir_all(parent);
         }
-        Err(_) => {
-            cmd.stdout(Stdio::null());
-            cmd.stderr(Stdio::null());
+        match fs::File::create(&log_path) {
+            Ok(f) => {
+                cmd.stdout(Stdio::from(f.try_clone()?));
+                cmd.stderr(Stdio::from(f));
+            }
+            Err(_) => {
+                cmd.stdout(Stdio::null());
+                cmd.stderr(Stdio::null());
+            }
         }
+        child = Some(
+            cmd.spawn()
+                .with_context(|| "spawn teach browser for chat")?,
+        );
+        staged = Some(dest);
     }
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| "spawn teach browser for chat")?;
 
     let profile = prof.name.clone();
-    let chat_result = crate::tui::chat::run_dedicated(
-        root,
-        hub,
-        crate::tui::chat::DedicatedOpts {
-            profile,
-            mock_json,
-        },
-    )
-    .await;
+    let chat_result = if events {
+        crate::teach_events::run(
+            root,
+            hub,
+            crate::teach_events::EventsOpts {
+                profile,
+                mock_json,
+                spawn_browser,
+            },
+        )
+        .await
+    } else {
+        crate::tui::chat::run_dedicated(
+            root,
+            hub,
+            crate::tui::chat::DedicatedOpts {
+                profile,
+                mock_json,
+            },
+        )
+        .await
+    };
 
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-    let _ = fs::remove_dir_all(&staged);
+    if let Some(mut c) = child {
+        let _ = c.kill().await;
+        let _ = c.wait().await;
+    }
+    if let Some(path) = staged {
+        let _ = fs::remove_dir_all(&path);
+    }
     chat_result
 }
 
