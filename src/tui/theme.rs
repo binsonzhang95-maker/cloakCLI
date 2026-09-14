@@ -1,7 +1,9 @@
-//! Shared TUI palette: near-black canvas, white body text, sparse accents.
+//! Shared TUI palette: ANSI-black canvas, white body text, sparse accents.
 //!
-//! Bright colors are only for selection, brand shimmer, key hints, the active
-//! tab marker, and status pills — never default borders or body text.
+//! `BG`/`FG` use indexed ANSI colors so Terminal.app (and GNU screen without
+//! truecolor) still paints a real black canvas. Bright colors are only for
+//! selection, brand shimmer, key hints, the active tab marker, and status
+//! pills — never default borders or body text.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -9,9 +11,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType};
 use ratatui::Frame;
 
-pub const BG: Color = Color::Rgb(10, 10, 12);
+/// ANSI 0 — reliable black even when truecolor / Rgb delivery fails.
+pub const BG: Color = Color::Black;
 pub const SURFACE: Color = Color::Rgb(18, 18, 22);
-pub const FG: Color = Color::Rgb(235, 235, 235);
+/// ANSI 7 — reliable white body text without truecolor.
+pub const FG: Color = Color::White;
 pub const MUTED: Color = Color::Rgb(110, 110, 118);
 /// Unfocused pane chrome — dark gray, never an accent.
 pub const BORDER: Color = Color::Rgb(42, 42, 48);
@@ -25,7 +29,7 @@ pub const OK: Color = Color::Rgb(74, 222, 128);
 pub const WARN: Color = Color::Rgb(251, 191, 36);
 pub const ERR: Color = Color::Rgb(248, 113, 113);
 /// Dark fg on accent / colored pills.
-pub const ON_PILL: Color = Color::Rgb(10, 10, 12);
+pub const ON_PILL: Color = Color::Black;
 pub const COOKIE: Color = Color::Rgb(167, 139, 250);
 pub const STATUS_OK_BG: Color = Color::Rgb(10, 28, 16);
 pub const STATUS_WARN_BG: Color = Color::Rgb(28, 22, 8);
@@ -116,10 +120,15 @@ mod tests {
 
     #[test]
     fn palette_is_near_black_canvas() {
-        let (r, g, b) = rgb(BG);
-        assert!(r <= 16 && g <= 16 && b <= 16, "BG should be near-black");
-        let (r, g, b) = rgb(FG);
-        assert!(r >= 220 && g >= 220 && b >= 220, "FG should be off-white");
+        // ANSI Black is the reliable canvas when truecolor is unavailable.
+        assert!(
+            matches!(BG, Color::Black),
+            "BG should be ANSI Black, got {BG:?}"
+        );
+        assert!(
+            matches!(FG, Color::White) || matches!(FG, Color::Rgb(r, g, b) if r >= 220 && g >= 220 && b >= 220),
+            "FG should be White or bright off-white, got {FG:?}"
+        );
         let (r, g, b) = rgb(BORDER);
         assert!(r < 90 && g < 90 && b < 90, "borders stay dark gray");
         assert_ne!(BORDER, ACCENT);
