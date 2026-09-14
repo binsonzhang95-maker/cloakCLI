@@ -14,10 +14,10 @@
       {
         "label": "main",
         "title": "CloakCLI",
-        "width": 1100,
-        "height": 720,
-        "minWidth": 800,
-        "minHeight": 500,
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 560,
         "resizable": true,
         "decorations": false
       }

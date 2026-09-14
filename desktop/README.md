@@ -1,19 +1,28 @@
 # CloakCLI desktop shell
 
-Tauri 2 window around the existing `cloakcli tui`. The desktop crate does **not** reimplement CLI, TUI, or worker logic. It only:
+Tauri 2 **geek ops console** (M1). The Web UI is the product home: Teach Chat, Profiles, Skills, Runs, and a collapsible inspector. **xterm.js + PTY is Diagnostics only** (`cloakcli tui`) and is not started on first paint.
 
-- draws a custom title bar (drag / minimize / maximize / close)
-- embeds **xterm.js + fit addon**
-- opens a real **PTY** and runs the fixed command `cloakcli tui`
+The desktop crate does **not** reimplement CLI, TUI, worker, Playwright, or LLM logic. It:
 
-The frontend cannot spawn arbitrary commands. There is no shell plugin.
+- draws custom chrome (drag / minimize / maximize / close)
+- renders a dense monospace ops UI (`#0b0d10`, 1px separators, cyan/coral accents)
+- calls read-only Tauri commands (`list_profiles`, `list_skills`, `ops_status`) that return structured DTOs from the same on-disk layout as the CLI (`profiles/`, `skills/`, `data/`)
+- lazy-loads **xterm.js** on the Diagnostics route and opens a real **PTY** for the fixed command `cloakcli tui`
+
+The frontend cannot spawn arbitrary commands. There is no shell plugin. Proxy userinfo is redacted; cookie **values are never copied** into DTOs, events, or logs.
+
+Teach Chat in M1 is a **local protocol mock** (`teach_chat_send` / `teach_chat_event`). Live hub streaming is M2.
 
 ## Layout
 
 ```text
 desktop/
-├─ src/                 # custom chrome + xterm.js
+├─ src/
+│  ├─ main.js / shell.js / store.js / api.js
+│  ├─ features/         # teach-chat, profiles, skills, runs, diagnostics
+│  └─ styles.css        # M1 theme
 ├─ src-tauri/           # independent Tauri 2 crate (not in the root Cargo workspace)
+│  └─ src/catalog.rs    # read-only DTOs (no terminal scraping)
 ├─ package.json
 └─ README.md
 ```
@@ -49,9 +58,21 @@ export CLOAKCLI_HOME="$(cd .. && pwd)"                  # absolute repo root
 npm run tauri dev
 ```
 
-`npm run tauri dev` should open an ~1100×720 undecorated window, start `cloakcli tui` in the PTY, and pass colors / keys / Unicode / resize through xterm.js.
+`npm run tauri dev` opens an ~1280×800 undecorated window on **Teach Chat**. It does **not** start a PTY. Profiles / skills / hub+worker status come from the catalog commands.
 
-The title bar has **Start**, **Stop**, and **Restart**. After the TUI exits (or after Stop), the status bar shows the result and those buttons start it again. Restart is `pty_stop` then `pty_start` in the same window.
+Keyboard (also printed on the status bar):
+
+| Key | Action |
+|-----|--------|
+| `1` | Teach Chat |
+| `2` | Profiles |
+| `3` | Skills |
+| `4` | Runs / History |
+| `5` | Diagnostics (Raw TUI) |
+| `[` | Toggle inspector |
+| `,` | Settings stub |
+
+Selection shimmer is **off** by default (Settings checkbox). Diagnostics **Start / Stop / Restart** run the existing PTY path (`cloakcli tui` only).
 
 ## Binary resolution
 
@@ -100,10 +121,10 @@ On macOS an empty application menu (app name only) may still appear — there is
 
 - window chrome: drag, minimize, maximize/restore, close, is-maximized
 - events for PTY I/O
-- the six app commands (`shell_status`, `set_home`, `pty_start`, `pty_write`, `pty_resize`, `pty_stop`)
-- `pty-status` is emitted when stop/reclaim finishes so the title-bar Start/Stop/Restart state can update
+- app commands: `shell_status`, `set_home`, `list_profiles`, `list_skills`, `ops_status`, `pty_start`, `pty_write`, `pty_resize`, `pty_stop`
+- `pty-status` is emitted when stop/reclaim finishes so Diagnostics Start/Stop/Restart can update
 
-No `shell`, `os`, `fs`, or `opener` plugins. `pty_start` always execs the resolved `cloakcli` binary with the single argument `tui`.
+No `shell`, `os`, `fs`, or `opener` plugins. `pty_start` always execs the resolved `cloakcli` binary with the single argument `tui`. Catalog commands read files under `CLOAKCLI_HOME`; they never scrape terminal text.
 
 A generic Tauri PTY plugin (`tauri-plugin-pty` / `spawn(cmd, args)`) was not used because it would expose arbitrary command execution to the frontend.
 
@@ -121,12 +142,14 @@ PTY reads are decoded with a stateful UTF-8 buffer so a CJK or emoji scalar spli
 
 ## Known limits (this phase)
 
-- Not a rewrite of the TUI into web widgets — ratatui still runs inside the PTY.
+- M1: Teach Chat is a static/mock protocol; Profiles/Skills/Runs are read-only.
+- Hub status is an honest file probe (control socket / `master.json`), not a live token-authenticated connection.
+- Raw TUI still exists on Diagnostics; ratatui is not the product home.
 - No formal packaging, code signing, notarization, DMG, AppImage, or Windows installer.
 - Linux needs WebKitGTK 4.1 + GTK 3 **dev** packages to compile.
 - `tauri build` skeleton is present (`bundle.active`, icons) but unsigned.
 - One PTY session per window; no tabs.
-- xterm.js is not a perfect match for every terminal query the TUI might make; report glitches against this shell, not against `cloakcli tui` itself.
+- xterm.js is not a perfect match for every terminal query the TUI might make; report glitches against Diagnostics, not against `cloakcli tui` itself.
 
 ## Future packaging
 
@@ -144,10 +167,12 @@ Root CLI tests are unchanged:
 cargo test
 ```
 
-Desktop path/env unit tests (need the Tauri Linux deps to compile the crate):
+Desktop path/env/catalog unit tests (need the Tauri Linux deps to compile the crate):
 
 ```bash
 cd desktop/src-tauri && cargo test
 ```
+
+Catalog tests assert proxy userinfo is redacted and cookie values never appear in serialized DTOs.
 
 `desktop/src-tauri/Cargo.lock` is pinned so **rustc 1.85** can compile Tauri 2 (newer transitive crates want 1.88). Do not blindly `cargo update` on that crate without checking `rustc --version`.

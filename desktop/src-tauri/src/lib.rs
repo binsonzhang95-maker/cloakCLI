@@ -1,7 +1,9 @@
+mod catalog;
 mod env_inherit;
 mod paths;
 mod pty;
 
+use catalog::{OpsStatus, ProfileDto, SkillListDto};
 use pty::SharedPty;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -92,6 +94,52 @@ fn pty_stop(app: AppHandle) -> Result<(), String> {
     pty::stop(&state.pty, Some(&app))
 }
 
+fn resolved_home(state: &AppState) -> Result<PathBuf, String> {
+    let exe = current_exe()?;
+    let stored = paths::load_stored_config(&state.config_dir);
+    paths::resolve_home(stored.cloakcli_home.as_deref(), &exe)
+}
+
+#[tauri::command]
+fn list_profiles(state: tauri::State<AppState>) -> Result<Vec<ProfileDto>, String> {
+    let home = resolved_home(&state)?;
+    catalog::list_profiles(&home)
+}
+
+#[tauri::command]
+fn list_skills(state: tauri::State<AppState>) -> Result<SkillListDto, String> {
+    let home = resolved_home(&state)?;
+    catalog::list_skills(&home)
+}
+
+#[tauri::command]
+fn ops_status(state: tauri::State<AppState>) -> OpsStatus {
+    let exe = current_exe().ok();
+    let stored = paths::load_stored_config(&state.config_dir);
+
+    let (binary, binary_error) = match exe.as_ref().map(|p| paths::resolve_bin(p)) {
+        Some(Ok(path)) => (Some(path.display().to_string()), None),
+        Some(Err(err)) => (None, Some(err)),
+        None => (None, Some("cannot resolve current executable".into())),
+    };
+
+    let (home, home_error) = match exe.as_ref() {
+        Some(exe) => match paths::resolve_home(stored.cloakcli_home.as_deref(), exe) {
+            Ok(path) => (Some(path), None),
+            Err(err) => (None, Some(err)),
+        },
+        None => (None, Some("cannot resolve current executable".into())),
+    };
+
+    catalog::ops_status(
+        home.as_deref(),
+        home_error,
+        binary,
+        binary_error,
+        pty::is_running(&state.pty),
+    )
+}
+
 fn terminate_pty(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         let _ = pty::stop(&state.pty, Some(app));
@@ -121,7 +169,10 @@ pub fn run() {
             pty_start,
             pty_write,
             pty_resize,
-            pty_stop
+            pty_stop,
+            list_profiles,
+            list_skills,
+            ops_status
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

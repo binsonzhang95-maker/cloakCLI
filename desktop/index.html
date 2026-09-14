@@ -12,20 +12,7 @@
         <div class="titlebar-drag" data-tauri-drag-region>
           <span class="titlebar-mark" data-tauri-drag-region>C</span>
           <span class="titlebar-title" data-tauri-drag-region>CloakCLI</span>
-          <span id="session-label" class="titlebar-session" data-tauri-drag-region
-            >starting…</span
-          >
-        </div>
-        <div class="titlebar-actions">
-          <button type="button" id="btn-start" title="Start cloakcli tui" aria-label="Start">
-            Start
-          </button>
-          <button type="button" id="btn-stop" title="Stop cloakcli tui" aria-label="Stop" disabled>
-            Stop
-          </button>
-          <button type="button" id="btn-restart" title="Restart cloakcli tui" aria-label="Restart">
-            Restart
-          </button>
+          <span id="session-label" class="titlebar-session" data-tauri-drag-region>ops</span>
         </div>
         <div class="titlebar-controls">
           <button type="button" id="titlebar-minimize" title="Minimize" aria-label="Minimize">
@@ -56,6 +43,108 @@
         </div>
       </header>
 
+      <div class="topbar">
+        <div class="topbar-left">
+          <span class="lamp-wrap" title="Environment">
+            <span id="lamp-env" class="lamp ok"></span>
+            <span id="top-env">env local</span>
+          </span>
+          <span class="sep">│</span>
+          <span class="lamp-wrap" title="Hub (file probe, not connected)">
+            <span id="lamp-hub" class="lamp"></span>
+            <span id="top-hub">hub —</span>
+          </span>
+          <span class="lamp-wrap" title="Worker daemon">
+            <span id="lamp-worker" class="lamp"></span>
+            <span id="top-worker">worker —</span>
+          </span>
+        </div>
+        <div class="topbar-mid">
+          <span id="top-profile">profile —</span>
+          <span class="sep">│</span>
+          <span id="top-jobs">jobs 0</span>
+        </div>
+        <div class="topbar-right">
+          <button type="button" id="btn-inspector" class="chip-btn" title="Toggle inspector ([)">
+            inspector
+          </button>
+          <button type="button" id="btn-settings" class="chip-btn" title="Settings">settings</button>
+        </div>
+      </div>
+
+      <div class="workspace">
+        <nav class="nav" aria-label="Primary">
+          <div class="nav-head">NAV</div>
+          <button type="button" class="nav-item is-active" data-route="chat" data-key="1">
+            <span class="nav-key">1</span>
+            <span class="nav-label">Teach Chat</span>
+          </button>
+          <button type="button" class="nav-item" data-route="profiles" data-key="2">
+            <span class="nav-key">2</span>
+            <span class="nav-label">Profiles</span>
+          </button>
+          <button type="button" class="nav-item" data-route="skills" data-key="3">
+            <span class="nav-key">3</span>
+            <span class="nav-label">Skills</span>
+          </button>
+          <button type="button" class="nav-item" data-route="runs" data-key="4">
+            <span class="nav-key">4</span>
+            <span class="nav-label">Runs / History</span>
+          </button>
+          <button type="button" class="nav-item" data-route="diagnostics" data-key="5">
+            <span class="nav-key">5</span>
+            <span class="nav-label">Diagnostics</span>
+            <span class="nav-sub">Raw TUI</span>
+          </button>
+          <div class="nav-foot">
+            <div class="nav-meta" id="nav-counts">profiles — · skills —</div>
+            <div class="nav-meta muted">M1 read-only catalog</div>
+          </div>
+        </nav>
+
+        <main class="main" id="main">
+          <section class="page is-active" id="page-chat" data-route="chat"></section>
+          <section class="page" id="page-profiles" data-route="profiles"></section>
+          <section class="page" id="page-skills" data-route="skills"></section>
+          <section class="page" id="page-runs" data-route="runs"></section>
+          <section class="page" id="page-diagnostics" data-route="diagnostics">
+            <div class="diag-bar">
+              <div class="diag-title">Raw TUI · cloakcli tui</div>
+              <div class="diag-actions">
+                <button type="button" id="btn-start" title="Start cloakcli tui">Start</button>
+                <button type="button" id="btn-stop" title="Stop cloakcli tui" disabled>Stop</button>
+                <button type="button" id="btn-restart" title="Restart cloakcli tui">Restart</button>
+              </div>
+              <span id="diag-pty" class="diag-pty">pty: stopped</span>
+            </div>
+            <div id="terminal" class="terminal"></div>
+          </section>
+        </main>
+
+        <aside class="inspector" id="inspector" aria-label="Inspector">
+          <div class="insp-head">
+            <span>INSPECTOR</span>
+            <button type="button" id="btn-inspector-close" class="icon-btn" title="Collapse ([)">×</button>
+          </div>
+          <div class="insp-block">
+            <div class="insp-label">Profile</div>
+            <div id="insp-profile" class="insp-body muted">no profile selected</div>
+          </div>
+          <div class="insp-block">
+            <div class="insp-label">Skills</div>
+            <div id="insp-skills" class="insp-body muted">—</div>
+          </div>
+          <div class="insp-block">
+            <div class="insp-label">Recent runs</div>
+            <div id="insp-runs" class="insp-body muted">—</div>
+          </div>
+          <div class="insp-block">
+            <div class="insp-label">Risk</div>
+            <div class="insp-body muted">M1 is read-only. Proxy userinfo redacted. Cookie values never leave Rust. Playwright / LLM stay in the worker — not in this UI.</div>
+          </div>
+        </aside>
+      </div>
+
       <div id="setup" class="setup hidden">
         <div class="setup-card">
           <h1>Project root required</h1>
@@ -70,12 +159,30 @@
         </div>
       </div>
 
-      <div id="terminal" class="terminal"></div>
+      <div id="settings" class="setup hidden">
+        <div class="setup-card">
+          <h1>Settings</h1>
+          <p class="muted">M1 stub. Home path and selection shimmer only.</p>
+          <label for="settings-home">CLOAKCLI_HOME</label>
+          <input id="settings-home" type="text" spellcheck="false" />
+          <label class="check-row" for="settings-shimmer">
+            <input id="settings-shimmer" type="checkbox" />
+            Selection shimmer (off by default)
+          </label>
+          <p id="settings-error" class="setup-error"></p>
+          <div class="row-actions">
+            <button type="button" id="settings-save">Save home</button>
+            <button type="button" id="settings-close" class="ghost">Close</button>
+          </div>
+        </div>
+      </div>
 
       <footer class="statusbar">
+        <span id="status-hub">hub —</span>
+        <span id="status-worker">worker —</span>
         <span id="status-bin">bin: …</span>
-        <span id="status-home">home: …</span>
-        <span id="status-pty">pty: stopped</span>
+        <span id="status-ver">v—</span>
+        <span class="status-keys" title="Keyboard">1–5 nav · [ inspector · , settings</span>
       </footer>
     </div>
     <script type="module" src="/src/main.js"></script>

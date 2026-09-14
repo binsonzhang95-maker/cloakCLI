@@ -8,6 +8,9 @@ fn main() {
                 "pty_write",
                 "pty_resize",
                 "pty_stop",
+                "list_profiles",
+                "list_skills",
+                "ops_status",
             ]),
         ),
     )

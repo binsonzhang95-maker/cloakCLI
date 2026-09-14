@@ -29,7 +29,17 @@ cloakcli master serve (optional)          ▼
 
 ## Desktop shell (Tauri 2)
 
-Optional GUI that embeds `cloakcli tui` in a PTY (xterm.js). It does not reimplement CLI/TUI/worker logic. See [`desktop/README.md`](desktop/README.md).
+Optional **geek ops console** (`desktop/`). Teach Chat is the home page. Profiles / skills / job stubs come from read-only Tauri DTOs. The raw TUI (`cloakcli tui` in a PTY) is **Diagnostics only** and is not started on first paint. See [`desktop/README.md`](desktop/README.md).
+
+```bash
+cargo build
+cd desktop && npm install
+export CLOAKCLI_BIN="$(pwd)/../target/debug/cloakcli"
+export CLOAKCLI_HOME="$(cd .. && pwd)"
+npm run tauri dev
+```
+
+Keys: `1–5` switch Teach Chat / Profiles / Skills / Runs / Diagnostics; `[` toggles the inspector.
 
 ## Per-node browser daemon
 
