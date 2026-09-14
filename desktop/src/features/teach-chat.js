@@ -1,3 +1,4 @@
+import { mockAckPreview, summarizeUserMessage } from "../redact.js";
 import { currentProfile, getState } from "../store.js";
 
 const MOCK_WELCOME = [
@@ -88,20 +89,21 @@ function paintMessages() {
 }
 
 function send(area) {
-  const text = (area.value || "").trim();
-  if (!text) return;
-  messages.push({ role: "user", text, ts: Date.now() });
+  const raw = (area.value || "").trim();
+  if (!raw) return;
+  const summary = summarizeUserMessage(raw);
   area.value = "";
+  messages.push({ role: "user", text: summary.display, ts: Date.now() });
   streaming = true;
   paintMessages();
   const stop = document.getElementById("chat-stop");
   if (stop) stop.disabled = false;
-  // Mock teach_chat_event — structured, no secrets.
+  // Mock teach_chat_event — structured; never echoes raw input or secrets.
   window.setTimeout(() => {
     streaming = false;
     messages.push({
       role: "assistant",
-      text: `ack mock event\nkind: teach_chat_event\nstatus: recorded_locally\npreview: ${text.slice(0, 80)}`,
+      text: mockAckPreview(summary),
       ts: Date.now(),
     });
     paintMessages();

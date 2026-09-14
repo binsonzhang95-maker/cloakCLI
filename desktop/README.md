@@ -173,6 +173,12 @@ Desktop path/env/catalog unit tests (need the Tauri Linux deps to compile the cr
 cd desktop/src-tauri && cargo test
 ```
 
-Catalog tests assert proxy userinfo is redacted and cookie values never appear in serialized DTOs.
+Catalog tests assert proxy userinfo is redacted, cookie values never appear in serialized DTOs, and free-text fields (`notes`, `description`, `on_stall`) redact token / Authorization / cookie samples.
+
+Frontend redaction (Teach Chat mock never stores or echoes pasted secrets):
+
+```bash
+cd desktop && npm test
+```
 
 `desktop/src-tauri/Cargo.lock` is pinned so **rustc 1.85** can compile Tauri 2 (newer transitive crates want 1.88). Do not blindly `cargo update` on that crate without checking `rustc --version`.

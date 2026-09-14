@@ -2,6 +2,7 @@ mod catalog;
 mod env_inherit;
 mod paths;
 mod pty;
+mod redact;
 
 use catalog::{OpsStatus, ProfileDto, SkillListDto};
 use pty::SharedPty;

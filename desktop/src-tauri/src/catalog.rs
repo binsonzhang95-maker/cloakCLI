@@ -5,14 +5,19 @@
 //! follow the same layout as the CLI (`profiles/`, `skills/`, `data/`) and
 //! return structured DTOs — they do not scrape TUI/CLI text and do not exec
 //! a shell. Proxy userinfo is redacted; cookie values are never copied into
-//! DTOs, events, or error strings.
+//! DTOs, events, or error strings. Free-text fields (`notes`, `description`,
+//! `on_stall`, error/detail strings) run through the same token / Authorization
+//! / cookie redaction before they reach the UI.
 
+use crate::redact::redact_text;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub use crate::redact::redact_proxy;
 
 const DESKTOP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -183,30 +188,15 @@ pub fn ops_status(
         version: DESKTOP_VERSION.to_string(),
         env: "local".into(),
         home: home.map(|p| p.display().to_string()),
-        home_error,
+        home_error: home_error.map(|s| redact_text(&s)),
         binary,
-        binary_error,
+        binary_error: binary_error.map(|s| redact_text(&s)),
         hub,
         worker,
         jobs_running,
         jobs_recent,
         pty_running,
     }
-}
-
-/// Same rule as `cloakcli::util::redact_proxy`: strip userinfo, keep host.
-pub fn redact_proxy(proxy: &str) -> String {
-    if let Some(scheme_end) = proxy.find("://") {
-        let after = scheme_end + 3;
-        if let Some(at) = proxy[after..].find('@') {
-            let userinfo = &proxy[after..after + at];
-            if userinfo.contains(':') || !userinfo.is_empty() {
-                let rest = &proxy[after + at..];
-                return format!("{}://***:***{}", &proxy[..scheme_end], rest);
-            }
-        }
-    }
-    proxy.to_string()
 }
 
 fn load_profile_dto(path: &Path) -> Option<ProfileDto> {
@@ -224,7 +214,8 @@ fn load_profile_dto(path: &Path) -> Option<ProfileDto> {
     let notes = v
         .get("notes")
         .and_then(|x| x.as_str())
-        .map(|s| s.to_string());
+        .map(redact_text)
+        .filter(|s| !s.is_empty());
     let created_at = v
         .get("created_at")
         .and_then(|x| x.as_str())
@@ -359,7 +350,7 @@ fn collect_skills(
                     Ok(s) => out.push(s),
                     Err(err) => invalid.push(InvalidSkillDto {
                         path: sj.display().to_string(),
-                        error: err,
+                        error: redact_text(&err),
                     }),
                 }
             } else {
@@ -389,8 +380,8 @@ fn load_skill_dto(path: &Path) -> Result<SkillDto, String> {
     let description = v
         .get("description")
         .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
+        .map(redact_text)
+        .unwrap_or_default();
     let schema_version = v
         .get("schema_version")
         .and_then(|x| x.as_u64())
@@ -408,7 +399,7 @@ fn load_skill_dto(path: &Path) -> Result<SkillDto, String> {
     let on_stall = v
         .get("on_stall")
         .and_then(|x| x.as_str())
-        .map(|s| s.to_string());
+        .map(redact_text);
     Ok(SkillDto {
         name,
         description,
@@ -430,13 +421,13 @@ fn hub_status(root: &Path) -> ComponentStatus {
     match (bind, sock_exists) {
         (Some(bind), true) => ComponentStatus {
             state: "unknown".into(),
-            detail: format!("control socket present at {bind} (not probed)"),
+            detail: redact_text(&format!("control socket present at {bind} (not probed)")),
             pid: None,
             source: "files".into(),
         },
         (Some(bind), false) => ComponentStatus {
             state: "stopped".into(),
-            detail: format!("metadata bind={bind}; no control socket"),
+            detail: redact_text(&format!("metadata bind={bind}; no control socket")),
             pid: None,
             source: "files".into(),
         },
@@ -532,16 +523,8 @@ fn list_job_stubs(root: &Path) -> (usize, Vec<JobStub>) {
             }
             jobs.push(JobStub {
                 job_id,
-                skill: v
-                    .get("skill")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                profile: v
-                    .get("profile")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                skill: redact_text(v.get("skill").and_then(|x| x.as_str()).unwrap_or("")),
+                profile: redact_text(v.get("profile").and_then(|x| x.as_str()).unwrap_or("")),
                 state: v
                     .get("state")
                     .and_then(|x| x.as_str())
@@ -727,6 +710,71 @@ mod tests {
         assert_eq!(dto.invalid[0].error, "invalid skill JSON");
         let json = serde_json::to_string(&dto).unwrap();
         assert!(!json.contains("LEAKME"), "{json}");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn freetext_dto_redacts_token_authorization_cookie() {
+        let home = temp_home();
+        let pdir = home.join("profiles").join("secretbox");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(
+            pdir.join("profile.json"),
+            r#"{
+  "name": "secretbox",
+  "proxy": "http://127.0.0.1:7890",
+  "notes": "Authorization: Bearer tok_LIVE_abcDEF123456 cookie=SESSIONID_SUPER_SECRET token=abc123SECRETVALUE",
+  "created_at": "2026-01-01T00:00:00Z"
+}
+"#,
+        )
+        .unwrap();
+
+        let sdir = home.join("skills").join("examples").join("leaky");
+        fs::create_dir_all(&sdir).unwrap();
+        fs::write(
+            sdir.join("skill.json"),
+            r#"{
+  "schema_version": 1,
+  "name": "leaky",
+  "description": "login with Authorization: Bearer sk-secretTEST99abc and cookie=SESSIONID_SUPER_SECRET",
+  "params": [],
+  "on_stall": "retry token=abc123SECRETVALUE then Authorization: Bearer tok_LIVE_abcDEF123456",
+  "steps": []
+}
+"#,
+        )
+        .unwrap();
+
+        let profiles = list_profiles(&home).unwrap();
+        assert_eq!(profiles.len(), 1);
+        let notes = profiles[0].notes.as_deref().unwrap_or("");
+        assert!(!notes.contains("tok_LIVE_abcDEF123456"), "{notes}");
+        assert!(!notes.contains("SESSIONID_SUPER_SECRET"), "{notes}");
+        assert!(!notes.contains("abc123SECRETVALUE"), "{notes}");
+        assert!(notes.contains("***"), "{notes}");
+
+        let skills = list_skills(&home).unwrap();
+        assert_eq!(skills.skills.len(), 1);
+        let d = &skills.skills[0].description;
+        let stall = skills.skills[0].on_stall.as_deref().unwrap_or("");
+        assert!(!d.contains("sk-secretTEST99abc"), "{d}");
+        assert!(!d.contains("SESSIONID_SUPER_SECRET"), "{d}");
+        assert!(!stall.contains("abc123SECRETVALUE"), "{stall}");
+        assert!(!stall.contains("tok_LIVE_abcDEF123456"), "{stall}");
+        assert!(d.contains("***"), "{d}");
+        assert!(stall.contains("***"), "{stall}");
+
+        let json = serde_json::to_string(&(&profiles, &skills)).unwrap();
+        for leak in [
+            "tok_LIVE_abcDEF123456",
+            "SESSIONID_SUPER_SECRET",
+            "abc123SECRETVALUE",
+            "sk-secretTEST99abc",
+        ] {
+            assert!(!json.contains(leak), "leaked {leak} in {json}");
+        }
+
         fs::remove_dir_all(&home).ok();
     }
 }
