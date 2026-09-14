@@ -4,6 +4,7 @@
 //! `src/teach_events.rs` (v=1). Unknown kinds and malformed JSON are rejected
 //! and never forwarded to the WebView.
 
+use serde::de::Error;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -25,15 +26,43 @@ const EVENT_KINDS: &[&str] = &[
 
 const JOB_STATES: &[&str] = &["running", "done", "failed", "cancelled", "needs_confirm"];
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Envelope for JSONL events. `flatten` + `deny_unknown_fields` cannot be
+/// combined on this struct (`kind` would be treated as unknown); unknown keys
+/// are rejected on `EventKind` and nested DTOs. `v` is required and must be 1.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WireEvent {
     pub v: u32,
     #[serde(flatten)]
     pub body: EventKind,
 }
 
+impl<'de> Deserialize<'de> for WireEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Helper {
+            v: u32,
+            #[serde(flatten)]
+            body: EventKind,
+        }
+        let helper = Helper::deserialize(deserializer)?;
+        if helper.v != EVENT_SCHEMA_V {
+            return Err(D::Error::custom(format!(
+                "unsupported event schema version {}",
+                helper.v
+            )));
+        }
+        Ok(WireEvent {
+            v: helper.v,
+            body: helper.body,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EventKind {
     Session {
         session_id: String,
@@ -128,19 +157,22 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ToolStatusDto {
     pub summary: String,
     pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ChatLineDto {
     pub role: String,
     pub text: String,
 }
 
 /// Parse one JSONL event from the cloakcli child. Rejects unknown kinds,
-/// unsupported schema versions, unknown job states, and malformed JSON.
+/// extra fields, missing or wrong schema `v`, unknown job states, and
+/// malformed JSON. `v` must be present and equal to 1 (no default).
 pub fn parse_event_line(line: &str) -> Result<Value, String> {
     let v: Value = serde_json::from_str(line).map_err(|e| format!("malformed JSON: {e}"))?;
     let obj = v
@@ -153,10 +185,12 @@ pub fn parse_event_line(line: &str) -> Result<Value, String> {
     if !EVENT_KINDS.contains(&kind) {
         return Err(format!("unknown event kind: {kind}"));
     }
-    let ver = obj
-        .get("v")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(EVENT_SCHEMA_V as u64);
+    let ver = match obj.get("v") {
+        None => return Err("event missing schema version v".into()),
+        Some(val) => val
+            .as_u64()
+            .ok_or_else(|| "event schema version v must be an integer".to_string())?,
+    };
     if ver != EVENT_SCHEMA_V as u64 {
         return Err(format!("unsupported event schema version {ver}"));
     }
@@ -211,5 +245,43 @@ mod tests {
                 .is_err()
         );
         assert!(parse_event_line(r#"{"v":1,"kind":"user"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_event_line_strict_v1_schema() {
+        let ok = parse_event_line(r#"{"v":1,"kind":"user","role":"user","text":"hello"}"#)
+            .expect("valid v=1 must be accepted");
+        assert_eq!(ok["v"], 1);
+        assert_eq!(ok["kind"], "user");
+        assert_eq!(ok["text"], "hello");
+
+        let extra = parse_event_line(
+            r#"{"v":1,"kind":"user","role":"user","text":"hello","extra":true}"#,
+        )
+        .unwrap_err();
+        assert!(
+            extra.contains("unknown field") || extra.contains("malformed"),
+            "unknown field must be rejected: {extra}"
+        );
+
+        let missing = parse_event_line(r#"{"kind":"user","role":"user","text":"hello"}"#)
+            .unwrap_err();
+        assert!(
+            missing.contains("missing") && missing.contains('v'),
+            "missing v must be rejected: {missing}"
+        );
+
+        let wrong = parse_event_line(r#"{"v":2,"kind":"user","role":"user","text":"hello"}"#)
+            .unwrap_err();
+        assert!(
+            wrong.contains("schema version"),
+            "wrong v must be rejected: {wrong}"
+        );
+        let zero = parse_event_line(r#"{"v":0,"kind":"user","role":"user","text":"hello"}"#)
+            .unwrap_err();
+        assert!(
+            zero.contains("schema version"),
+            "v=0 must be rejected: {zero}"
+        );
     }
 }

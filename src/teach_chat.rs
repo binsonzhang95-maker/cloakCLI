@@ -198,6 +198,7 @@ pub struct ToolLine {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ChatLine {
     pub role: String, // user|assistant|system
     pub text: String,
