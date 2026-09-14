@@ -161,7 +161,7 @@ fn draw_tools(f: &mut Frame, area: Rect, session: &ChatSession) {
     if session.tools.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no actions this turn)",
-            Style::default().fg(MUTED).bg(BG),
+            Style::default().fg(CHROME).bg(BG),
         )));
     } else {
         for t in &session.tools {
@@ -179,7 +179,7 @@ fn draw_tools(f: &mut Frame, area: Rect, session: &ChatSession) {
                 "[LLM] "
             };
             lines.push(Line::from(vec![
-                Span::styled(tag, Style::default().fg(MUTED).bg(BG)),
+                Span::styled(tag, Style::default().fg(CHROME).bg(BG)),
                 Span::styled(t.summary.clone(), Style::default().fg(FG).bg(BG)),
                 Span::styled(format!("  {}", t.status), Style::default().fg(color).bg(BG)),
             ]));
@@ -256,7 +256,7 @@ fn draw_input(f: &mut Frame, area: Rect, session: &ChatSession) {
     } else {
         format!(" {}█", session.input)
     };
-    let fg = if session.input.is_empty() { MUTED } else { FG };
+    let fg = if session.input.is_empty() { CHROME } else { FG };
     f.render_widget(
         Paragraph::new(Span::styled(shown, Style::default().fg(fg).bg(BG)))
             .block(bordered("input", true)),

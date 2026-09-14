@@ -59,6 +59,8 @@ fn shimmer_spans(text: &str, phase: u32, base_style: Style) -> Vec<Span<'static>
 
 fn shimmer_highlight_style(base: Style) -> Style {
     let fg = match base.fg {
+        Some(Color::White) => ACCENT_HOT,
+        Some(Color::Rgb(r, g, b)) if r >= 200 && g >= 200 && b >= 200 => ACCENT_HOT,
         Some(Color::Rgb(r, g, b)) => Color::Rgb(
             r.saturating_add(38).min(255),
             g.saturating_add(48).min(255),
@@ -68,6 +70,41 @@ fn shimmer_highlight_style(base: Style) -> Style {
         None => ACCENT_HOT,
     };
     base.fg(fg).add_modifier(Modifier::BOLD)
+}
+
+/// Selected list row: accent ▸ + shimmering white name+detail (no inverted block).
+/// Unselected: static white.
+fn list_row_spans(selected: bool, phase: u32, anim: bool, text: &str) -> Vec<Span<'static>> {
+    let marker = if selected {
+        Span::styled(
+            "▸ ",
+            Style::default()
+                .fg(ACCENT)
+                .bg(BG)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("  ", Style::default().fg(FG).bg(BG))
+    };
+    let base = Style::default().fg(FG).bg(BG);
+    let mut spans = vec![marker];
+    if selected && anim {
+        spans.extend(shimmer_spans(text, phase, base));
+    } else if selected {
+        spans.push(Span::styled(text.to_string(), base.add_modifier(Modifier::BOLD)));
+    } else {
+        spans.push(Span::styled(text.to_string(), base));
+    }
+    spans
+}
+
+fn shimmer_list_item(selected: bool, phase: u32, anim: bool, text: impl AsRef<str>) -> ListItem<'static> {
+    ListItem::new(Line::from(list_row_spans(
+        selected,
+        phase,
+        anim,
+        text.as_ref(),
+    )))
 }
 
 /// ASCII `| / - \` spinner via throbber-widgets-tui (ratatui 0.28). Static `[busy]` when off.
@@ -177,11 +214,11 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
     let headed_pill = if app.headed {
         pill("HEADED", WARN)
     } else {
-        pill("HEADLESS", MUTED)
+        pill("HEADLESS", CHROME)
     };
     let conc = Span::styled(
         format!(" conc:{} ", app.concurrency),
-        Style::default().fg(MUTED).bg(BG),
+        Style::default().fg(CHROME).bg(BG),
     );
     let stub = pill("DEV STUB", PURPLE);
     let hub_ok = app.hub_bind_ok;
@@ -204,7 +241,7 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
     spans.push(Span::styled(" ", Style::default().bg(BG)));
     spans.push(Span::styled(
         format!("v{} ", env!("CARGO_PKG_VERSION")),
-        Style::default().fg(MUTED).bg(BG),
+        Style::default().fg(CHROME).bg(BG),
     ));
     spans.push(stub);
     spans.push(Span::styled("  ", Style::default().bg(BG)));
@@ -216,7 +253,7 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
     spans.push(Span::styled("  │ ", Style::default().fg(BORDER).bg(BG)));
     spans.push(Span::styled(
         "master control plane",
-        Style::default().fg(MUTED).bg(BG),
+        Style::default().fg(CHROME).bg(BG),
     ));
     if app.busy.is_some() {
         spans.push(Span::styled(" ", Style::default().bg(BG)));
@@ -250,7 +287,7 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 Line::from(Span::styled(
                     format!(" {label} "),
-                    Style::default().fg(MUTED).bg(BG),
+                    Style::default().fg(CHROME).bg(BG),
                 ))
             }
         })
@@ -263,7 +300,7 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(BORDER))
-                .title(Span::styled(" panes ", Style::default().fg(MUTED).bg(BG)))
+                .title(Span::styled(" panes ", Style::default().fg(CHROME).bg(BG)))
                 .style(Style::default().bg(BG).fg(FG)),
         )
         .highlight_style(Style::default()); // already styled per-title
@@ -303,6 +340,43 @@ fn draw_list_pane(f: &mut Frame, area: Rect, app: &mut App) {
         _ => ("", ""),
     };
 
+    let real_len = match app.tab {
+        Tab::Profiles => app.profile_rows.len(),
+        Tab::Skills => app.skill_rows.len(),
+        Tab::Sessions => app.session_rows.len(),
+        Tab::Clients => app.client_rows.len(),
+        _ => 0,
+    };
+    {
+        let state = match app.tab {
+            Tab::Profiles => &mut app.profile_state,
+            Tab::Skills => &mut app.skill_state,
+            Tab::Sessions => &mut app.session_state,
+            Tab::Clients => &mut app.client_state,
+            _ => {
+                let list = List::new(Vec::<ListItem>::new()).block(bordered(title, true));
+                f.render_widget(list, area);
+                return;
+            }
+        };
+        if real_len > 0 && state.selected().is_none() {
+            state.select(Some(0));
+        }
+        if real_len == 0 {
+            state.select(None);
+        }
+    }
+
+    let selected = match app.tab {
+        Tab::Profiles => app.profile_state.selected(),
+        Tab::Skills => app.skill_state.selected(),
+        Tab::Sessions => app.session_state.selected(),
+        Tab::Clients => app.client_state.selected(),
+        _ => None,
+    };
+    let phase = app.animation_phase;
+    let anim = app.animations_enabled;
+
     let items: Vec<ListItem> = match app.tab {
         Tab::Profiles => {
             if app.profile_rows.is_empty() {
@@ -310,30 +384,21 @@ fn draw_list_pane(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 app.profile_rows
                     .iter()
-                    .map(|p| {
+                    .enumerate()
+                    .map(|(i, p)| {
                         let proxy = profiles::display_proxy(p);
                         let ck = app
                             .cookie_summaries
                             .get(&p.name)
                             .cloned()
                             .unwrap_or_else(|| "none".into());
-                        ListItem::new(Line::from(vec![
-                            Span::styled(
-                                format!("{:<16}", truncate(&p.name, 16)),
-                                Style::default()
-                                    .fg(FG)
-                                    .bg(BG)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!(" proxy:{:<18}", truncate(&proxy, 18)),
-                                Style::default().fg(MUTED).bg(BG),
-                            ),
-                            Span::styled(
-                                format!(" [{}]", truncate(&ck, 24)),
-                                Style::default().fg(MUTED).bg(BG),
-                            ),
-                        ]))
+                        let text = format!(
+                            "{:<16} proxy:{:<18} [{}]",
+                            truncate(&p.name, 16),
+                            truncate(&proxy, 18),
+                            truncate(&ck, 24)
+                        );
+                        shimmer_list_item(selected == Some(i), phase, anim, text)
                     })
                     .collect()
             }
@@ -344,20 +409,14 @@ fn draw_list_pane(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 app.skill_rows
                     .iter()
-                    .map(|s| {
-                        ListItem::new(Line::from(vec![
-                            Span::styled(
-                                format!("{:<16}", truncate(&s.name, 16)),
-                                Style::default()
-                                    .fg(FG)
-                                    .bg(BG)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!(" {}", truncate(&s.description, 48)),
-                                Style::default().fg(MUTED).bg(BG),
-                            ),
-                        ]))
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let text = format!(
+                            "{:<16} {}",
+                            truncate(&s.name, 16),
+                            truncate(&s.description, 48)
+                        );
+                        shimmer_list_item(selected == Some(i), phase, anim, text)
                     })
                     .collect()
             }
@@ -365,33 +424,21 @@ fn draw_list_pane(f: &mut Frame, area: Rect, app: &mut App) {
         Tab::Sessions => {
             if app.session_rows.is_empty() {
                 vec![empty_item(
-                    app.sessions_hint
-                        .as_deref()
-                        .unwrap_or(empty_hint),
+                    app.sessions_hint.as_deref().unwrap_or(empty_hint),
                 )]
             } else {
                 app.session_rows
                     .iter()
-                    .map(|s| {
+                    .enumerate()
+                    .map(|(i, s)| {
                         let headed = if s.headed { "H" } else { "h" };
-                        ListItem::new(Line::from(vec![
-                            Span::styled(
-                                format!("{:<10}", truncate(&s.id, 10)),
-                                Style::default().fg(FG).bg(BG),
-                            ),
-                            Span::styled(
-                                format!(" {:<12}", truncate(&s.profile, 12)),
-                                Style::default().fg(FG).bg(BG),
-                            ),
-                            Span::styled(
-                                format!(" [{headed}] "),
-                                Style::default().fg(MUTED).bg(BG),
-                            ),
-                            Span::styled(
-                                truncate(&s.url, 36),
-                                Style::default().fg(MUTED).bg(BG),
-                            ),
-                        ]))
+                        let text = format!(
+                            "{:<10} {:<12} [{headed}] {}",
+                            truncate(&s.id, 10),
+                            truncate(&s.profile, 12),
+                            truncate(&s.url, 36)
+                        );
+                        shimmer_list_item(selected == Some(i), phase, anim, text)
                     })
                     .collect()
             }
@@ -402,49 +449,22 @@ fn draw_list_pane(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 app.client_rows
                     .iter()
-                    .map(|c| {
+                    .enumerate()
+                    .map(|(i, c)| {
                         let age = c.last_seen.elapsed().as_secs();
-                        let (badge, style) = if c.online {
-                            (
-                                "ONLINE ",
-                                Style::default()
-                                    .fg(OK)
-                                    .bg(BG)
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                        } else {
-                            ("offline", Style::default().fg(MUTED).bg(BG))
-                        };
+                        let badge = if c.online { "ONLINE " } else { "offline" };
                         let job = c
                             .last_job_state
                             .as_ref()
                             .and_then(|v| v.get("state"))
                             .and_then(|s| s.as_str())
                             .unwrap_or("-");
-                        ListItem::new(Line::from(vec![
-                            Span::styled(
-                                format!("{:<12}", truncate(&c.client_id, 12)),
-                                Style::default()
-                                    .fg(FG)
-                                    .bg(BG)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(format!(" {badge} "), style.bg(BG)),
-                            Span::styled(
-                                format!("seen={age}s "),
-                                Style::default().fg(MUTED).bg(BG),
-                            ),
-                            Span::styled(
-                                format!("rev={} ", c.observed.revision),
-                                Style::default().fg(MUTED).bg(BG),
-                            ),
-                            Span::styled(
-                                format!("job={job}"),
-                                Style::default()
-                                    .fg(if job == "-" { MUTED } else { WARN })
-                                    .bg(BG),
-                            ),
-                        ]))
+                        let text = format!(
+                            "{:<12} {badge} seen={age}s rev={} job={job}",
+                            truncate(&c.client_id, 12),
+                            c.observed.revision
+                        );
+                        shimmer_list_item(selected == Some(i), phase, anim, text)
                     })
                     .collect()
             }
@@ -458,32 +478,17 @@ fn draw_list_pane(f: &mut Frame, area: Rect, app: &mut App) {
         Tab::Sessions => &mut app.session_state,
         Tab::Clients => &mut app.client_state,
         _ => {
-            // unreachable for split panes
             let list = List::new(items).block(bordered(title, true));
             f.render_widget(list, area);
             return;
         }
     };
 
-    // Ensure selection exists when there are real rows
-    let real_len = match app.tab {
-        Tab::Profiles => app.profile_rows.len(),
-        Tab::Skills => app.skill_rows.len(),
-        Tab::Sessions => app.session_rows.len(),
-        Tab::Clients => app.client_rows.len(),
-        _ => 0,
-    };
-    if real_len > 0 && state.selected().is_none() {
-        state.select(Some(0));
-    }
-    if real_len == 0 {
-        state.select(None);
-    }
-
+    // Do not use highlight_style — ratatui's default REVERSED / style_selected
+    // paints a solid block that washes out the 流光. Selection is in the row.
     let list = List::new(items)
         .block(bordered(title, true))
-        .highlight_style(style_selected())
-        .highlight_symbol(" ▸ ");
+        .highlight_style(Style::default());
     f.render_stateful_widget(list, area, state);
 }
 
@@ -491,7 +496,7 @@ fn empty_item(hint: &str) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(
         format!("  ({hint})"),
         Style::default()
-            .fg(MUTED)
+            .fg(CHROME)
             .bg(BG)
             .add_modifier(Modifier::ITALIC),
     )))
@@ -574,7 +579,7 @@ fn detail_profile(app: &App) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(Span::styled(
             "  chips: proxy redacted · cookie status only",
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            Style::default().fg(CHROME).add_modifier(Modifier::ITALIC),
         )),
     ]
 }
@@ -620,7 +625,7 @@ fn detail_skill(app: &App) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(Span::styled(
             "  Enter = run on selected profile (local)",
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            Style::default().fg(CHROME).add_modifier(Modifier::ITALIC),
         )),
     ]
 }
@@ -658,7 +663,7 @@ fn detail_session(app: &App) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(Span::styled(
             "  x = close selected (or all if none)",
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            Style::default().fg(CHROME).add_modifier(Modifier::ITALIC),
         )),
     ]
 }
@@ -670,11 +675,11 @@ fn detail_client(app: &App) -> Vec<Line<'static>> {
             Line::from(""),
             Line::from(Span::styled(
                 "  cloakcli client connect \\",
-                Style::default().fg(MUTED),
+                Style::default().fg(CHROME),
             )),
             Line::from(Span::styled(
                 format!("    --master {} --id box1", app.hub_bind),
-                Style::default().fg(MUTED),
+                Style::default().fg(CHROME),
             )),
         ];
     }
@@ -718,7 +723,7 @@ fn detail_client(app: &App) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(Span::styled(
             "  J = submit job (selected skill@profile)",
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            Style::default().fg(CHROME).add_modifier(Modifier::ITALIC),
         )),
     ]
 }
@@ -727,7 +732,7 @@ fn hint_line(msg: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!("  ({msg})"),
         Style::default()
-            .fg(MUTED)
+            .fg(CHROME)
             .bg(BG)
             .add_modifier(Modifier::ITALIC),
     ))
@@ -842,7 +847,7 @@ fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
     }
     lines.push(Line::from(Span::styled(
         "  Key is env-only (never saved). Failed fetch does not change saved model.",
-        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        Style::default().fg(CHROME).add_modifier(Modifier::ITALIC),
     )));
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -850,20 +855,29 @@ fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
         .style(style_normal());
     f.render_widget(p, chunks[0]);
 
+    if !app.llm_models.is_empty() && app.llm_model_state.selected().is_none() {
+        app.llm_model_state.select(Some(0));
+    }
+    if app.llm_models.is_empty() {
+        app.llm_model_state.select(None);
+    }
+    let selected = app.llm_model_state.selected();
     let items: Vec<ListItem> = if app.llm_models.is_empty() {
-        vec![ListItem::new(Span::styled(
-            "  (f fetch models — GET {base}/models; Enter saves selected id)",
-            Style::default().fg(MUTED).bg(BG),
-        ))]
+        vec![empty_item(
+            "f fetch models — GET {base}/models; Enter saves selected id",
+        )]
     } else {
         app.llm_models
             .iter()
-            .map(|id| {
+            .enumerate()
+            .map(|(i, id)| {
                 let mark = if *id == app.llm.model { " *" } else { "" };
-                ListItem::new(Span::styled(
-                    format!("  {id}{mark}"),
-                    Style::default().fg(FG).bg(BG),
-                ))
+                shimmer_list_item(
+                    selected == Some(i),
+                    app.animation_phase,
+                    app.animations_enabled,
+                    format!("{id}{mark}"),
+                )
             })
             .collect()
     };
@@ -873,8 +887,7 @@ fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
         format!("Models / 模型  ({})", app.llm_models.len())
     };
     let list = List::new(items)
-        .highlight_style(style_selected())
-        .highlight_symbol("▸ ")
+        .highlight_style(Style::default())
         .block(bordered(&title, true));
     f.render_stateful_widget(list, chunks[1], &mut app.llm_model_state);
 }
@@ -1074,7 +1087,7 @@ fn draw_input_modal(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             format!("  {hint}"),
-            Style::default().fg(MUTED).bg(SURFACE),
+            Style::default().fg(CHROME).bg(SURFACE),
         )),
     ];
 
@@ -1099,7 +1112,7 @@ fn draw_input_modal(f: &mut Frame, area: Rect, app: &App) {
         ]))
         .title_bottom(Span::styled(
             " Esc cancel ",
-            Style::default().fg(MUTED).bg(SURFACE),
+            Style::default().fg(CHROME).bg(SURFACE),
         ))
         .style(Style::default().bg(SURFACE).fg(FG));
 
@@ -1186,5 +1199,42 @@ mod tests {
     #[test]
     fn ascii_throbber_set_is_pipe_slash_dash_backslash() {
         assert_eq!(throbber_widgets_tui::ASCII.symbols, &["|", "/", "-", "\\"]);
+    }
+
+    #[test]
+    fn white_shimmer_peak_is_accent_hot() {
+        let base = Style::default().fg(FG).bg(BG);
+        let peak = shimmer_highlight_style(base);
+        assert_eq!(peak.fg, Some(ACCENT_HOT));
+        assert!(peak.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn selected_list_row_shimmers_without_block() {
+        let spans = list_row_spans(true, 0, true, "demo proxy:- [none]");
+        assert_eq!(collect_text(&spans), "▸ demo proxy:- [none]");
+        assert_eq!(spans[0].content.as_ref(), "▸ ");
+        assert_eq!(spans[0].style.fg, Some(ACCENT));
+        assert_ne!(spans[0].style.bg, Some(ACCENT));
+        for s in &spans {
+            assert_ne!(s.style.bg, Some(ACCENT), "selection must not wash out with accent block");
+            assert!(!s.style.add_modifier.contains(Modifier::REVERSED));
+        }
+        let peak = shimmer_highlight_style(Style::default().fg(FG).bg(BG));
+        assert!(
+            spans.iter().any(|s| s.style.fg == peak.fg),
+            "selected row should carry the shimmer peak"
+        );
+    }
+
+    #[test]
+    fn unselected_list_row_is_static_white() {
+        let spans = list_row_spans(false, 0, true, "demo proxy:- [none]");
+        assert_eq!(collect_text(&spans), "  demo proxy:- [none]");
+        for s in &spans {
+            assert_eq!(s.style.fg, Some(FG));
+            assert_eq!(s.style.bg, Some(BG));
+            assert_ne!(s.style.fg, Some(ACCENT_HOT));
+        }
     }
 }
