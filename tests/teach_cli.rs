@@ -462,6 +462,7 @@ fn events_no_browser_mock_turn_and_redacts() {
     let mock = r#"{"schema_version":1,"actions":[{"action":"click","selector":"a"},{"action":"done","reason":"ok"}]}"#;
     let mut child = bin()
         .env("CLOAKCLI_HOME", &home)
+        .env("CLOAKCLI_TEACH_STREAM_CHUNK_MS", "0")
         .args([
             "teach",
             "chat",
@@ -519,6 +520,247 @@ fn events_no_browser_mock_turn_and_redacts() {
     assert!(all.contains("\"kind\":\"closed\"") || all.contains("\"kind\": \"closed\""), "{all}");
     assert!(!all.contains("abc123SECRETVALUE"), "secret leaked: {all}");
     assert!(!stderr.contains("abc123SECRETVALUE"), "secret on stderr: {stderr}");
+    assert!(
+        all.contains("\"kind\":\"assistant_delta\"") || all.contains("\"kind\": \"assistant_delta\""),
+        "expected incremental assistant_delta: {all}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn events_reject_unknown_cmd() {
+    let home = tmp_home();
+    let created = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args(["profile", "create", "demo"])
+        .output()
+        .expect("create");
+    assert!(created.status.success(), "{}", combined(&created));
+
+    let mut child = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args([
+            "teach",
+            "chat",
+            "--profile",
+            "demo",
+            "--events",
+            "--no-browser",
+            "--mock-json",
+            r#"{"schema_version":1,"actions":[{"action":"done","reason":"ok"}]}"#,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("session");
+    writeln!(stdin, r#"{{"cmd":"explode","shell":"rm -rf /"}}"#).unwrap();
+    writeln!(stdin, r#"{{"cmd":"stop"}}"#).unwrap();
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let _ = child.wait_timeout();
+    let all = format!("{line}{rest}");
+    assert!(
+        all.contains("\"code\":\"bad_cmd\"") || all.contains("invalid command"),
+        "expected bad_cmd for unknown cmd: {all}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn events_stream_deltas_and_cancel_mid_stream() {
+    let home = tmp_home();
+    let created = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args(["profile", "create", "demo"])
+        .output()
+        .expect("create");
+    assert!(created.status.success(), "{}", combined(&created));
+
+    let mock = r##"{"schema_version":1,"actions":[{"action":"click","selector":"#go"},{"action":"done","reason":"ok"}]}"##;
+    let mut child = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .env("CLOAKCLI_TEACH_STREAM_CHUNK_MS", "40")
+        .env("CLOAKCLI_TEACH_STREAM_CHUNK_CHARS", "4")
+        .args([
+            "teach",
+            "chat",
+            "--profile",
+            "demo",
+            "--events",
+            "--no-browser",
+            "--mock-json",
+            mock,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut saw_delta = false;
+    loop {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        let mut line = String::new();
+        reader.read_line(&mut line).ok();
+        if line.contains("\"kind\":\"session\"") || line.contains("\"kind\": \"session\"") {
+            writeln!(
+                stdin,
+                r#"{{"cmd":"send","goal":"click go","profile":"demo"}}"#
+            )
+            .unwrap();
+            let _ = stdin.flush();
+        }
+        if line.contains("assistant_delta") {
+            saw_delta = true;
+            writeln!(stdin, r#"{{"cmd":"cancel"}}"#).unwrap();
+            let _ = stdin.flush();
+            break;
+        }
+    }
+    assert!(saw_delta, "never saw assistant_delta before cancel");
+    writeln!(stdin, r#"{{"cmd":"stop"}}"#).unwrap();
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let _ = child.wait_timeout();
+    assert!(
+        rest.contains("cancelled") || rest.contains("\"state\":\"cancelled\""),
+        "expected cancelled job after mid-stream cancel: {rest}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn events_resume_after_child_exit() {
+    let home = tmp_home();
+    let created = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args(["profile", "create", "demo"])
+        .output()
+        .expect("create");
+    assert!(created.status.success(), "{}", combined(&created));
+    let mock = r#"{"schema_version":1,"actions":[{"action":"click","selector":"a"},{"action":"done","reason":"ok"}]}"#;
+
+    let mut child = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .env("CLOAKCLI_TEACH_STREAM_CHUNK_MS", "0")
+        .args([
+            "teach",
+            "chat",
+            "--profile",
+            "demo",
+            "--events",
+            "--no-browser",
+            "--mock-json",
+            mock,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn 1");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("session");
+    writeln!(
+        stdin,
+        r#"{{"cmd":"send","goal":"click the link","profile":"demo"}}"#
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut saw_assistant = false;
+    let mut rest = String::new();
+    while std::time::Instant::now() < deadline {
+        let mut l = String::new();
+        if reader.read_line(&mut l).unwrap_or(0) == 0 {
+            break;
+        }
+        rest.push_str(&l);
+        if l.contains("\"kind\":\"assistant\"") && l.contains("\"done\":true")
+            || (l.contains("\"kind\":\"assistant\"") && !l.contains("assistant_delta"))
+        {
+            saw_assistant = true;
+            break;
+        }
+    }
+    assert!(saw_assistant, "first session never finished assistant: {rest}");
+    writeln!(stdin, r#"{{"cmd":"stop"}}"#).unwrap();
+    drop(stdin);
+    let _ = child.wait_timeout();
+
+    let snap = home.join("data").join("teach").join("events-snapshot.json");
+    assert!(snap.is_file(), "snapshot missing at {}", snap.display());
+
+    let mut child2 = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .env("CLOAKCLI_TEACH_STREAM_CHUNK_MS", "0")
+        .args([
+            "teach",
+            "chat",
+            "--profile",
+            "demo",
+            "--events",
+            "--no-browser",
+            "--mock-json",
+            mock,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn 2");
+    let mut stdin2 = child2.stdin.take().expect("stdin");
+    let stdout2 = child2.stdout.take().expect("stdout");
+    let mut reader2 = BufReader::new(stdout2);
+    let mut blob = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut saw_resume = false;
+    while std::time::Instant::now() < deadline {
+        let mut l = String::new();
+        if reader2.read_line(&mut l).unwrap_or(0) == 0 {
+            break;
+        }
+        blob.push_str(&l);
+        if l.contains("\"kind\":\"resume\"") || l.contains("\"kind\": \"resume\"") {
+            saw_resume = true;
+            break;
+        }
+    }
+    assert!(saw_resume, "reconnect did not emit resume: {blob}");
+    assert!(
+        blob.contains("click the link") || blob.contains("new_hub"),
+        "resume missing transcript/hub note: {blob}"
+    );
+    writeln!(
+        stdin2,
+        r#"{{"cmd":"send","goal":"again","profile":"demo"}}"#
+    )
+    .unwrap();
+    writeln!(stdin2, r#"{{"cmd":"stop"}}"#).unwrap();
+    drop(stdin2);
+    let mut rest2 = String::new();
+    let _ = reader2.read_to_string(&mut rest2);
+    let _ = child2.wait_timeout();
+    let all2 = format!("{blob}{rest2}");
+    assert!(
+        all2.contains("\"kind\":\"assistant\"") || all2.contains("assistant_delta"),
+        "continue after resume produced no assistant: {all2}"
+    );
     let _ = fs::remove_dir_all(&home);
 }
 

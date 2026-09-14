@@ -57,6 +57,26 @@ export async function ensureChatEvents() {
   });
 }
 
+export function getChatState() {
+  return chat;
+}
+
+export function resetChatState() {
+  chat.messages = WELCOME.map((m) => ({ ...m, ts: Date.now() }));
+  chat.session = null;
+  chat.status = null;
+  chat.job = null;
+  chat.tools = [];
+  chat.connecting = false;
+  chat.sending = false;
+  chat.error = null;
+  chat.url = "";
+  chat.spawnBrowser = false;
+  chat.fleetHint = null;
+  lastMsgSig = "";
+  lastJobSig = "";
+}
+
 export function onTeachEvent(rawPayload) {
   const payload = redactEventPayload(rawPayload);
   if (!payload || typeof payload !== "object") return;
@@ -68,12 +88,56 @@ export function onTeachEvent(rawPayload) {
   } else if (kind === "status") {
     chat.status = payload;
     if (Array.isArray(payload.tools)) chat.tools = payload.tools;
+  } else if (kind === "resume") {
+    if (Array.isArray(payload.messages) && payload.messages.length) {
+      chat.messages = payload.messages.map((m) => ({
+        role: m.role || "system",
+        text: m.text || "",
+        ts: Date.now(),
+      }));
+    }
+    if (Array.isArray(payload.tools)) chat.tools = payload.tools;
+    if (payload.note) {
+      const last = chat.messages[chat.messages.length - 1];
+      if (!(last && last.role === "system" && last.text === payload.note)) {
+        chat.messages.push({ role: "system", text: payload.note, ts: Date.now() });
+      }
+    }
+    if (payload.hub_resume === "new_hub") {
+      chat.status = {
+        ...(chat.status || {}),
+        hub_resume: "new_hub",
+        phase: payload.phase || "chat",
+      };
+    }
+  } else if (kind === "assistant_delta") {
+    const chunk = text || "";
+    const last = chat.messages[chat.messages.length - 1];
+    if (last && last.role === "assistant" && last.streaming) {
+      last.text += chunk;
+    } else {
+      chat.messages.push({
+        role: "assistant",
+        text: chunk,
+        streaming: true,
+        ts: Date.now(),
+      });
+    }
+    chat.sending = true;
   } else if (kind === "user" || kind === "assistant" || kind === "system") {
     const role = payload.role || kind;
     const body = text || "";
     const last = chat.messages[chat.messages.length - 1];
-    if (!(last && last.role === role && last.text === body)) {
-      chat.messages.push({ role, text: body, ts: Date.now() });
+    if (kind === "assistant" && last && last.role === "assistant" && last.streaming) {
+      last.text = body || last.text;
+      last.streaming = false;
+    } else if (!(last && last.role === role && last.text === body && !last.streaming)) {
+      if (last && last.role === role && last.streaming) {
+        last.text = body || last.text;
+        last.streaming = false;
+      } else {
+        chat.messages.push({ role, text: body, ts: Date.now() });
+      }
     }
   } else if (kind === "tool") {
     chat.tools = Array.isArray(payload.tools) ? payload.tools : [];
@@ -85,6 +149,10 @@ export function onTeachEvent(rawPayload) {
       error: typeof payload.error === "string" ? redactText(payload.error) : payload.error,
     };
     chat.sending = payload.state === "running" || payload.state === "needs_confirm";
+    if (payload.state === "cancelled" || payload.state === "done" || payload.state === "failed") {
+      const last = chat.messages[chat.messages.length - 1];
+      if (last && last.streaming) last.streaming = false;
+    }
   } else if (kind === "error") {
     chat.error = redactText(payload.message || payload.code || "error");
     chat.messages.push({
@@ -97,11 +165,14 @@ export function onTeachEvent(rawPayload) {
     chat.session = null;
     chat.status = { ...(chat.status || {}), running: false, hub: false, busy: false };
     chat.sending = false;
-    chat.messages.push({
-      role: "system",
-      text: "session closed",
-      ts: Date.now(),
-    });
+    const last = chat.messages[chat.messages.length - 1];
+    if (!(last && last.role === "system" && String(last.text).startsWith("session closed"))) {
+      chat.messages.push({
+        role: "system",
+        text: "session closed — Reconnect restores transcript (new hub port)",
+        ts: Date.now(),
+      });
+    }
   }
   paint();
 }
@@ -179,6 +250,7 @@ export function updateChatChrome() {
 }
 
 function paint() {
+  if (typeof document === "undefined") return;
   const root = lastRoot || document.getElementById("page-chat");
   if (!root || !root.querySelector("#chat-stream")) return;
   const profile = currentProfile();
@@ -224,13 +296,13 @@ function paintMessages() {
   const stream = document.getElementById("chat-stream");
   if (!stream) return;
   const last = chat.messages[chat.messages.length - 1];
-  const sig = `${chat.messages.length}:${last?.role || ""}:${last?.text || ""}`;
+  const sig = `${chat.messages.length}:${last?.role || ""}:${last?.text || ""}:${last?.streaming ? 1 : 0}`;
   if (sig === lastMsgSig && stream.childElementCount) return;
   lastMsgSig = sig;
   stream.innerHTML = chat.messages
     .map(
       (m) => `
-      <article class="msg ${esc(m.role)}">
+      <article class="msg ${esc(m.role)}${m.streaming ? " is-streaming" : ""}">
         <div class="msg-role">${esc(m.role)}</div>
         <div class="msg-body">${esc(m.text)}</div>
       </article>`,

@@ -4,6 +4,7 @@ mod paths;
 mod pty;
 mod redact;
 mod teach;
+mod teach_event;
 
 use catalog::{OpsStatus, ProfileDto, SkillListDto};
 use pty::SharedPty;

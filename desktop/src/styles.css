@@ -530,6 +530,12 @@ html.shimmer .row.is-selected {
   word-break: break-word;
 }
 
+.msg.assistant.is-streaming .msg-body::after {
+  content: "▍";
+  color: var(--cyan);
+  margin-left: 2px;
+}
+
 .chat-pair {
   border-bottom: 1px solid var(--line);
   padding: 8px 12px;

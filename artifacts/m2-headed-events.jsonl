@@ -1,0 +1,29 @@
+{"hub_url": "ws://127.0.0.1:37123", "kind": "session", "pairing_code": "36N5D2", "pairing_id": "a1dae562-83f9-4780-967e-97d2298ff439", "profile": "demo", "session_id": "sess-86ba4318-cbb1-47c6-b0f8-8bb19c48b6b4", "spawn_browser": true, "v": 1}
+{"busy": false, "extension": false, "hub": true, "kind": "status", "last_request_id": null, "mode": "LLM", "page_origin": "", "page_title": "", "page_url": "", "phase": "chat", "profile": "demo", "status": "chat", "tools": [], "v": 1, "worker": false}
+{"busy": false, "extension": false, "hub": true, "kind": "status", "last_request_id": null, "mode": "LLM", "page_origin": "", "page_title": "", "page_url": "", "phase": "chat", "profile": "demo", "status": "chat", "tools": [], "v": 1, "worker": false}
+{"busy": false, "extension": false, "hub": true, "kind": "status", "last_request_id": null, "mode": "LLM", "page_origin": "", "page_title": "", "page_url": "", "phase": "chat", "profile": "demo", "status": "chat", "tools": [], "v": 1, "worker": false}
+{"busy": false, "extension": false, "hub": true, "kind": "status", "last_request_id": null, "mode": "LLM", "page_origin": "", "page_title": "", "page_url": "", "phase": "chat", "profile": "demo", "status": "chat", "tools": [], "v": 1, "worker": false}
+{"busy": false, "extension": true, "hub": true, "kind": "status", "last_request_id": null, "mode": "LLM", "page_origin": "", "page_title": "", "page_url": "", "phase": "chat", "profile": "demo", "status": "chat", "tools": [], "v": 1, "worker": true}
+{"kind": "user", "role": "user", "text": "click the Go button", "v": 1}
+{"job_id": "pending", "kind": "job", "state": "running", "summary": "planning", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 0, "text": "{\"schema", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 1, "text": "_version", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 2, "text": "\": 1, \"a", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 3, "text": "ctions\":", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 4, "text": " [{\"acti", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 5, "text": "on\": \"cl", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 6, "text": "ick\", \"s", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 7, "text": "elector\"", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 8, "text": ": \"#go\"}", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 9, "text": ", {\"acti", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 10, "text": "on\": \"do", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 11, "text": "ne\", \"re", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 12, "text": "ason\": \"", "v": 1}
+{"done": false, "kind": "assistant_delta", "role": "assistant", "seq": 13, "text": "ok\"}]}", "v": 1}
+{"done": true, "kind": "assistant", "role": "assistant", "text": "click #go → done ok", "v": 1}
+{"kind": "tool", "tools": [{"status": "validated", "summary": "click #go"}, {"status": "validated", "summary": "done ok"}], "v": 1}
+{"job_id": "req-93e094fd-345f-4392-ac87-ae10b71dd169", "kind": "job", "state": "running", "summary": "executing", "v": 1}
+{"kind": "tool", "tools": [{"status": "running", "summary": "click #go"}, {"status": "running", "summary": "done ok"}], "v": 1}
+{"kind": "tool", "tools": [{"status": "ok", "summary": "click #go"}, {"status": "done", "summary": "done ok"}], "v": 1}
+{"kind": "system", "role": "system", "text": "results: 2 step(s)", "v": 1}
+{"job_id": "req-93e094fd-345f-4392-ac87-ae10b71dd169", "kind": "job", "ok": true, "state": "done", "summary": "executed", "v": 1}

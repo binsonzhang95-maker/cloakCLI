@@ -1,0 +1,10 @@
+cloakbrowser: /home/box/.cloakbrowser/chromium-146.0.7680.177.5/chrome
+origin http://127.0.0.1:42257
+home /tmp/cloakcli-m2-headed-6tto0gum
+paired: worker + extension
+page GET hits=2 POST /clicked=1
+saved /workspace/CloakCLI/artifacts/m2-headed-display.png
+saved /workspace/CloakCLI/artifacts/m2-headed-page.png
+saved /workspace/CloakCLI/artifacts/m2-headed-events.jsonl
+event kinds: ['session', 'status', 'status', 'status', 'status', 'status', 'user', 'job', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant_delta', 'assistant', 'tool', 'job', 'tool', 'tool', 'system', 'job']
+PASS headed Teach Chat → click #go → result echo

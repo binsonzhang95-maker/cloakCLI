@@ -7,8 +7,9 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::io::Read;
-use std::time::Duration;
+use std::io::{BufRead, BufReader, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::llm::{
     chat_completions_url, models_url, redact_secrets, MAX_MODELS, MAX_MODELS_BODY,
@@ -229,6 +230,232 @@ pub fn chat_complete(
     Ok(ChatCompletion { text, tokens })
 }
 
+/// Streaming chat/completions (`stream: true`, SSE `data:` lines).
+///
+/// `on_delta` is invoked with each non-empty content chunk. `cancel` is checked
+/// after every delta and between reads. Errors never include the API key.
+pub fn chat_complete_stream(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Value],
+    timeout_sec: u64,
+    cancel: &AtomicBool,
+    mut on_delta: impl FnMut(&str),
+) -> Result<ChatCompletion> {
+    if cancel.load(Ordering::SeqCst) {
+        bail!("cancelled");
+    }
+    if api_key.is_empty() {
+        bail!("API key is empty (set the env var named in api_key_env; never pass --api-key)");
+    }
+    let url = chat_completions_url(base_url)?;
+    let model = crate::llm::accept_model_id(model, Some(api_key))?;
+    if messages.is_empty() {
+        bail!("chat/completions requires messages");
+    }
+
+    let payload = json!({
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": 1024,
+        "stream": true,
+    });
+    let body = serde_json::to_vec(&payload).context("serialize chat payload")?;
+
+    let read_timeout = timeout_sec.clamp(5, 60);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(MODELS_CONNECT_TIMEOUT_SEC))
+        .timeout_read(Duration::from_secs(read_timeout))
+        .timeout_write(Duration::from_secs(MODELS_CONNECT_TIMEOUT_SEC))
+        .redirects(3)
+        .user_agent("cloakcli/0.1")
+        .build();
+
+    let req = agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {api_key}"))
+        .set("Content-Type", "application/json")
+        .set("Accept", "text/event-stream")
+        .set("Connection", "close");
+
+    let resp = match req.send_bytes(&body) {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, resp)) => {
+            let _ = read_capped_n(resp.into_reader(), 400);
+            bail!(
+                "{}",
+                redact_secrets(
+                    &format!("POST chat/completions HTTP {code}"),
+                    Some(api_key)
+                )
+            )
+        }
+        Err(ureq::Error::Transport(t)) => {
+            let msg = redact_secrets(
+                &format!("POST chat/completions network error: {t}"),
+                Some(api_key),
+            );
+            bail!("{msg}")
+        }
+    };
+
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let _ = read_capped_n(resp.into_reader(), 400);
+        bail!(
+            "{}",
+            redact_secrets(
+                &format!("POST chat/completions HTTP {status}"),
+                Some(api_key)
+            )
+        );
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(read_timeout);
+    let reader = BufReader::new(resp.into_reader());
+    read_sse_completion(reader, cancel, deadline, api_key, &mut on_delta)
+}
+
+fn read_sse_completion<R: Read>(
+    reader: BufReader<R>,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    api_key: &str,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<ChatCompletion> {
+    let mut reader = reader;
+    let mut acc = String::new();
+    let mut line = String::new();
+    let mut total = 0usize;
+    let mut saw_sse = false;
+    let mut raw_json = String::new();
+
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            bail!("cancelled");
+        }
+        if Instant::now() > deadline {
+            bail!("POST chat/completions stream timed out");
+        }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                if total > MAX_CHAT_BODY {
+                    bail!("POST chat/completions response exceeded size cap");
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(data) = trimmed.strip_prefix("data:") {
+                    saw_sse = true;
+                    let data = data.trim();
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data == "[DONE]" {
+                        break;
+                    }
+                    let parsed: Value = match serde_json::from_str(data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if parsed.get("error").is_some() {
+                        bail!(
+                            "{}",
+                            redact_secrets(
+                                "chat/completions error: stream error object",
+                                Some(api_key)
+                            )
+                        );
+                    }
+                    if let Some(delta) = extract_stream_delta(&parsed) {
+                        acc.push_str(&delta);
+                        on_delta(&delta);
+                        if cancel.load(Ordering::SeqCst) {
+                            bail!("cancelled");
+                        }
+                    }
+                } else if !saw_sse {
+                    raw_json.push_str(trimmed);
+                    raw_json.push('\n');
+                }
+            }
+            Err(e) => {
+                let msg = redact_secrets(
+                    &format!("POST chat/completions stream read: {e}"),
+                    Some(api_key),
+                );
+                bail!("{msg}")
+            }
+        }
+    }
+
+    if acc.trim().is_empty() && !raw_json.trim().is_empty() {
+        let parsed: Value = match serde_json::from_str(raw_json.trim()) {
+            Ok(v) => v,
+            Err(_) => bail!("POST chat/completions returned non-JSON (non-SSE)"),
+        };
+        if parsed.get("error").is_some() {
+            bail!(
+                "{}",
+                redact_secrets("chat/completions error: response error object", Some(api_key))
+            );
+        }
+        if let Some(text) = extract_assistant_text(&parsed) {
+            if !text.is_empty() {
+                on_delta(&text);
+                acc = text;
+            }
+        }
+    }
+
+    if acc.trim().is_empty() {
+        bail!("POST chat/completions returned empty content");
+    }
+    Ok(ChatCompletion {
+        text: acc,
+        tokens: 0,
+    })
+}
+
+fn extract_stream_delta(parsed: &Value) -> Option<String> {
+    let choice = parsed.get("choices")?.as_array()?.first()?;
+    if let Some(c) = choice.get("delta").and_then(|d| d.get("content")) {
+        return content_to_nonempty_string(c);
+    }
+    if let Some(c) = choice.get("message").and_then(|m| m.get("content")) {
+        return content_to_nonempty_string(c);
+    }
+    None
+}
+
+fn content_to_nonempty_string(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+                    out.push_str(t);
+                } else if let Some(s) = p.as_str() {
+                    out.push_str(s);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
 fn extract_assistant_text(parsed: &Value) -> Option<String> {
     let choice = parsed.get("choices")?.as_array()?.first()?;
     let content = choice.get("message")?.get("content")?;
@@ -428,9 +655,10 @@ mod tests {
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn parse_http_request(stream: &mut dyn Read) -> (String, String, Vec<(String, String)>) {
         let mut buf = Vec::new();
@@ -742,6 +970,101 @@ mod tests {
         let _ = join.join();
         assert!(err.contains("401"), "{err}");
         assert!(!err.contains("sk-chat-leak"), "{err}");
+    }
+
+    fn write_sse(stream: &mut dyn Write, chunks: &[&str]) {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        );
+        for c in chunks {
+            let payload = json!({"choices":[{"delta":{"content": c}}]});
+            let _ = write!(stream, "data: {payload}\n\n");
+            let _ = stream.flush();
+            thread::sleep(Duration::from_millis(8));
+        }
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        let _ = stream.flush();
+    }
+
+    fn spawn_sse(
+        chunks: &'static [&'static str],
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).ok();
+        let addr = listener.local_addr().unwrap();
+        let join = thread::spawn(move || {
+            use std::net::Shutdown;
+            let deadline = Instant::now() + Duration::from_secs(6);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                        let _ = parse_http_request(&mut stream);
+                        write_sse(&mut stream, chunks);
+                        let _ = stream.shutdown(Shutdown::Both);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() > deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{}/v1", addr.port()), join)
+    }
+
+    #[test]
+    fn chat_complete_stream_emits_deltas() {
+        let (base, join) = spawn_sse(&["Hel", "lo", "!"]);
+        let mut parts = Vec::new();
+        let cancel = AtomicBool::new(false);
+        let out = chat_complete_stream(
+            &base,
+            "sk-stream-secret",
+            "gpt-test",
+            &[json!({"role":"user","content":"ping"})],
+            8,
+            &cancel,
+            |d| parts.push(d.to_string()),
+        )
+        .unwrap();
+        let _ = join.join();
+        assert_eq!(parts, vec!["Hel", "lo", "!"]);
+        assert_eq!(out.text, "Hello!");
+        assert!(parts.len() >= 2, "expected incremental deltas, got {parts:?}");
+    }
+
+    #[test]
+    fn chat_complete_stream_cancel_after_first_delta() {
+        let (base, join) = spawn_sse(&["aa", "bb", "cc", "dd"]);
+        let mut parts = Vec::new();
+        let cancel = AtomicBool::new(false);
+        let err = chat_complete_stream(
+            &base,
+            "sk-stream-secret",
+            "gpt-test",
+            &[json!({"role":"user","content":"ping"})],
+            8,
+            &cancel,
+            |d| {
+                parts.push(d.to_string());
+                if parts.len() == 1 {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        let _ = join.join();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(!err.contains("sk-stream-secret"), "{err}");
+        assert_eq!(parts, vec!["aa"]);
     }
 
 }

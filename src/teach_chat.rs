@@ -191,13 +191,13 @@ pub struct NavConfirm {
     pub actions: Vec<TeachAction>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolLine {
     pub summary: String,
     pub status: String, // pending|validated|running|ok|fail|rejected|cancelled|needs_confirm
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatLine {
     pub role: String, // user|assistant|system
     pub text: String,
@@ -793,8 +793,27 @@ pub struct PageBrief {
 
 pub trait TeachLlm: Send + Sync {
     fn complete(&self, messages: &[Value]) -> Result<String>;
+
+    /// Incremental completion. Default: one `complete()` then a single delta.
+    /// Live backends override this with HTTP SSE. `cancel` is checked between deltas.
+    fn complete_streaming(
+        &self,
+        messages: &[Value],
+        on_delta: &mut dyn FnMut(&str),
+        cancel: &AtomicBool,
+    ) -> Result<String> {
+        let text = self.complete(messages)?;
+        if cancel.load(Ordering::SeqCst) {
+            bail!("cancelled");
+        }
+        if !text.is_empty() {
+            on_delta(&text);
+        }
+        Ok(text)
+    }
 }
 
+#[derive(Clone)]
 pub struct LiveLlm {
     pub base_url: String,
     pub api_key: String,
@@ -812,6 +831,40 @@ impl TeachLlm for LiveLlm {
             self.timeout_sec,
         )?;
         Ok(out.text)
+    }
+
+    fn complete_streaming(
+        &self,
+        messages: &[Value],
+        on_delta: &mut dyn FnMut(&str),
+        cancel: &AtomicBool,
+    ) -> Result<String> {
+        match llm_client::chat_complete_stream(
+            &self.base_url,
+            &self.api_key,
+            &self.model,
+            messages,
+            self.timeout_sec,
+            cancel,
+            &mut *on_delta,
+        ) {
+            Ok(out) => Ok(out.text),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("cancelled") {
+                    return Err(e);
+                }
+                // Provider rejected SSE (or returned a non-stream body): one-shot + one delta.
+                let text = self.complete(messages)?;
+                if cancel.load(Ordering::SeqCst) {
+                    bail!("cancelled");
+                }
+                if !text.is_empty() {
+                    on_delta(&text);
+                }
+                Ok(text)
+            }
+        }
     }
 }
 

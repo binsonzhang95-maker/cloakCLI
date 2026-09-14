@@ -6,6 +6,7 @@
 
 use crate::env_inherit;
 use crate::redact::redact_text;
+use crate::teach_event;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -183,6 +184,9 @@ fn redact_value(v: &mut Value) {
                         | "running"
                         | "wired"
                         | "via"
+                        | "seq"
+                        | "done"
+                        | "hub_resume"
                 ) {
                     continue;
                 }
@@ -285,8 +289,13 @@ pub fn start(
             if line.is_empty() {
                 continue;
             }
-            let Ok(raw) = serde_json::from_str::<Value>(line) else {
-                continue;
+            let raw = match teach_event::parse_event_line(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    let payload = teach_event::bad_event_payload(&redact_text(&e));
+                    let _ = app_r.emit("teach_chat_event", &payload);
+                    continue;
+                }
             };
             let event = redact_event(raw);
             if event.get("kind").and_then(|k| k.as_str()) == Some("session") {
@@ -336,6 +345,13 @@ pub fn start(
             }
             let _ = app_r.emit("teach_chat_event", &event);
         }
+        let closed = json!({
+            "v": 1,
+            "kind": "closed",
+            "reason": "child_exit",
+            "profile": "",
+        });
+        let _ = app_r.emit("teach_chat_event", &closed);
     });
 
     let deadline = Instant::now() + START_WAIT;
@@ -650,5 +666,16 @@ mod tests {
         assert!(!dto.wired);
         assert_eq!(dto.via, "none");
         assert!(dto.hint.contains("not wired") || dto.hint.contains("Teach Chat"));
+    }
+
+    #[test]
+    fn child_event_schema_rejects_unknown() {
+        assert!(teach_event::parse_event_line(r#"{"v":1,"kind":"shell"}"#).is_err());
+        assert!(teach_event::parse_event_line("nope").is_err());
+        let ok = teach_event::parse_event_line(
+            r#"{"v":1,"kind":"assistant_delta","role":"assistant","text":"x","seq":1,"done":false}"#,
+        )
+        .unwrap();
+        assert_eq!(ok["kind"], "assistant_delta");
     }
 }

@@ -125,7 +125,7 @@ On macOS an empty application menu (app name only) may still appear — there is
 - window chrome: drag, minimize, maximize/restore, close, is-maximized
 - events for PTY I/O
 - app commands: `shell_status`, `set_home`, `list_profiles`, `list_skills`, `ops_status`, `pty_start`, `pty_write`, `pty_resize`, `pty_stop`, `teach_chat_start`, `teach_chat_send`, `teach_chat_cancel`, `teach_chat_confirm`, `teach_chat_status`, `teach_chat_stop`, `job_start`, `job_cancel`
-- events: `teach_chat_event` (JSONL kinds: session/status/user/assistant/system/tool/job/error/closed), `pty-status` / `pty-exit`
+- events: `teach_chat_event` (JSONL v=1 kinds: session/status/user/assistant_delta/assistant/system/tool/job/error/closed/resume), `pty-status` / `pty-exit`
 
 No `shell`, `os`, `fs`, or `opener` plugins. `pty_start` always execs the resolved `cloakcli` binary with the single argument `tui`. Catalog commands read files under `CLOAKCLI_HOME`; they never scrape terminal text.
 
@@ -146,6 +146,8 @@ PTY reads are decoded with a stateful UTF-8 buffer so a CJK or emoji scalar spli
 ## Known limits (this phase)
 
 - Teach Chat is live JSONL to `cloakcli`; Profiles/Skills catalogs stay read-only except selection (profile + optional skill are passed into the turn context).
+- Assistant text is streamed as `assistant_delta` chunks (live LLM: HTTP SSE; mock: chunked mock JSON) then a final `assistant` (`done: true`). Stop/cancel is honored between chunks.
+- **Hub port is not reused on reconnect.** Each `cloakcli teach chat --events` child binds a new ephemeral teach-hub port and new pairing codes. A session snapshot (`data/teach/events-snapshot.json`) restores the chat transcript, last request id, page brief, and profile so you can continue; the headed worker must re-pair for new browser actions. The `resume` event sets `hub_resume: "new_hub"`.
 - Fleet `master submit` job start is **not wired** in the desktop (`job_start` returns an honest stub). The job card is the in-flight teach turn (start/progress/cancel via teach-chat).
 - Top-bar hub/worker lamps remain an honest file probe of the **master** control socket / `worker.pid`. Teach hub/worker/extension lamps live on the Chat pair strip.
 - Raw TUI still exists on Diagnostics; ratatui is not the product home.
@@ -185,11 +187,19 @@ Frontend redaction (pasted secrets never stored/echoed; event payloads redacted)
 cd desktop && npm test
 ```
 
-JSONL teach-chat smoke (no display, mock model):
+JSONL teach-chat smoke (no display, mock model; covers deltas, cancel, child-exit resume):
 
 ```bash
 ./scripts/desktop-m2-smoke.sh
 ```
+
+Headed Teach Chat → browser click → result echo (needs display + CloakBrowser):
+
+```bash
+./scripts/desktop-m2-headed-smoke.sh
+```
+
+Evidence lands in `artifacts/m2-headed-events.jsonl`, `artifacts/m2-headed-smoke.log`, and screenshots.
 
 CLI events protocol (same as the desktop child):
 

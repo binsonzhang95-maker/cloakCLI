@@ -96,6 +96,9 @@ const EVENT_ID_KEYS = new Set([
   "mode",
   "last_request_id",
   "running",
+  "seq",
+  "done",
+  "hub_resume",
 ]);
 
 /** Defense in depth: redact free-text fields on teach_chat_event payloads. */
