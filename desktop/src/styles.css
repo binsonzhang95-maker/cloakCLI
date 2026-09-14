@@ -49,6 +49,14 @@ textarea {
   display: flex;
   flex-direction: column;
   height: 100%;
+  position: relative;
+}
+
+#help,
+#fatal {
+  position: fixed;
+  inset: 0;
+  z-index: 8;
 }
 
 .titlebar {
@@ -404,7 +412,41 @@ html.shimmer .row.is-selected {
 }
 
 .runs-row {
-  grid-template-columns: 140px 100px 100px 90px;
+  grid-template-columns: 160px 90px 90px 110px;
+}
+
+.runs-split {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(220px, 0.8fr);
+}
+
+.runs-detail {
+  border-left: 1px solid var(--line);
+  padding: 10px 12px;
+  overflow: auto;
+  font-size: 11px;
+}
+
+.runs-detail .kv {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 4px 8px;
+}
+
+.runs-note {
+  margin-top: 12px;
+}
+
+.runs-detail button {
+  margin-top: 10px;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--cyan);
+  background: transparent;
+  color: var(--cyan);
+  cursor: pointer;
 }
 
 .empty {
@@ -453,6 +495,7 @@ html.shimmer .row.is-selected {
   gap: 8px;
   padding: 3px 0;
   border-bottom: 1px solid var(--line);
+  cursor: pointer;
 }
 
 .insp-run:last-child {
@@ -867,6 +910,95 @@ html.shimmer .row.is-selected {
 .status-keys {
   margin-left: auto;
   color: var(--chrome);
+  cursor: pointer;
+}
+
+.status-keys:hover {
+  color: var(--cyan);
+}
+
+.error-boundary {
+  padding: 16px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.error-boundary-msg {
+  color: var(--err);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.resume-banner {
+  margin: 8px 12px 0;
+  border: 1px solid var(--warn);
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.resume-banner button {
+  align-self: flex-start;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--cyan);
+  background: transparent;
+  color: var(--cyan);
+  cursor: pointer;
+}
+
+.diag-health {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.health-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.health-item .lamp {
+  margin-top: 3px;
+}
+
+.settings-llm {
+  font-size: 11px;
+  line-height: 1.45;
+  margin: 0 0 8px;
+}
+
+.help-table {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0 12px;
+}
+
+.help-row {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 8px;
+  align-items: baseline;
+  border-bottom: 1px solid var(--line);
+  padding: 3px 0;
+}
+
+.help-row kbd {
+  color: var(--coral);
+  font: inherit;
+}
+
+.help-card {
+  width: min(480px, calc(100% - 40px));
 }
 
 .status-keys::before {
@@ -880,6 +1012,16 @@ html.shimmer .row.is-selected {
   :root {
     --nav-w: 200px;
     --insp-w: 220px;
+  }
+}
+
+@media (max-width: 900px) {
+  .runs-split {
+    grid-template-columns: 1fr;
+  }
+  .runs-detail {
+    border-left: 0;
+    border-top: 1px solid var(--line);
   }
 }
 

@@ -418,28 +418,48 @@ fn hub_status(root: &Path) -> ComponentStatus {
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .and_then(|v| v.get("bind").and_then(|b| b.as_str()).map(|s| s.to_string()));
     let sock_exists = sock.exists();
-    match (bind, sock_exists) {
-        (Some(bind), true) => ComponentStatus {
-            state: "unknown".into(),
-            detail: redact_text(&format!("control socket present at {bind} (not probed)")),
+    let accepting = sock_exists && unix_socket_accepts(&sock);
+    match (bind, sock_exists, accepting) {
+        (Some(bind), true, true) => ComponentStatus {
+            state: "running".into(),
+            detail: redact_text(&format!(
+                "control socket accepting · bind {bind} · data/master_ctrl.sock"
+            )),
             pid: None,
-            source: "files".into(),
+            source: "sock-connect".into(),
         },
-        (Some(bind), false) => ComponentStatus {
+        (None, true, true) => ComponentStatus {
+            state: "running".into(),
+            detail: "control socket accepting · data/master_ctrl.sock (no master.json bind)"
+                .into(),
+            pid: None,
+            source: "sock-connect".into(),
+        },
+        (Some(bind), true, false) => ComponentStatus {
             state: "stopped".into(),
-            detail: redact_text(&format!("metadata bind={bind}; no control socket")),
+            detail: redact_text(&format!(
+                "stale control socket (not accepting) · metadata bind={bind}"
+            )),
             pid: None,
             source: "files".into(),
         },
-        (None, true) => ComponentStatus {
-            state: "unknown".into(),
-            detail: "control socket present (not probed)".into(),
-            pid: None,
-            source: "files".into(),
-        },
-        (None, false) => ComponentStatus {
+        (None, true, false) => ComponentStatus {
             state: "stopped".into(),
-            detail: "no hub metadata or control socket".into(),
+            detail: "stale control socket (not accepting) · data/master_ctrl.sock".into(),
+            pid: None,
+            source: "files".into(),
+        },
+        (Some(bind), false, _) => ComponentStatus {
+            state: "stopped".into(),
+            detail: redact_text(&format!(
+                "stopped · metadata bind={bind} · no data/master_ctrl.sock"
+            )),
+            pid: None,
+            source: "files".into(),
+        },
+        (None, false, _) => ComponentStatus {
+            state: "stopped".into(),
+            detail: "stopped · no hub metadata or control socket".into(),
             pid: None,
             source: "absent".into(),
         },
@@ -454,40 +474,78 @@ fn worker_status(root: &Path) -> ComponentStatus {
         .and_then(|s| s.trim().parse::<u32>().ok());
     let pid_alive = pid.map(process_alive).unwrap_or(false);
     let sock_exists = sock.exists();
+    let sock_live = sock_exists && unix_socket_accepts(&sock);
 
-    if pid_alive && sock_exists {
+    if pid_alive && sock_live {
         ComponentStatus {
             state: "running".into(),
-            detail: format!("running pid={}", pid.unwrap_or(0)),
+            detail: format!(
+                "running pid={} · data/worker.pid + worker.sock accepting",
+                pid.unwrap_or(0)
+            ),
+            pid,
+            source: "pid+sock".into(),
+        }
+    } else if pid_alive && sock_exists && !sock_live {
+        ComponentStatus {
+            state: "unknown".into(),
+            detail: format!(
+                "pid {} alive but worker.sock is not accepting",
+                pid.unwrap_or(0)
+            ),
             pid,
             source: "pid+sock".into(),
         }
     } else if sock_exists && !pid_alive {
         ComponentStatus {
             state: "stopped".into(),
-            detail: "stale socket (pid dead)".into(),
+            detail: "stale: data/worker.sock left behind (pid dead or missing)".into(),
             pid,
             source: "pid+sock".into(),
         }
     } else if pid_alive && !sock_exists {
         ComponentStatus {
             state: "unknown".into(),
-            detail: format!("pid {} alive but socket missing", pid.unwrap_or(0)),
+            detail: format!(
+                "pid {} listed in data/worker.pid but worker.sock missing",
+                pid.unwrap_or(0)
+            ),
             pid,
             source: "pid+sock".into(),
         }
     } else {
         ComponentStatus {
             state: "stopped".into(),
-            detail: "stopped".into(),
+            detail: "stopped · no data/worker.pid".into(),
             pid: None,
             source: "pid+sock".into(),
         }
     }
 }
 
+fn unix_socket_accepts(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        path.exists()
+    }
+}
+
 fn process_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn is_terminal_job(state: &str) -> bool {
@@ -495,6 +553,12 @@ fn is_terminal_job(state: &str) -> bool {
 }
 
 fn list_job_stubs(root: &Path) -> (usize, Vec<JobStub>) {
+    list_job_stubs_n(root, 8)
+}
+
+/// Fleet job stubs. `limit == 0` means no truncation (caller still must not
+/// copy `data` / extracts — this reader never does).
+pub(crate) fn list_job_stubs_n(root: &Path, limit: usize) -> (usize, Vec<JobStub>) {
     let dir = root.join("data").join("jobs");
     if !dir.is_dir() {
         return (0, vec![]);
@@ -536,7 +600,9 @@ fn list_job_stubs(root: &Path) -> (usize, Vec<JobStub>) {
     }
     let running = jobs.iter().filter(|j| !is_terminal_job(&j.state)).count();
     jobs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    jobs.truncate(8);
+    if limit > 0 {
+        jobs.truncate(limit);
+    }
     (running, jobs)
 }
 
@@ -690,7 +756,14 @@ mod tests {
         );
         assert_eq!(st.hub.state, "stopped");
         assert!(st.hub.detail.contains("7750"), "{}", st.hub.detail);
+        assert!(
+            st.hub.detail.contains("no data/master_ctrl.sock")
+                || st.hub.detail.contains("no hub metadata"),
+            "{}",
+            st.hub.detail
+        );
         assert_eq!(st.worker.state, "stopped");
+        assert!(st.worker.detail.contains("worker.pid"), "{}", st.worker.detail);
         assert_eq!(st.jobs_running, 0);
         assert_eq!(st.jobs_recent.len(), 1);
         let json = serde_json::to_string(&st).unwrap();
@@ -775,6 +848,28 @@ mod tests {
             assert!(!json.contains(leak), "leaked {leak} in {json}");
         }
 
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hub_running_when_control_socket_accepts() {
+        let home = temp_home();
+        fs::create_dir_all(home.join("data")).unwrap();
+        fs::write(
+            home.join("data").join("master.json"),
+            r#"{"bind":"127.0.0.1:7750","mode":"dev-stub"}"#,
+        )
+        .unwrap();
+        let sock_path = home.join("data").join("master_ctrl.sock");
+        let _ = fs::remove_file(&sock_path);
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        let st = ops_status(Some(&home), None, Some("/bin/cloakcli".into()), None, false);
+        assert_eq!(st.hub.state, "running", "{}", st.hub.detail);
+        assert_eq!(st.hub.source, "sock-connect");
+        assert!(st.hub.detail.contains("7750"), "{}", st.hub.detail);
+        drop(listener);
+        let _ = fs::remove_file(&sock_path);
         fs::remove_dir_all(&home).ok();
     }
 }

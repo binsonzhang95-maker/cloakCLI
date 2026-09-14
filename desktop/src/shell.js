@@ -1,10 +1,20 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { listProfiles, listSkills, opsStatus, setHome, shellStatus } from "./api.js";
+import {
+  listProfiles,
+  listRuns,
+  listSkills,
+  llmStatus,
+  opsStatus,
+  setHome,
+  shellStatus,
+  teachResumeHint,
+} from "./api.js";
 import {
   currentProfile,
   getState,
   loadShimmerPref,
   selectProfile,
+  selectRun,
   setCatalog,
   setInspectorOpen,
   setRoute,
@@ -12,11 +22,13 @@ import {
   subscribe,
   toggleInspector,
 } from "./store.js";
-import { ensureChatEvents, renderChat, updateChatChrome } from "./features/teach-chat.js";
+import { ensureChatEvents, refreshResumeHint, renderChat, updateChatChrome } from "./features/teach-chat.js";
 import { renderProfiles } from "./features/profiles.js";
 import { renderSkills } from "./features/skills.js";
 import { renderRuns } from "./features/runs.js";
-import { ensureDiagnostics, focusDiagnostics } from "./features/diagnostics.js";
+import { ensureDiagnostics, focusDiagnostics, paintDiagHealth } from "./features/diagnostics.js";
+import { safeRender, showFatal } from "./errors.js";
+import { renderShortcutsTable, shortcutsStatusHint } from "./help.js";
 
 const ROUTES = ["chat", "profiles", "skills", "runs", "diagnostics"];
 const appWindow = getCurrentWindow();
@@ -71,8 +83,11 @@ function paintChrome(state) {
     : `bin missing${st?.binary_error ? ` (${st.binary_error})` : ""}`;
   $("status-ver").textContent = `v${st?.version || "—"}`;
   $("nav-counts").textContent = `profiles ${state.profiles.length} · skills ${state.skills.length}`;
-
+  const keys = $("status-keys");
+  if (keys) keys.textContent = shortcutsStatusHint();
   paintInspector(state);
+  paintDiagHealth(state.status);
+  paintLlmSettings(state.llm);
 }
 
 function paintInspector(state) {
@@ -101,13 +116,19 @@ function paintInspector(state) {
     runsEl.textContent = "—";
   } else {
     runsEl.className = "insp-body";
-    runsEl.innerHTML = runs
-      .slice(0, 6)
-      .map(
-        (j) =>
-          `<div class="insp-run"><span>${escapeHtml(j.job_id)}</span><span>${escapeHtml(j.state)}</span></div>`,
-      )
+    const history = (state.runs && state.runs.length ? state.runs : runs).slice(0, 6);
+    runsEl.innerHTML = history
+      .map((j) => {
+        const id = j.id || j.job_id;
+        return `<div class="insp-run" data-id="${escapeHtml(id)}" role="button" tabindex="0"><span>${escapeHtml(j.job_id || id)}</span><span>${escapeHtml(j.state)}</span></div>`;
+      })
       .join("");
+    runsEl.querySelectorAll(".insp-run").forEach((row) => {
+      row.addEventListener("click", () => {
+        selectRun(row.dataset.id);
+        setRoute("runs");
+      });
+    });
   }
 }
 
@@ -119,18 +140,40 @@ function escapeHtml(s) {
 }
 
 function paintRoute(state) {
-  if (state.route === "chat") renderChat($("page-chat"));
-  if (state.route === "profiles") renderProfiles($("page-profiles"));
-  if (state.route === "skills") renderSkills($("page-skills"));
-  if (state.route === "runs") renderRuns($("page-runs"));
-  if (state.route === "diagnostics") {
-    ensureDiagnostics().then(() => focusDiagnostics());
+  try {
+    if (state.route === "chat") {
+      safeRender($("page-chat"), "Teach Chat", renderChat);
+    }
+    if (state.route === "profiles") {
+      safeRender($("page-profiles"), "Profiles", renderProfiles);
+    }
+    if (state.route === "skills") {
+      safeRender($("page-skills"), "Skills", renderSkills);
+    }
+    if (state.route === "runs") {
+      safeRender($("page-runs"), "Runs / History", renderRuns);
+    }
+    if (state.route === "diagnostics") {
+      ensureDiagnostics()
+        .then(() => {
+          paintDiagHealth(getState().status);
+          focusDiagnostics();
+        })
+        .catch((err) => {
+          safeRender($("page-diagnostics"), "Diagnostics", () => {
+            throw err;
+          });
+        });
+    }
+  } catch (err) {
+    showFatal(err);
   }
 }
 
 let lastRoute = null;
 let lastProfile = null;
 let lastSkill = null;
+let lastSelectedRun = null;
 let lastCatalogSig = "";
 
 function onState(state) {
@@ -140,6 +183,10 @@ function onState(state) {
     s: state.skills.length,
     e: state.error,
     j: state.status?.jobs_recent?.length,
+    r: state.runs?.length,
+    sel: state.selectedRun,
+    llm: state.llm?.configured,
+    rh: state.resumeHint?.present,
   });
   const routeChanged = state.route !== lastRoute;
   if (routeChanged) {
@@ -147,31 +194,46 @@ function onState(state) {
     lastRoute = state.route;
     lastProfile = state.selectedProfile;
     lastSkill = state.selectedSkill;
+    lastSelectedRun = state.selectedRun;
     lastCatalogSig = sig;
     return;
   }
   if (state.route === "chat") {
-    if (state.selectedProfile !== lastProfile || state.selectedSkill !== lastSkill) {
+    if (
+      state.selectedProfile !== lastProfile ||
+      state.selectedSkill !== lastSkill ||
+      sig !== lastCatalogSig
+    ) {
       updateChatChrome();
       lastProfile = state.selectedProfile;
       lastSkill = state.selectedSkill;
+      lastCatalogSig = sig;
     }
     return;
   }
   if (state.route === "profiles" && state.selectedProfile !== lastProfile) {
-    renderProfiles($("page-profiles"));
+    safeRender($("page-profiles"), "Profiles", renderProfiles);
     lastProfile = state.selectedProfile;
     return;
   }
   if (state.route === "skills" && (state.selectedSkill !== lastSkill || sig !== lastCatalogSig)) {
-    renderSkills($("page-skills"));
+    safeRender($("page-skills"), "Skills", renderSkills);
     lastSkill = state.selectedSkill;
     lastCatalogSig = sig;
     return;
   }
+  if (
+    state.route === "runs" &&
+    (sig !== lastCatalogSig || state.selectedRun !== lastSelectedRun)
+  ) {
+    safeRender($("page-runs"), "Runs / History", renderRuns);
+    lastSelectedRun = state.selectedRun;
+    lastCatalogSig = sig;
+    return;
+  }
   if (sig !== lastCatalogSig) {
-    if (state.route === "runs") renderRuns($("page-runs"));
-    if (state.route === "profiles") renderProfiles($("page-profiles"));
+    if (state.route === "runs") safeRender($("page-runs"), "Runs / History", renderRuns);
+    if (state.route === "profiles") safeRender($("page-profiles"), "Profiles", renderProfiles);
     lastCatalogSig = sig;
   }
 }
@@ -200,6 +262,10 @@ export async function bootShell() {
   $("btn-inspector").addEventListener("click", () => toggleInspector());
   $("btn-inspector-close").addEventListener("click", () => setInspectorOpen(false));
   $("btn-settings").addEventListener("click", () => openSettings());
+  $("btn-help")?.addEventListener("click", () => openHelp());
+  $("status-keys")?.addEventListener("click", () => openHelp());
+  $("help-close")?.addEventListener("click", () => closeHelp());
+  $("fatal-close")?.addEventListener("click", () => $("fatal").classList.add("hidden"));
   $("settings-close").addEventListener("click", () => $("settings").classList.add("hidden"));
   $("settings-shimmer").addEventListener("change", (e) => setShimmer(e.target.checked));
   $("settings-save").addEventListener("click", async () => {
@@ -263,15 +329,27 @@ export async function bootShell() {
     } else if (event.key === ",") {
       event.preventDefault();
       openSettings();
+    } else if (event.key === "?") {
+      event.preventDefault();
+      openHelp();
     } else if (event.key === "Escape") {
       $("settings").classList.add("hidden");
+      closeHelp();
+      $("fatal")?.classList.add("hidden");
     }
   });
 
   window.addEventListener("resize", () => syncMaximizeIcon());
   await syncMaximizeIcon();
+  window.addEventListener("error", (ev) => showFatal(ev.error || ev.message));
+  window.addEventListener("unhandledrejection", (ev) => showFatal(ev.reason));
+
+  const helpBody = $("help-body");
+  if (helpBody) helpBody.innerHTML = renderShortcutsTable();
+
   await ensureChatEvents();
   await refreshCatalog();
+  await refreshResumeHint();
 }
 
 function openSettings() {
@@ -279,8 +357,43 @@ function openSettings() {
   $("settings-home").value = st?.home || "";
   $("settings-shimmer").checked = getState().shimmer;
   $("settings-error").textContent = "";
+  paintLlmSettings(getState().llm);
   $("settings").classList.remove("hidden");
   $("settings-home").focus();
+}
+
+function paintLlmSettings(llm) {
+  const el = $("settings-llm");
+  if (!el) return;
+  if (!llm) {
+    el.textContent = "LLM status unavailable (set CLOAKCLI_HOME).";
+    return;
+  }
+  if (!llm.configured) {
+    el.textContent = `not configured · ${llm.relative_path || "config/llm.json"} · key ${
+      llm.key_present ? "present" : "missing"
+    } (read-only)`;
+    return;
+  }
+  el.textContent = [
+    llm.enabled ? "enabled" : "disabled",
+    llm.model ? `model ${llm.model}` : "model —",
+    llm.base_url ? `base ${llm.base_url}` : "base —",
+    `env ${llm.api_key_env || "CLOAKCLI_LLM_API_KEY"}`,
+    `key ${llm.key_present ? "present" : "missing"}`,
+    `teach optimize ${llm.teach_smart_optimize ? "on" : "off"}`,
+    "read-only",
+  ].join(" · ");
+}
+
+function openHelp() {
+  const overlay = $("help");
+  if (!overlay) return;
+  overlay.classList.remove("hidden");
+}
+
+function closeHelp() {
+  $("help")?.classList.add("hidden");
 }
 
 export async function refreshCatalog() {
@@ -294,11 +407,20 @@ export async function refreshCatalog() {
       return;
     }
     $("setup").classList.add("hidden");
-    const [profiles, skillList] = await Promise.all([listProfiles(), listSkills()]);
+    const [profiles, skillList, runs, llm, hint] = await Promise.all([
+      listProfiles(),
+      listSkills(),
+      listRuns().catch(() => []),
+      llmStatus().catch(() => null),
+      teachResumeHint().catch(() => null),
+    ]);
     setCatalog({
       profiles,
       skills: skillList.skills || [],
       skillsInvalid: skillList.invalid || [],
+      runs: Array.isArray(runs) ? runs : [],
+      llm,
+      resumeHint: hint,
     });
     const selected = getState().selectedProfile;
     if (selected && !profiles.some((p) => p.name === selected) && profiles[0]) {

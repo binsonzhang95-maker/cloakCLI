@@ -9,8 +9,12 @@ const state = {
   skillsInvalid: [],
   selectedProfile: null,
   selectedSkill: null,
+  selectedRun: null,
   status: null,
   shell: null,
+  runs: [],
+  llm: null,
+  resumeHint: null,
   error: null,
 };
 
@@ -44,16 +48,45 @@ export function toggleInspector() {
   emit();
 }
 
-export function setCatalog({ profiles, skills, skillsInvalid, status, shell, error }) {
+export function setCatalog({
+  profiles,
+  skills,
+  skillsInvalid,
+  status,
+  shell,
+  runs,
+  llm,
+  resumeHint,
+  error,
+}) {
   if (profiles) state.profiles = profiles;
   if (skills) state.skills = skills;
   if (skillsInvalid) state.skillsInvalid = skillsInvalid;
   if (status) state.status = status;
   if (shell) state.shell = shell;
+  if (runs) state.runs = runs;
+  if (llm !== undefined) state.llm = llm;
+  if (resumeHint !== undefined) state.resumeHint = resumeHint;
   if (error !== undefined) state.error = error;
   if (!state.selectedProfile && state.profiles.length) {
     state.selectedProfile = state.profiles[0].name;
   }
+  emit();
+}
+
+export function selectRun(id) {
+  state.selectedRun = id || null;
+  emit();
+}
+
+export function upsertRun(run) {
+  if (!run || !run.id) return;
+  const next = Array.isArray(state.runs) ? state.runs.slice() : [];
+  const i = next.findIndex((r) => r.id === run.id);
+  if (i >= 0) next[i] = { ...next[i], ...run };
+  else next.unshift(run);
+  next.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+  state.runs = next.slice(0, 50);
   emit();
 }
 

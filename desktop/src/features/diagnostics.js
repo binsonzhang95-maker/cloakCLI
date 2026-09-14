@@ -34,6 +34,41 @@ function updateButtons() {
   restart.disabled = busy || !canLaunch;
 }
 
+function lampClass(state) {
+  if (state === "running") return "lamp ok";
+  if (state === "stopped") return "lamp";
+  if (state === "unknown") return "lamp warn";
+  return "lamp err";
+}
+
+export function paintDiagHealth(status) {
+  const host = $("diag-health");
+  if (!host) return;
+  const hub = status?.hub;
+  const worker = status?.worker;
+  const ptyState = running ? "running" : lastExit || "stopped";
+  const set = (lampId, textId, component, fallback) => {
+    const lamp = $(lampId);
+    const text = $(textId);
+    if (lamp) lamp.className = lampClass(component?.state);
+    if (text) {
+      text.textContent = component
+        ? `${fallback} ${component.state} · ${component.detail || ""}${
+            component.pid ? ` · pid ${component.pid}` : ""
+          } · ${component.source || ""}`
+        : `${fallback} —`;
+    }
+  };
+  set("diag-lamp-hub", "diag-hub", hub, "hub");
+  set("diag-lamp-worker", "diag-worker", worker, "worker");
+  const ptyLamp = $("diag-lamp-pty");
+  const ptyText = $("diag-pty-detail");
+  if (ptyLamp) ptyLamp.className = running ? "lamp ok" : "lamp";
+  if (ptyText) {
+    ptyText.textContent = `pty ${ptyState} · cloakcli tui only (no arbitrary shell)`;
+  }
+}
+
 function applyShell(status) {
   canLaunch = Boolean(status.binary && status.home);
   running = Boolean(status.running);
@@ -41,6 +76,13 @@ function applyShell(status) {
   if (pty) {
     if (running) pty.textContent = "pty: running";
     else pty.textContent = lastExit ? `pty: ${lastExit}` : "pty: stopped";
+  }
+  const ptyLamp = $("diag-lamp-pty");
+  const ptyText = $("diag-pty-detail");
+  if (ptyLamp) ptyLamp.className = running ? "lamp ok" : "lamp";
+  if (ptyText) {
+    const st = running ? "running" : lastExit || "stopped";
+    ptyText.textContent = `pty ${st} · cloakcli tui only (no arbitrary shell)`;
   }
   updateButtons();
 }

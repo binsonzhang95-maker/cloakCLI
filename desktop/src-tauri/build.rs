@@ -19,6 +19,9 @@ fn main() {
                 "teach_chat_stop",
                 "job_start",
                 "job_cancel",
+                "list_runs",
+                "llm_status",
+                "teach_resume_hint",
             ]),
         ),
     )

@@ -53,6 +53,21 @@ test("resume restores transcript and hub-port note", () => {
   assert.equal(c.status.hub_resume, "new_hub");
 });
 
+test("job events upsert a teach run for History", async () => {
+  resetChatState();
+  const { getState } = await import("../store.js");
+  onTeachEvent({
+    kind: "job",
+    job_id: "pending",
+    state: "done",
+    summary: "click a → done ok",
+  });
+  const rec = getState().runs.find((r) => r.id === "teach:pending");
+  assert.ok(rec, "expected teach run in store");
+  assert.equal(rec.state, "done");
+  assert.equal(rec.kind, "teach");
+});
+
 test("closed keeps transcript so reconnect can continue", () => {
   resetChatState();
   onTeachEvent({ kind: "user", role: "user", text: "click the link" });

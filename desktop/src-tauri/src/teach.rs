@@ -282,6 +282,8 @@ pub fn start(
     let first_w = first.clone();
     let slot_r = slot.clone();
     let app_r = app.clone();
+    let home_for_runs = home.to_path_buf();
+    let profile_for_runs = profile.to_string();
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
@@ -342,6 +344,9 @@ pub fn start(
                         sess.last_status = status_from_event(&event, &sess.last_status);
                     }
                 }
+            }
+            if event.get("kind").and_then(|k| k.as_str()) == Some("job") {
+                let _ = crate::runs::record_teach_run(&home_for_runs, &event, &profile_for_runs);
             }
             let _ = app_r.emit("teach_chat_event", &event);
         }
@@ -562,7 +567,7 @@ pub fn job_start_dto(slot: &SharedTeach) -> JobStartDto {
         JobStartDto {
             wired: false,
             via: "none".into(),
-            hint: "start Teach Chat first. Fleet master submit is not wired in desktop M2.".into(),
+            hint: "start Teach Chat first. Fleet master submit is not wired in desktop.".into(),
         }
     }
 }

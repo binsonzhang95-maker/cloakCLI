@@ -3,11 +3,13 @@ mod env_inherit;
 mod paths;
 mod pty;
 mod redact;
+mod runs;
 mod teach;
 mod teach_event;
 
 use catalog::{OpsStatus, ProfileDto, SkillListDto};
 use pty::SharedPty;
+use runs::{LlmStatusDto, ResumeHintDto, RunDto};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -187,6 +189,24 @@ fn job_cancel(state: tauri::State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn list_runs(state: tauri::State<AppState>) -> Result<Vec<RunDto>, String> {
+    let home = resolved_home(&state)?;
+    Ok(runs::list_runs(&home))
+}
+
+#[tauri::command]
+fn llm_status(state: tauri::State<AppState>) -> Result<LlmStatusDto, String> {
+    let home = resolved_home(&state)?;
+    Ok(runs::llm_status(&home))
+}
+
+#[tauri::command]
+fn teach_resume_hint(state: tauri::State<AppState>) -> Result<ResumeHintDto, String> {
+    let home = resolved_home(&state)?;
+    Ok(runs::resume_hint(&home))
+}
+
+#[tauri::command]
 fn ops_status(state: tauri::State<AppState>) -> OpsStatus {
     let exe = current_exe().ok();
     let stored = paths::load_stored_config(&state.config_dir);
@@ -225,6 +245,8 @@ fn terminate_pty(app: &AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            // Release builds compile without the `devtools` Cargo feature, so
+            // WebView inspector is off. Debug (`tauri dev`) keeps DevTools.
             let menu = Menu::new(app.handle())?;
             app.set_menu(menu)?;
 
@@ -256,7 +278,10 @@ pub fn run() {
             teach_chat_status,
             teach_chat_stop,
             job_start,
-            job_cancel
+            job_cancel,
+            list_runs,
+            llm_status,
+            teach_resume_hint
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -275,4 +300,27 @@ pub fn run() {
                 terminate_pty(app);
             }
         });
+}
+
+#[cfg(test)]
+mod capability_tests {
+    #[test]
+    fn capabilities_are_minimal() {
+        let raw = include_str!("../capabilities/default.json");
+        let v: serde_json::Value = serde_json::from_str(raw).expect("capabilities json");
+        let perms = v["permissions"].as_array().expect("permissions");
+        let joined = perms
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(!joined.contains("shell:"), "{joined}");
+        assert!(!joined.contains("fs:"), "{joined}");
+        assert!(!joined.contains("os:"), "{joined}");
+        assert!(!joined.contains("opener"), "{joined}");
+        assert!(joined.contains("allow-list-runs"), "{joined}");
+        assert!(joined.contains("allow-llm-status"), "{joined}");
+        assert!(joined.contains("allow-teach-resume-hint"), "{joined}");
+        assert!(joined.contains("allow-teach-chat-start"), "{joined}");
+    }
 }

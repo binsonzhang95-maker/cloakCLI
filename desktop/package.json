@@ -1,13 +1,13 @@
 {
   "name": "cloakcli-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test src/redact.test.js src/features/teach-chat.test.js",
+    "test": "node --test src/redact.test.js src/errors.test.js src/help.test.js src/features/teach-chat.test.js src/features/runs.test.js",
     "tauri": "tauri"
   },
   "dependencies": {

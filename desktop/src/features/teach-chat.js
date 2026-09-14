@@ -8,14 +8,16 @@ import {
   teachChatStart,
   teachChatStatus,
   teachChatStop,
+  teachResumeHint,
 } from "../api.js";
 import { redactEventPayload, redactText, summarizeUserMessage } from "../redact.js";
-import { currentProfile, getState } from "../store.js";
+import { currentProfile, getState, setCatalog, upsertRun } from "../store.js";
+import { openRunFromChat, runFromJobEvent } from "./runs.js";
 
 const WELCOME = [
   {
     role: "system",
-    text: "Teach Chat M2 — live cloakcli teach-chat via JSONL. Playwright / LLM stay in Rust. Start a session, then send a goal.",
+    text: "Teach Chat — live cloakcli teach-chat via JSONL. Playwright / LLM stay in Rust. Start a session, then send a goal. Reconnect restores the M2 snapshot (new hub port).",
   },
 ];
 
@@ -31,6 +33,7 @@ const chat = {
   url: "",
   spawnBrowser: false,
   fleetHint: null,
+  resumeHint: null,
 };
 
 let listening = false;
@@ -73,6 +76,7 @@ export function resetChatState() {
   chat.url = "";
   chat.spawnBrowser = false;
   chat.fleetHint = null;
+  chat.resumeHint = null;
   lastMsgSig = "";
   lastJobSig = "";
 }
@@ -153,6 +157,12 @@ export function onTeachEvent(rawPayload) {
       const last = chat.messages[chat.messages.length - 1];
       if (last && last.streaming) last.streaming = false;
     }
+    const rec = runFromJobEvent(payload, currentProfile()?.name);
+    if (rec) {
+      rec.summary = typeof rec.summary === "string" ? redactText(rec.summary) : rec.summary;
+      rec.error = typeof rec.error === "string" ? redactText(rec.error) : rec.error;
+      upsertRun(rec);
+    }
   } else if (kind === "error") {
     chat.error = redactText(payload.message || payload.code || "error");
     chat.messages.push({
@@ -173,6 +183,7 @@ export function onTeachEvent(rawPayload) {
         ts: Date.now(),
       });
     }
+    refreshResumeHint();
   }
   paint();
 }
@@ -206,6 +217,7 @@ export function renderChat(root) {
       <div class="pair-ids" id="chat-ids">start a session to pair the extension / worker</div>
     </div>
     <div class="chat">
+      <div class="resume-banner hidden" id="chat-resume"></div>
       <div class="chat-stream" id="chat-stream"></div>
       <div class="job-card" id="chat-job"></div>
       <form class="chat-input" id="chat-form">
@@ -284,12 +296,37 @@ function paint() {
         } · ${sess.hub_url || ""}`
       : chat.error || "start a session to pair the extension / worker";
   }
+  paintResume();
   paintMessages();
   paintJob();
   const stop = root.querySelector("#chat-stop");
   if (stop) stop.disabled = !(chat.sending || st?.busy);
   const sendBtn = root.querySelector("#chat-send");
   if (sendBtn) sendBtn.disabled = chat.connecting;
+}
+
+function paintResume() {
+  const el = document.getElementById("chat-resume");
+  if (!el) return;
+  const hint = chat.resumeHint || getState().resumeHint;
+  const running = Boolean(chat.session);
+  if (!hint?.present || running) {
+    el.classList.add("hidden");
+    el.innerHTML = "";
+    return;
+  }
+  el.classList.remove("hidden");
+  el.innerHTML = `
+    <div>
+      <strong>Resume available</strong>
+      · profile ${esc(hint.profile || "—")}
+      · ${esc(String(hint.message_count ?? 0))} messages
+      · ${esc(hint.relative_path || "data/teach/events-snapshot.json")}
+    </div>
+    <div class="muted">${esc(hint.note || "Reconnect restores transcript. Hub binds a new port.")}</div>
+    <button type="button" id="chat-resume-btn">Reconnect</button>
+  `;
+  el.querySelector("#chat-resume-btn")?.addEventListener("click", () => startSession(true));
 }
 
 function paintMessages() {
@@ -336,6 +373,7 @@ function paintJob() {
     <div class="job-head">
       <strong>${esc(job.state || "idle")}</strong>
       <span>${esc(job.job_id || "")}</span>
+      <button type="button" class="ghost" id="job-history">History</button>
       ${
         job.state === "running" || needs
           ? `<button type="button" class="ghost" id="job-cancel">Cancel</button>`
@@ -350,6 +388,9 @@ function paintJob() {
     <div>${esc(job.summary || "")}${job.error ? ` · ${esc(job.error)}` : ""}</div>
     ${toolLines}
   `;
+  el.querySelector("#job-history")?.addEventListener("click", () =>
+    openRunFromChat(job.job_id),
+  );
   el.querySelector("#job-cancel")?.addEventListener("click", () => stopTurn());
   el.querySelector("#job-yes")?.addEventListener("click", () => confirmNav(true));
   el.querySelector("#job-no")?.addEventListener("click", () => confirmNav(false));
@@ -460,5 +501,16 @@ export async function refreshTeachStatus() {
     paint();
   } catch {
     // ignore
+  }
+}
+
+export async function refreshResumeHint() {
+  try {
+    const hint = await teachResumeHint();
+    chat.resumeHint = hint;
+    setCatalog({ resumeHint: hint });
+    paint();
+  } catch {
+    // home unset or command unavailable
   }
 }

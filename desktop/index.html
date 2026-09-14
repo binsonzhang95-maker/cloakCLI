@@ -68,7 +68,8 @@
           <button type="button" id="btn-inspector" class="chip-btn" title="Toggle inspector ([)">
             inspector
           </button>
-          <button type="button" id="btn-settings" class="chip-btn" title="Settings">settings</button>
+          <button type="button" id="btn-help" class="chip-btn" title="Keyboard shortcuts (?)">?</button>
+          <button type="button" id="btn-settings" class="chip-btn" title="Settings (,)">settings</button>
         </div>
       </div>
 
@@ -98,7 +99,7 @@
           </button>
           <div class="nav-foot">
             <div class="nav-meta" id="nav-counts">profiles — · skills —</div>
-            <div class="nav-meta muted">M2 teach chat</div>
+            <div class="nav-meta muted">M3 ops console</div>
           </div>
         </nav>
 
@@ -116,6 +117,20 @@
                 <button type="button" id="btn-restart" title="Restart cloakcli tui">Restart</button>
               </div>
               <span id="diag-pty" class="diag-pty">pty: stopped</span>
+            </div>
+            <div class="diag-health" id="diag-health">
+              <div class="health-item">
+                <span id="diag-lamp-hub" class="lamp"></span>
+                <span id="diag-hub">hub —</span>
+              </div>
+              <div class="health-item">
+                <span id="diag-lamp-worker" class="lamp"></span>
+                <span id="diag-worker">worker —</span>
+              </div>
+              <div class="health-item">
+                <span id="diag-lamp-pty" class="lamp"></span>
+                <span id="diag-pty-detail">pty stopped · cloakcli tui only</span>
+              </div>
             </div>
             <div id="terminal" class="terminal"></div>
           </section>
@@ -169,6 +184,8 @@
             <input id="settings-shimmer" type="checkbox" />
             Selection shimmer (off by default)
           </label>
+          <label>LLM status (read-only)</label>
+          <p id="settings-llm" class="settings-llm muted">—</p>
           <p id="settings-error" class="setup-error"></p>
           <div class="row-actions">
             <button type="button" id="settings-save">Save home</button>
@@ -182,8 +199,28 @@
         <span id="status-worker">worker —</span>
         <span id="status-bin">bin: …</span>
         <span id="status-ver">v—</span>
-        <span class="status-keys" title="Keyboard">1–5 nav · [ inspector · , settings</span>
+        <span id="status-keys" class="status-keys" title="Keyboard shortcuts (?)">1–5 nav · [ inspector · , settings · ? help</span>
       </footer>
+    </div>
+
+    <div id="help" class="setup hidden" role="dialog" aria-label="Keyboard shortcuts">
+      <div class="setup-card help-card">
+        <h1>Keyboard</h1>
+        <p class="muted">Digits do not steal keys while Diagnostics / xterm is focused.</p>
+        <div id="help-body" class="help-table"></div>
+        <div class="row-actions">
+          <button type="button" id="help-close" class="ghost">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="fatal" class="setup hidden" role="alertdialog" aria-label="Unhandled error">
+      <div class="setup-card">
+        <h1>Something broke</h1>
+        <p id="fatal-msg" class="error-boundary-msg">—</p>
+        <p class="muted">Secrets are redacted. Retry the view or restart the window. Teach Chat JSONL is unchanged.</p>
+        <button type="button" id="fatal-close" class="ghost">Dismiss</button>
+      </div>
     </div>
     <script type="module" src="/src/main.js"></script>
   </body>

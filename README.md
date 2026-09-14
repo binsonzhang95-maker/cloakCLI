@@ -29,7 +29,7 @@ cloakcli master serve (optional)          ▼
 
 ## Desktop shell (Tauri 2)
 
-Optional **geek ops console** (`desktop/`). Teach Chat is the home page. Profiles / skills / job stubs come from read-only Tauri DTOs. The raw TUI (`cloakcli tui` in a PTY) is **Diagnostics only** and is not started on first paint. See [`desktop/README.md`](desktop/README.md).
+Optional **geek ops console** (`desktop/`, M3). Teach Chat is the home page. Profiles / skills / runs / LLM status come from read-only Tauri DTOs. Teach Chat is live JSONL to `cloakcli`. The raw TUI (`cloakcli tui` in a PTY) is **Diagnostics only** and is not started on first paint. See [`desktop/README.md`](desktop/README.md) for Linux + Mac mini run/dev/build.
 
 ```bash
 cargo build
@@ -39,7 +39,9 @@ export CLOAKCLI_HOME="$(cd .. && pwd)"
 npm run tauri dev
 ```
 
-Keys: `1–5` switch Teach Chat / Profiles / Skills / Runs / Diagnostics; `[` toggles the inspector.
+Keys: `1–5` switch Teach Chat / Profiles / Skills / Runs / Diagnostics; `[` inspector; `,` settings; `?` shortcuts. Shimmer is off by default.
+
+Linux package: `./scripts/desktop-build.sh` → unsigned `desktop/src-tauri/target/release/bundle/deb/CloakCLI_0.3.0_amd64.deb` (shell only; set `CLOAKCLI_BIN`). Mac mini: same command produces an unsigned `.app` under `bundle/macos/`. Signing / notarization / DMG / sidecar are out of scope.
 
 ## Per-node browser daemon
 

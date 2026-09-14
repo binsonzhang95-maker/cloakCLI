@@ -78,3 +78,15 @@ export async function jobStart() {
 export async function jobCancel() {
   return invoke("job_cancel");
 }
+
+export async function listRuns() {
+  return invoke("list_runs");
+}
+
+export async function llmStatus() {
+  return invoke("llm_status");
+}
+
+export async function teachResumeHint() {
+  return invoke("teach_resume_hint");
+}
