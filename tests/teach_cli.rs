@@ -38,6 +38,27 @@ fn combined(out: &std::process::Output) -> String {
     )
 }
 
+
+fn read_until(reader: &mut BufReader<impl Read>, needle: &str, secs: u64) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut out = String::new();
+    while std::time::Instant::now() < deadline {
+        let mut l = String::new();
+        match reader.read_line(&mut l) {
+            Ok(0) => break,
+            Ok(_) => {
+                out.push_str(&l);
+                if l.contains(needle) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+
 #[test]
 fn help_lists_teach_start() {
     let out = bin().args(["teach", "--help"]).output().expect("run");
@@ -497,11 +518,17 @@ fn events_no_browser_mock_turn_and_redacts() {
         r#"{{"cmd":"send","goal":"click the link token=abc123SECRETVALUE","profile":"demo"}}"#
     )
     .unwrap();
+    // Wait for the turn to finish before stop — under parallel cargo test load,
+    // an immediate stop can cancel during planning and flake the assistant asserts.
+    let mut rest = read_until(&mut reader, "\"kind\":\"assistant\"", 8);
+    if !rest.contains("\"kind\":\"assistant\"") && !rest.contains("assistant_delta") {
+        panic!("turn did not stream before stop: {rest}");
+    }
     writeln!(stdin, r#"{{"cmd":"stop"}}"#).unwrap();
     drop(stdin);
-
-    let mut rest = String::new();
-    let _ = reader.read_to_string(&mut rest);
+    let mut tail = String::new();
+    let _ = reader.read_to_string(&mut tail);
+    rest.push_str(&tail);
     let status = child
         .wait_timeout()
         .unwrap_or_else(|_| child.wait().expect("wait"));
@@ -809,10 +836,22 @@ fn events_thinking_mock_summary_then_assistant_delta() {
         r#"{{"cmd":"send","goal":"click go","profile":"demo"}}"#
     )
     .unwrap();
+    let mut rest = read_until(&mut reader, "thinking_delta", 8);
+    assert!(
+        rest.contains("thinking_delta"),
+        "expected thinking_delta before stop: {rest}"
+    );
+    let more = read_until(&mut reader, "\"kind\":\"assistant_delta\"", 8);
+    rest.push_str(&more);
+    if !rest.contains("\"kind\":\"assistant_delta\"") {
+        let more = read_until(&mut reader, "\"kind\":\"assistant\"", 4);
+        rest.push_str(&more);
+    }
     writeln!(stdin, r#"{{"cmd":"stop"}}"#).unwrap();
     drop(stdin);
-    let mut rest = String::new();
-    let _ = reader.read_to_string(&mut rest);
+    let mut tail = String::new();
+    let _ = reader.read_to_string(&mut tail);
+    rest.push_str(&tail);
     let _ = child.wait_timeout();
     let all = format!("{session_line}{rest}");
     assert!(
@@ -880,10 +919,19 @@ fn events_thinking_cross_chunk_secret_redacted() {
         r#"{{"cmd":"send","goal":"go","profile":"demo"}}"#
     )
     .unwrap();
+    let mut rest = read_until(&mut reader, "thinking_delta", 8);
+    assert!(
+        rest.contains("thinking_delta"),
+        "expected thinking_delta before stop: {rest}"
+    );
+    // Keep the turn alive until assistant streams — stop would cancel planning.
+    let more = read_until(&mut reader, "assistant_delta", 8);
+    rest.push_str(&more);
     writeln!(stdin, r#"{{"cmd":"stop"}}"#).unwrap();
     drop(stdin);
-    let mut rest = String::new();
-    let _ = reader.read_to_string(&mut rest);
+    let mut tail = String::new();
+    let _ = reader.read_to_string(&mut tail);
+    rest.push_str(&tail);
     let stderr = {
         let mut s = String::new();
         if let Some(mut err) = child.stderr.take() {
