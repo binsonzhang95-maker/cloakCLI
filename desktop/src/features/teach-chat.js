@@ -10,9 +10,16 @@ import {
   teachChatStop,
   teachResumeHint,
 } from "../api.js";
-import { redactEventPayload, redactText, summarizeUserMessage } from "../redact.js";
+import { redactEventPayload, redactText, safeRedactedDisplay, summarizeUserMessage } from "../redact.js";
 import { currentProfile, getState, setCatalog, upsertRun } from "../store.js";
 import { openRunFromChat, runFromJobEvent } from "./runs.js";
+
+export const THINKING_STATUS = "正在思考";
+export const THINKING_LABEL = "思考摘要";
+
+function emptyThinking() {
+  return { active: false, done: false, raw: "", text: "" };
+}
 
 const WELCOME = [
   {
@@ -34,6 +41,7 @@ const chat = {
   spawnBrowser: false,
   fleetHint: null,
   resumeHint: null,
+  thinking: emptyThinking(),
 };
 
 let listening = false;
@@ -77,8 +85,47 @@ export function resetChatState() {
   chat.spawnBrowser = false;
   chat.fleetHint = null;
   chat.resumeHint = null;
+  chat.thinking = emptyThinking();
   lastMsgSig = "";
   lastJobSig = "";
+}
+
+function prefersReducedMotion() {
+  try {
+    return Boolean(
+      typeof window !== "undefined" &&
+        window.matchMedia &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function beginThinking() {
+  chat.thinking = { active: true, done: false, raw: "", text: "" };
+}
+
+export function endThinking() {
+  chat.thinking.active = false;
+  chat.thinking.done = true;
+  chat.thinking.text = chat.thinking.raw
+    ? safeRedactedDisplay(chat.thinking.raw, true)
+    : "";
+}
+
+export function getThinkingView() {
+  const t = chat.thinking;
+  const shimmerPref = Boolean(getState().shimmer);
+  const show = t.active || Boolean(t.text);
+  return {
+    active: Boolean(t.active),
+    done: Boolean(t.done),
+    text: t.text || "",
+    show,
+    status: t.text ? THINKING_LABEL : THINKING_STATUS,
+    shimmer: Boolean(t.active && shimmerPref && !prefersReducedMotion()),
+  };
 }
 
 export function onTeachEvent(rawPayload) {
@@ -114,7 +161,19 @@ export function onTeachEvent(rawPayload) {
         phase: payload.phase || "chat",
       };
     }
+  } else if (kind === "thinking_delta") {
+    if (chat.thinking.done && !chat.thinking.active) {
+      // late event: do not attach to another message
+    } else {
+      chat.thinking.active = true;
+      chat.thinking.done = false;
+      chat.thinking.raw += text || "";
+      chat.thinking.text = safeRedactedDisplay(chat.thinking.raw, false);
+    }
+  } else if (kind === "thinking_done") {
+    endThinking();
   } else if (kind === "assistant_delta") {
+    endThinking();
     const chunk = text || "";
     const last = chat.messages[chat.messages.length - 1];
     if (last && last.role === "assistant" && last.streaming) {
@@ -129,6 +188,7 @@ export function onTeachEvent(rawPayload) {
     }
     chat.sending = true;
   } else if (kind === "user" || kind === "assistant" || kind === "system") {
+    if (kind === "assistant") endThinking();
     const role = payload.role || kind;
     const body = text || "";
     const last = chat.messages[chat.messages.length - 1];
@@ -153,9 +213,13 @@ export function onTeachEvent(rawPayload) {
       error: typeof payload.error === "string" ? redactText(payload.error) : payload.error,
     };
     chat.sending = payload.state === "running" || payload.state === "needs_confirm";
+    if (payload.state === "running" && !chat.thinking.active) {
+      beginThinking();
+    }
     if (payload.state === "cancelled" || payload.state === "done" || payload.state === "failed") {
       const last = chat.messages[chat.messages.length - 1];
       if (last && last.streaming) last.streaming = false;
+      endThinking();
     }
     const rec = runFromJobEvent(payload, currentProfile()?.name);
     if (rec) {
@@ -171,10 +235,12 @@ export function onTeachEvent(rawPayload) {
       ts: Date.now(),
     });
     chat.sending = false;
+    endThinking();
   } else if (kind === "closed") {
     chat.session = null;
     chat.status = { ...(chat.status || {}), running: false, hub: false, busy: false };
     chat.sending = false;
+    endThinking();
     const last = chat.messages[chat.messages.length - 1];
     if (!(last && last.role === "system" && String(last.text).startsWith("session closed"))) {
       chat.messages.push({
@@ -329,22 +395,56 @@ function paintResume() {
   el.querySelector("#chat-resume-btn")?.addEventListener("click", () => startSession(true));
 }
 
+function thinkingHtml() {
+  const v = getThinkingView();
+  if (!v.show) return "";
+  const cls = [
+    "msg",
+    "thinking",
+    v.active ? "is-thinking" : "is-done",
+    v.shimmer ? "is-shimmer" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const body = v.text
+    ? `<div class="msg-body">${esc(v.text)}</div>`
+    : `<div class="msg-body">${esc(THINKING_STATUS)}</div>`;
+  return `
+      <article class="${cls}" data-thinking="1">
+        <div class="msg-role">${esc(v.status)}</div>
+        ${body}
+      </article>`;
+}
+
+function msgHtml(m) {
+  return `
+      <article class="msg ${esc(m.role)}${m.streaming ? " is-streaming" : ""}">
+        <div class="msg-role">${esc(m.role)}</div>
+        <div class="msg-body">${esc(m.text)}</div>
+      </article>`;
+}
+
 function paintMessages() {
   const stream = document.getElementById("chat-stream");
   if (!stream) return;
   const last = chat.messages[chat.messages.length - 1];
-  const sig = `${chat.messages.length}:${last?.role || ""}:${last?.text || ""}:${last?.streaming ? 1 : 0}`;
+  const v = getThinkingView();
+  const sig = `${chat.messages.length}:${last?.role || ""}:${last?.text || ""}:${last?.streaming ? 1 : 0}:${v.active}:${v.text}:${v.shimmer}`;
   if (sig === lastMsgSig && stream.childElementCount) return;
   lastMsgSig = sig;
-  stream.innerHTML = chat.messages
-    .map(
-      (m) => `
-      <article class="msg ${esc(m.role)}${m.streaming ? " is-streaming" : ""}">
-        <div class="msg-role">${esc(m.role)}</div>
-        <div class="msg-body">${esc(m.text)}</div>
-      </article>`,
-    )
-    .join("");
+  const lastUser = (() => {
+    for (let i = chat.messages.length - 1; i >= 0; i--) {
+      if (chat.messages[i].role === "user") return i;
+    }
+    return -1;
+  })();
+  const parts = [];
+  chat.messages.forEach((m, i) => {
+    parts.push(msgHtml(m));
+    if (i === lastUser) parts.push(thinkingHtml());
+  });
+  if (lastUser < 0) parts.push(thinkingHtml());
+  stream.innerHTML = parts.join("");
   stream.scrollTop = stream.scrollHeight;
 }
 
@@ -437,6 +537,7 @@ async function endSession() {
   }
   chat.session = null;
   chat.sending = false;
+  endThinking();
   paint();
 }
 
@@ -448,6 +549,7 @@ async function stopTurn() {
     chat.error = redactText(String(err));
   }
   chat.sending = false;
+  endThinking();
   paint();
 }
 
@@ -467,12 +569,14 @@ async function send(area) {
   area.value = "";
   chat.messages.push({ role: "user", text: summary.display, ts: Date.now() });
   chat.sending = true;
+  beginThinking();
   paint();
   try {
     if (!chat.session) {
       const started = await startSession(false);
       if (!started) {
         chat.sending = false;
+        endThinking();
         paint();
         return;
       }
@@ -482,6 +586,7 @@ async function send(area) {
     await teachChatSend(raw, profile?.name, skill || null);
   } catch (err) {
     chat.sending = false;
+    endThinking();
     chat.messages.push({
       role: "system",
       text: redactText(String(err)),

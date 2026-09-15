@@ -803,6 +803,20 @@ pub trait TeachLlm: Send + Sync {
         on_delta: &mut dyn FnMut(&str),
         cancel: &AtomicBool,
     ) -> Result<String> {
+        self.complete_streaming_ex(messages, on_delta, &mut |_| {}, cancel)
+    }
+
+    /// Incremental completion with optional provider-exposed reasoning.
+    /// Default: one `complete()` then a single content delta. Never fabricates
+    /// a thinking chain when the backend did not expose reasoning.
+    fn complete_streaming_ex(
+        &self,
+        messages: &[Value],
+        on_delta: &mut dyn FnMut(&str),
+        on_reasoning: &mut dyn FnMut(&str),
+        cancel: &AtomicBool,
+    ) -> Result<String> {
+        let _ = on_reasoning;
         let text = self.complete(messages)?;
         if cancel.load(Ordering::SeqCst) {
             bail!("cancelled");
@@ -834,13 +848,14 @@ impl TeachLlm for LiveLlm {
         Ok(out.text)
     }
 
-    fn complete_streaming(
+    fn complete_streaming_ex(
         &self,
         messages: &[Value],
         on_delta: &mut dyn FnMut(&str),
+        on_reasoning: &mut dyn FnMut(&str),
         cancel: &AtomicBool,
     ) -> Result<String> {
-        match llm_client::chat_complete_stream(
+        match llm_client::chat_complete_stream_with_reasoning(
             &self.base_url,
             &self.api_key,
             &self.model,
@@ -848,6 +863,7 @@ impl TeachLlm for LiveLlm {
             self.timeout_sec,
             cancel,
             &mut *on_delta,
+            &mut *on_reasoning,
         ) {
             Ok(out) => Ok(out.text),
             Err(e) => {
@@ -856,6 +872,7 @@ impl TeachLlm for LiveLlm {
                     return Err(e);
                 }
                 // Provider rejected SSE (or returned a non-stream body): one-shot + one delta.
+                // No reasoning is fabricated on the fallback path.
                 let text = self.complete(messages)?;
                 if cancel.load(Ordering::SeqCst) {
                     bail!("cancelled");

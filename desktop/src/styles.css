@@ -579,6 +579,37 @@ html.shimmer .row.is-selected {
   margin-left: 2px;
 }
 
+.msg.thinking {
+  align-self: flex-start;
+  border-left: 2px solid var(--chrome);
+  color: var(--muted);
+}
+
+.msg.thinking .msg-role {
+  color: var(--chrome);
+}
+
+html.shimmer .msg.thinking.is-thinking.is-shimmer .msg-body,
+html.shimmer .msg.thinking.is-thinking.is-shimmer .msg-role {
+  background: linear-gradient(90deg, var(--muted) 0%, var(--text) 45%, var(--muted) 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 2.4s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.shimmer .msg.thinking.is-thinking.is-shimmer .msg-body,
+  html.shimmer .msg.thinking.is-thinking.is-shimmer .msg-role {
+    animation: none;
+    background: none;
+    color: var(--muted);
+    -webkit-background-clip: unset;
+    background-clip: unset;
+  }
+}
+
 .chat-pair {
   border-bottom: 1px solid var(--line);
   padding: 8px 12px;

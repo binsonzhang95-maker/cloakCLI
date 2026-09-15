@@ -9,6 +9,10 @@
 //! generation; a final `assistant` event (`done: true`) follows. Cancel is
 //! honored between chunks (and during live SSE).
 //!
+//! Provider-exposed reasoning/summary is emitted as `thinking_delta` (optional
+//! `thinking_done`). No reasoning is fabricated. First `assistant_delta` or a
+//! terminal job state ends thinking. Logs record kind/length/timing only.
+//!
 //! Reconnect: a snapshot of messages + request/profile context is persisted
 //! under `data/teach/events-snapshot.json`. A new child always binds a **new**
 //! teach-hub port (pairing codes are not reused). `kind=resume` restores the
@@ -123,6 +127,11 @@ pub enum EventKind {
         seq: u32,
         done: bool,
     },
+    ThinkingDelta {
+        text: String,
+        seq: u32,
+    },
+    ThinkingDone {},
     Assistant {
         role: String,
         text: String,
@@ -199,6 +208,8 @@ const EVENT_KINDS: &[&str] = &[
     "status",
     "user",
     "assistant_delta",
+    "thinking_delta",
+    "thinking_done",
     "assistant",
     "system",
     "tool",
@@ -650,6 +661,172 @@ fn tools_dto(session: &ChatSession) -> Vec<ToolStatusDto> {
     session.tools.iter().map(ToolStatusDto::from).collect()
 }
 
+/// Cross-chunk secret redaction. Holds incomplete secret-label prefixes so
+/// unchecked fragments are never emitted; matched patterns are replaced before
+/// any increment is returned.
+pub struct StreamRedactor {
+    raw: String,
+    emitted: String,
+}
+
+impl Default for StreamRedactor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamRedactor {
+    pub fn new() -> Self {
+        Self {
+            raw: String::new(),
+            emitted: String::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn reset(&mut self) {
+        self.raw.clear();
+        self.emitted.clear();
+    }
+
+    /// Append `chunk` and return the newly-safe increment (may be empty while
+    /// a potential secret prefix is held).
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.raw.push_str(chunk);
+        self.take_increment(false)
+    }
+
+    /// Release any held suffix (end of stream / thinking_done).
+    pub fn flush(&mut self) -> String {
+        self.take_increment(true)
+    }
+
+    /// Full safe display of the accumulator (replace, not concat).
+    pub fn display(&self, flushed: bool) -> String {
+        safe_redacted_display(&self.raw, flushed)
+    }
+
+    fn take_increment(&mut self, flushed: bool) -> String {
+        let display = self.display(flushed);
+        if display == self.emitted {
+            return String::new();
+        }
+        let delta = if display.starts_with(&self.emitted) {
+            display[self.emitted.len()..].to_string()
+        } else {
+            // Prefix changed after redaction; emit the new tail only if we have
+            // not shown anything yet. UI reconstructs from its own accumulator.
+            if self.emitted.is_empty() {
+                display.clone()
+            } else {
+                String::new()
+            }
+        };
+        self.emitted = display;
+        delta
+    }
+}
+
+const SECRET_STARTERS: &[&str] = &[
+    "authorization",
+    "set-cookie",
+    "cookie",
+    "token",
+    "api_key",
+    "api-key",
+    "apikey",
+    "password",
+    "passwd",
+    "secret",
+    "bearer",
+    "sk-proj-",
+    "sk-",
+    "http://",
+    "https://",
+];
+
+fn suffix_secret_hold(raw: &str) -> usize {
+    if raw.is_empty() {
+        return 0;
+    }
+    let lower = raw.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut hold = 0usize;
+    for starter in SECRET_STARTERS {
+        let max = starter.len().min(lower.len());
+        for n in (1..=max).rev() {
+            let suf = &starter.as_bytes()[..n];
+            if bytes.ends_with(suf) {
+                let start = bytes.len() - n;
+                let boundary = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+                if boundary {
+                    hold = hold.max(n);
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(pos) = lower.rfind("sk-") {
+        let boundary = pos == 0
+            || !lower
+                .as_bytes()
+                .get(pos.wrapping_sub(1))
+                .copied()
+                .unwrap_or(b' ')
+                .is_ascii_alphanumeric();
+        if boundary {
+            let mut rest = &raw[pos + 3..];
+            if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("proj-") {
+                rest = &rest[5..];
+            }
+            if rest.len() < 8
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            {
+                hold = hold.max(raw.len() - pos);
+            }
+        }
+    }
+    hold
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+pub fn safe_redacted_display(raw: &str, flushed: bool) -> String {
+    let redacted = redact_for_log(raw);
+    if flushed {
+        return redacted;
+    }
+    if redacted != raw {
+        return redacted;
+    }
+    let hold = suffix_secret_hold(raw);
+    let cut = floor_char_boundary(raw, raw.len().saturating_sub(hold));
+    raw[..cut].to_string()
+}
+
+/// Log line for thinking/assistant stream events: kind, length, timing only.
+/// Never includes plaintext thinking or secrets.
+pub fn event_log_meta(kind: &str, len: usize, elapsed_ms: u64) -> String {
+    format!("event kind={kind} len={len} ms={elapsed_ms}")
+}
+
+fn mock_thinking_text() -> Option<String> {
+    std::env::var("CLOAKCLI_TEACH_THINKING_MOCK")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn stream_chunk_delay() -> Duration {
     let ms = std::env::var("CLOAKCLI_TEACH_STREAM_CHUNK_MS")
         .ok()
@@ -667,6 +844,7 @@ fn stream_chunk_chars() -> usize {
 }
 
 async fn emit_text_deltas(text: &str, cancel: &AtomicBool) -> Result<(), ()> {
+    let mut redactor = StreamRedactor::new();
     let chars: Vec<char> = text.chars().collect();
     let n = stream_chunk_chars();
     let delay = stream_chunk_delay();
@@ -676,13 +854,16 @@ async fn emit_text_deltas(text: &str, cancel: &AtomicBool) -> Result<(), ()> {
             return Err(());
         }
         let s: String = chunk.iter().collect();
-        emit_kind(EventKind::AssistantDelta {
-            role: "assistant".into(),
-            text: redact_for_log(&s),
-            seq,
-            done: false,
-        });
-        seq = seq.saturating_add(1);
+        let delta = redactor.push(&s);
+        if !delta.is_empty() {
+            emit_kind(EventKind::AssistantDelta {
+                role: "assistant".into(),
+                text: delta,
+                seq,
+                done: false,
+            });
+            seq = seq.saturating_add(1);
+        }
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
@@ -690,7 +871,54 @@ async fn emit_text_deltas(text: &str, cancel: &AtomicBool) -> Result<(), ()> {
     if cancel.load(Ordering::SeqCst) {
         return Err(());
     }
+    let rest = redactor.flush();
+    if !rest.is_empty() {
+        emit_kind(EventKind::AssistantDelta {
+            role: "assistant".into(),
+            text: rest,
+            seq,
+            done: false,
+        });
+    }
     Ok(())
+}
+
+async fn emit_thinking_stream(text: &str, cancel: &AtomicBool) -> Result<u32, ()> {
+    let started = std::time::Instant::now();
+    let mut redactor = StreamRedactor::new();
+    let chars: Vec<char> = text.chars().collect();
+    let n = stream_chunk_chars();
+    let delay = stream_chunk_delay();
+    let mut seq = 0u32;
+    for chunk in chars.chunks(n) {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        let s: String = chunk.iter().collect();
+        let delta = redactor.push(&s);
+        if !delta.is_empty() {
+            let _ = event_log_meta("thinking_delta", delta.len(), started.elapsed().as_millis() as u64);
+            emit_kind(EventKind::ThinkingDelta { text: delta, seq });
+            seq = seq.saturating_add(1);
+        }
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(());
+    }
+    let rest = redactor.flush();
+    if !rest.is_empty() {
+        let _ = event_log_meta("thinking_delta", rest.len(), started.elapsed().as_millis() as u64);
+        emit_kind(EventKind::ThinkingDelta { text: rest, seq });
+        seq = seq.saturating_add(1);
+    }
+    if seq > 0 {
+        let _ = event_log_meta("thinking_done", 0, started.elapsed().as_millis() as u64);
+        emit_kind(EventKind::ThinkingDone {});
+    }
+    Ok(seq)
 }
 
 async fn handle_send(
@@ -747,6 +975,12 @@ async fn handle_send(
     };
 
     let llm_text = if let Some(m) = mock.as_ref() {
+        if let Some(thinking) = mock_thinking_text() {
+            if emit_thinking_stream(&thinking, &cancel).await.is_err() {
+                emit_cancelled_planning(&shared).await;
+                return;
+            }
+        }
         if emit_text_deltas(&m.text, &cancel).await.is_err() {
             emit_cancelled_planning(&shared).await;
             return;
@@ -885,30 +1119,109 @@ enum LiveStreamErr {
     Other(String),
 }
 
+enum LiveChunk {
+    Content(String),
+    Reasoning(String),
+}
+
 async fn stream_live_llm(
     llm: &crate::teach_chat::LiveLlm,
     messages: Vec<Value>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<String, LiveStreamErr> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LiveChunk>();
     let cancel_b = cancel.clone();
     let llm = llm.clone();
     let handle = tokio::task::spawn_blocking(move || {
-        let mut tx = tx;
-        llm.complete_streaming(
+        llm.complete_streaming_ex(
             &messages,
             &mut |d| {
-                let _ = tx.send(d.to_string());
+                let _ = tx.send(LiveChunk::Content(d.to_string()));
+            },
+            &mut |r| {
+                let _ = tx.send(LiveChunk::Reasoning(r.to_string()));
             },
             &cancel_b,
         )
     });
 
+    let started = std::time::Instant::now();
+    let mut think = StreamRedactor::new();
+    let mut asst = StreamRedactor::new();
+    let mut think_seq = 0u32;
+    let mut had_thinking = false;
+    let mut thinking_closed = false;
     let mut seq = 0u32;
-    while let Some(d) = rx.recv().await {
+
+    let close_thinking = |think: &mut StreamRedactor,
+                              think_seq: &mut u32,
+                              had_thinking: bool,
+                              thinking_closed: &mut bool| {
+        if *thinking_closed {
+            return;
+        }
+        *thinking_closed = true;
+        let rest = think.flush();
+        if !rest.is_empty() {
+            let _ = event_log_meta(
+                "thinking_delta",
+                rest.len(),
+                started.elapsed().as_millis() as u64,
+            );
+            emit_kind(EventKind::ThinkingDelta {
+                text: rest,
+                seq: *think_seq,
+            });
+            *think_seq = think_seq.saturating_add(1);
+        }
+        if had_thinking {
+            let _ = event_log_meta("thinking_done", 0, started.elapsed().as_millis() as u64);
+            emit_kind(EventKind::ThinkingDone {});
+        }
+    };
+
+    while let Some(chunk) = rx.recv().await {
+        match chunk {
+            LiveChunk::Reasoning(s) => {
+                if thinking_closed {
+                    continue;
+                }
+                had_thinking = true;
+                let delta = think.push(&s);
+                if !delta.is_empty() {
+                    let _ = event_log_meta(
+                        "thinking_delta",
+                        delta.len(),
+                        started.elapsed().as_millis() as u64,
+                    );
+                    emit_kind(EventKind::ThinkingDelta {
+                        text: delta,
+                        seq: think_seq,
+                    });
+                    think_seq = think_seq.saturating_add(1);
+                }
+            }
+            LiveChunk::Content(s) => {
+                close_thinking(&mut think, &mut think_seq, had_thinking, &mut thinking_closed);
+                let delta = asst.push(&s);
+                if !delta.is_empty() {
+                    emit_kind(EventKind::AssistantDelta {
+                        role: "assistant".into(),
+                        text: delta,
+                        seq,
+                        done: false,
+                    });
+                    seq = seq.saturating_add(1);
+                }
+            }
+        }
+    }
+    close_thinking(&mut think, &mut think_seq, had_thinking, &mut thinking_closed);
+    let rest = asst.flush();
+    if !rest.is_empty() {
         emit_kind(EventKind::AssistantDelta {
             role: "assistant".into(),
-            text: redact_for_log(&d),
+            text: rest,
             seq,
             done: false,
         });
@@ -1326,6 +1639,89 @@ mod tests {
         assert_eq!(v["pairing_id"], "pair-abc");
         let t = v["text"].as_str().unwrap();
         assert!(!t.contains("abc123SECRETVALUE"), "{t}");
+    }
+
+    #[test]
+    fn parse_thinking_delta_v1_deny_unknown() {
+        let ok = parse_wire_event(r#"{"v":1,"kind":"thinking_delta","text":"step","seq":0}"#)
+            .expect("valid thinking_delta");
+        match ok.body {
+            EventKind::ThinkingDelta { text, seq } => {
+                assert_eq!(text, "step");
+                assert_eq!(seq, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+        let done = parse_wire_event(r#"{"v":1,"kind":"thinking_done"}"#).unwrap();
+        assert!(matches!(done.body, EventKind::ThinkingDone {}));
+
+        let extra = parse_wire_event(
+            r#"{"v":1,"kind":"thinking_delta","text":"x","seq":0,"extra":true}"#,
+        )
+        .unwrap_err();
+        assert!(
+            extra.contains("unknown field") || extra.contains("malformed"),
+            "{extra}"
+        );
+        let extra_done = parse_wire_event(r#"{"v":1,"kind":"thinking_done","text":"x"}"#)
+            .unwrap_err();
+        assert!(
+            extra_done.contains("unknown field") || extra_done.contains("malformed"),
+            "{extra_done}"
+        );
+        assert!(parse_wire_event(r#"{"kind":"thinking_delta","text":"x","seq":0}"#).is_err());
+    }
+
+    #[test]
+    fn stream_redactor_cross_chunk_secret_never_emits_plaintext() {
+        let mut r = StreamRedactor::new();
+        let a = r.push("token=abc");
+        let b = r.push("123SECRETVALUE more");
+        let c = r.flush();
+        let shown = format!("{a}{b}{c}");
+        assert!(
+            !shown.contains("abc123SECRETVALUE"),
+            "secret leaked in increments: {shown}"
+        );
+        assert!(
+            !shown.contains("SECRETVALUE"),
+            "secret fragment leaked: {shown}"
+        );
+        let full = r.display(true);
+        assert!(!full.contains("SECRETVALUE"), "{full}");
+        assert!(full.contains("[REDACTED]") || full.contains("***"), "{full}");
+    }
+
+    #[test]
+    fn stream_redactor_holds_incomplete_prefix() {
+        let mut r = StreamRedactor::new();
+        let a = r.push("toke");
+        assert!(a.is_empty(), "unchecked prefix must not flash: {a}");
+        let b = r.push("n=S");
+        let shown = format!("{a}{b}");
+        assert!(!shown.contains("token=S") || shown.contains("[REDACTED]"), "{shown}");
+        assert!(!r.display(false).contains("token=S") || r.display(false).contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn stream_redactor_innocent_text_passes() {
+        let mut r = StreamRedactor::new();
+        let a = r.push("click a");
+        let b = r.push(" → done ok");
+        let c = r.flush();
+        assert_eq!(format!("{a}{b}{c}"), "click a → done ok");
+    }
+
+    #[test]
+    fn event_log_meta_has_kind_len_timing_not_plaintext() {
+        let secret = "token=abc123SECRETVALUE thinking chain";
+        let line = event_log_meta("thinking_delta", secret.len(), 12);
+        assert!(line.contains("kind=thinking_delta"), "{line}");
+        assert!(line.contains("len="), "{line}");
+        assert!(line.contains("ms=12"), "{line}");
+        assert!(!line.contains("SECRETVALUE"), "{line}");
+        assert!(!line.contains("thinking chain"), "{line}");
+        assert!(!line.contains("token="), "{line}");
     }
 
     #[test]

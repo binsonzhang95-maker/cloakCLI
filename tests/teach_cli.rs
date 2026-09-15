@@ -524,6 +524,10 @@ fn events_no_browser_mock_turn_and_redacts() {
         all.contains("\"kind\":\"assistant_delta\"") || all.contains("\"kind\": \"assistant_delta\""),
         "expected incremental assistant_delta: {all}"
     );
+    assert!(
+        !all.contains("thinking_delta"),
+        "no provider reasoning → must not fabricate thinking_delta: {all}"
+    );
     let _ = fs::remove_dir_all(&home);
 }
 
@@ -760,6 +764,147 @@ fn events_resume_after_child_exit() {
     assert!(
         all2.contains("\"kind\":\"assistant\"") || all2.contains("assistant_delta"),
         "continue after resume produced no assistant: {all2}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn events_thinking_mock_summary_then_assistant_delta() {
+    let home = tmp_home();
+    let created = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args(["profile", "create", "demo"])
+        .output()
+        .expect("create");
+    assert!(created.status.success(), "{}", combined(&created));
+
+    let mock = r#"{"schema_version":1,"actions":[{"action":"done","reason":"ok"}]}"#;
+    let mut child = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .env("CLOAKCLI_TEACH_STREAM_CHUNK_MS", "0")
+        .env("CLOAKCLI_TEACH_STREAM_CHUNK_CHARS", "8")
+        .env("CLOAKCLI_TEACH_THINKING_MOCK", "check selector then click")
+        .args([
+            "teach",
+            "chat",
+            "--profile",
+            "demo",
+            "--events",
+            "--no-browser",
+            "--mock-json",
+            mock,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut session_line = String::new();
+    reader.read_line(&mut session_line).expect("session");
+    writeln!(
+        stdin,
+        r#"{{"cmd":"send","goal":"click go","profile":"demo"}}"#
+    )
+    .unwrap();
+    writeln!(stdin, r#"{{"cmd":"stop"}}"#).unwrap();
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let _ = child.wait_timeout();
+    let all = format!("{session_line}{rest}");
+    assert!(
+        all.contains("\"kind\":\"thinking_delta\""),
+        "expected thinking_delta: {all}"
+    );
+    assert!(
+        all.contains("thinking_done") || all.contains("\"kind\":\"thinking_done\""),
+        "expected thinking_done: {all}"
+    );
+    assert!(
+        all.contains("\"kind\":\"assistant_delta\""),
+        "assistant_delta must still stream: {all}"
+    );
+    let think_pos = all.find("thinking_delta").expect("thinking_delta pos");
+    let asst_pos = all.find("assistant_delta").expect("assistant_delta pos");
+    assert!(
+        think_pos < asst_pos,
+        "thinking should precede assistant: {all}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn events_thinking_cross_chunk_secret_redacted() {
+    let home = tmp_home();
+    let created = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .args(["profile", "create", "demo"])
+        .output()
+        .expect("create");
+    assert!(created.status.success(), "{}", combined(&created));
+
+    let mock = r#"{"schema_version":1,"actions":[{"action":"done","reason":"ok"}]}"#;
+    let mut child = bin()
+        .env("CLOAKCLI_HOME", &home)
+        .env("CLOAKCLI_TEACH_STREAM_CHUNK_MS", "0")
+        .env("CLOAKCLI_TEACH_STREAM_CHUNK_CHARS", "4")
+        .env(
+            "CLOAKCLI_TEACH_THINKING_MOCK",
+            "use token=abc123SECRETVALUE then click",
+        )
+        .args([
+            "teach",
+            "chat",
+            "--profile",
+            "demo",
+            "--events",
+            "--no-browser",
+            "--mock-json",
+            mock,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut session_line = String::new();
+    reader.read_line(&mut session_line).expect("session");
+    writeln!(
+        stdin,
+        r#"{{"cmd":"send","goal":"go","profile":"demo"}}"#
+    )
+    .unwrap();
+    writeln!(stdin, r#"{{"cmd":"stop"}}"#).unwrap();
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let stderr = {
+        let mut s = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut err, &mut s);
+        }
+        s
+    };
+    let _ = child.wait_timeout();
+    let all = format!("{session_line}{rest}");
+    assert!(all.contains("thinking_delta"), "expected thinking_delta: {all}");
+    assert!(
+        !all.contains("abc123SECRETVALUE"),
+        "thinking secret leaked on stdout: {all}"
+    );
+    assert!(
+        !stderr.contains("abc123SECRETVALUE"),
+        "thinking secret leaked on stderr: {stderr}"
+    );
+    assert!(
+        all.contains("assistant_delta"),
+        "assistant_delta regression: {all}"
     );
     let _ = fs::remove_dir_all(&home);
 }

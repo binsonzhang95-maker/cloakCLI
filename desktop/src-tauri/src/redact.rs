@@ -46,6 +46,115 @@ pub fn redact_text(text: &str) -> String {
     s
 }
 
+const SECRET_STARTERS: &[&str] = &[
+    "authorization",
+    "set-cookie",
+    "cookie",
+    "token",
+    "api_key",
+    "api-key",
+    "apikey",
+    "password",
+    "passwd",
+    "secret",
+    "bearer",
+    "sk-proj-",
+    "sk-",
+    "http://",
+    "https://",
+];
+
+fn suffix_secret_hold(raw: &str) -> usize {
+    if raw.is_empty() {
+        return 0;
+    }
+    let lower = raw.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut hold = 0usize;
+    for starter in SECRET_STARTERS {
+        let max = starter.len().min(lower.len());
+        for n in (1..=max).rev() {
+            if bytes.ends_with(&starter.as_bytes()[..n]) {
+                let start = bytes.len() - n;
+                let boundary = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+                if boundary {
+                    hold = hold.max(n);
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(pos) = lower.rfind("sk-") {
+        let boundary = pos == 0
+            || !lower
+                .as_bytes()
+                .get(pos.wrapping_sub(1))
+                .copied()
+                .unwrap_or(b' ')
+                .is_ascii_alphanumeric();
+        if boundary {
+            let mut rest = &raw[pos + 3..];
+            if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("proj-") {
+                rest = &rest[5..];
+            }
+            if rest.len() < 8
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            {
+                hold = hold.max(raw.len() - pos);
+            }
+        }
+    }
+    hold
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Cross-chunk display redaction: hold incomplete secret prefixes; never flash
+/// unchecked fragments. When a pattern matches, the fully redacted string is shown.
+pub fn safe_redacted_display(raw: &str, flushed: bool) -> String {
+    let redacted = redact_text(raw);
+    if flushed {
+        return redacted;
+    }
+    if redacted != raw {
+        return redacted;
+    }
+    let hold = suffix_secret_hold(raw);
+    let cut = floor_char_boundary(raw, raw.len().saturating_sub(hold));
+    raw[..cut].to_string()
+}
+
+/// Accumulating redactor for thinking / assistant stream chunks.
+#[derive(Default)]
+pub struct StreamRedactor {
+    raw: String,
+}
+
+impl StreamRedactor {
+    pub fn new() -> Self {
+        Self { raw: String::new() }
+    }
+
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.raw.push_str(chunk);
+        safe_redacted_display(&self.raw, false)
+    }
+
+    pub fn flush(&mut self) -> String {
+        safe_redacted_display(&self.raw, true)
+    }
+}
+
 fn redact_proxy_userinfo(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -286,5 +395,34 @@ mod tests {
         let s = redact_text("use http://user:s3cretPASS@127.0.0.1:7890");
         assert!(!s.contains("s3cretPASS"), "{s}");
         assert!(s.contains("***:***"), "{s}");
+    }
+
+    #[test]
+    fn stream_redactor_cross_chunk_secret() {
+        let mut r = StreamRedactor::new();
+        let a = r.push("token=abc");
+        assert!(!a.contains("abc123SECRETVALUE"), "{a}");
+        let b = r.push("123SECRETVALUE more");
+        assert!(!b.contains("SECRETVALUE"), "{b}");
+        assert!(!b.contains("abc123"), "{b}");
+        let c = r.flush();
+        assert!(!c.contains("SECRETVALUE"), "{c}");
+        assert!(c.contains("***"), "{c}");
+    }
+
+    #[test]
+    fn stream_redactor_holds_incomplete_sk_prefix() {
+        let mut r = StreamRedactor::new();
+        let a = r.push("sk-");
+        assert!(a.is_empty() || a == "sk-", "held or prefix only: {a}");
+        assert!(!a.contains("secretTEST99abc"));
+        let b = r.push("secretTEST99abc");
+        assert!(!b.contains("secretTEST99abc"), "{b}");
+        assert!(b.contains("sk-***") || b.contains("***"), "{b}");
+    }
+
+    #[test]
+    fn safe_display_innocent_passes() {
+        assert_eq!(safe_redacted_display("click a → done ok", true), "click a → done ok");
     }
 }

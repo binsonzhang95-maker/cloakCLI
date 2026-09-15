@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  createStreamRedactor,
   looksLikeSecret,
   mockAckPreview,
   redactEventPayload,
   redactText,
+  safeRedactedDisplay,
   summarizeUserMessage,
 } from "./redact.js";
 
@@ -77,6 +79,25 @@ test("redactEventPayload redacts free-text and keeps pairing ids", () => {
   assert.equal(ev.text.includes("sk-secretTEST99abc"), false, ev.text);
   assert.equal(ev.text.includes("SESSIONID_SUPER_SECRET"), false, ev.text);
   assert.equal(ev.summary.includes("abc123SECRETVALUE"), false, ev.summary);
+});
+
+test("safeRedactedDisplay holds incomplete prefix then redacts across chunks", () => {
+  const r = createStreamRedactor();
+  const a = r.push("token=abc");
+  assert.equal(a.includes("abc123SECRETVALUE"), false, a);
+  const b = r.push("123SECRETVALUE more");
+  assert.equal(b.includes("SECRETVALUE"), false, b);
+  assert.equal(b.includes("abc123"), false, b);
+  const c = r.flush();
+  assert.equal(c.includes("SECRETVALUE"), false, c);
+  assert.equal(c.includes("***"), true, c);
+});
+
+test("safeRedactedDisplay does not flash sk- prefix until complete", () => {
+  assert.equal(safeRedactedDisplay("sk-", false), "");
+  const shown = safeRedactedDisplay("sk-secretTEST99abc", false);
+  assert.equal(shown.includes("secretTEST99abc"), false, shown);
+  assert.equal(shown.includes("sk-***") || shown.includes("***"), true, shown);
 });
 
 test("redactText strips remaining secret values", () => {

@@ -232,8 +232,10 @@ pub fn chat_complete(
 
 /// Streaming chat/completions (`stream: true`, SSE `data:` lines).
 ///
-/// `on_delta` is invoked with each non-empty content chunk. `cancel` is checked
-/// after every delta and between reads. Errors never include the API key.
+/// `on_delta` is invoked with each non-empty **content** chunk. Provider-exposed
+/// reasoning/summary (never fabricated, never encrypted hidden chains) is
+/// forwarded to `on_reasoning` when present. `cancel` is checked after every
+/// delta and between reads. Errors never include the API key.
 pub fn chat_complete_stream(
     base_url: &str,
     api_key: &str,
@@ -241,7 +243,32 @@ pub fn chat_complete_stream(
     messages: &[Value],
     timeout_sec: u64,
     cancel: &AtomicBool,
+    on_delta: impl FnMut(&str),
+) -> Result<ChatCompletion> {
+    chat_complete_stream_with_reasoning(
+        base_url,
+        api_key,
+        model,
+        messages,
+        timeout_sec,
+        cancel,
+        on_delta,
+        |_| {},
+    )
+}
+
+/// Like [`chat_complete_stream`], plus `on_reasoning` for provider-exposed
+/// reasoning/summary fields (`reasoning_content`, string `reasoning`,
+/// `reasoning_summary`, `reasoning.summary`). Encrypted/hidden chains are skipped.
+pub fn chat_complete_stream_with_reasoning(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Value],
+    timeout_sec: u64,
+    cancel: &AtomicBool,
     mut on_delta: impl FnMut(&str),
+    mut on_reasoning: impl FnMut(&str),
 ) -> Result<ChatCompletion> {
     if cancel.load(Ordering::SeqCst) {
         bail!("cancelled");
@@ -315,7 +342,14 @@ pub fn chat_complete_stream(
 
     let deadline = Instant::now() + Duration::from_secs(read_timeout);
     let reader = BufReader::new(resp.into_reader());
-    read_sse_completion(reader, cancel, deadline, api_key, &mut on_delta)
+    read_sse_completion(
+        reader,
+        cancel,
+        deadline,
+        api_key,
+        &mut on_delta,
+        &mut on_reasoning,
+    )
 }
 
 fn read_sse_completion<R: Read>(
@@ -324,6 +358,7 @@ fn read_sse_completion<R: Read>(
     deadline: Instant,
     api_key: &str,
     on_delta: &mut dyn FnMut(&str),
+    on_reasoning: &mut dyn FnMut(&str),
 ) -> Result<ChatCompletion> {
     let mut reader = reader;
     let mut acc = String::new();
@@ -373,7 +408,14 @@ fn read_sse_completion<R: Read>(
                             )
                         );
                     }
-                    if let Some(delta) = extract_stream_delta(&parsed) {
+                    let piece = extract_stream_piece(&parsed);
+                    if let Some(r) = piece.reasoning {
+                        on_reasoning(&r);
+                        if cancel.load(Ordering::SeqCst) {
+                            bail!("cancelled");
+                        }
+                    }
+                    if let Some(delta) = piece.content {
                         acc.push_str(&delta);
                         on_delta(&delta);
                         if cancel.load(Ordering::SeqCst) {
@@ -406,6 +448,9 @@ fn read_sse_completion<R: Read>(
                 redact_secrets("chat/completions error: response error object", Some(api_key))
             );
         }
+        if let Some(r) = extract_exposed_reasoning_from_choice(&parsed) {
+            on_reasoning(&r);
+        }
         if let Some(text) = extract_assistant_text(&parsed) {
             if !text.is_empty() {
                 on_delta(&text);
@@ -423,15 +468,57 @@ fn read_sse_completion<R: Read>(
     })
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct StreamPiece {
+    content: Option<String>,
+    reasoning: Option<String>,
+}
+
 fn extract_stream_delta(parsed: &Value) -> Option<String> {
+    extract_stream_piece(parsed).content
+}
+
+fn extract_stream_piece(parsed: &Value) -> StreamPiece {
+    let Some(choice) = parsed
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+    else {
+        return StreamPiece::default();
+    };
+    let delta = choice
+        .get("delta")
+        .or_else(|| choice.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    StreamPiece {
+        content: delta.get("content").and_then(content_to_nonempty_string),
+        reasoning: extract_exposed_reasoning(&delta),
+    }
+}
+
+fn extract_exposed_reasoning_from_choice(parsed: &Value) -> Option<String> {
     let choice = parsed.get("choices")?.as_array()?.first()?;
-    if let Some(c) = choice.get("delta").and_then(|d| d.get("content")) {
-        return content_to_nonempty_string(c);
+    let msg = choice.get("message").or_else(|| choice.get("delta"))?;
+    extract_exposed_reasoning(msg)
+}
+
+/// Provider-exposed reasoning/summary only. Never encrypted/hidden chains,
+/// never fabricated from content.
+fn extract_exposed_reasoning(delta: &Value) -> Option<String> {
+    for key in ["reasoning_content", "reasoning_summary"] {
+        if let Some(s) = delta.get(key).and_then(content_to_nonempty_string) {
+            return Some(s);
+        }
     }
-    if let Some(c) = choice.get("message").and_then(|m| m.get("content")) {
-        return content_to_nonempty_string(c);
+    match delta.get("reasoning") {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Object(map)) => map.get("summary").and_then(content_to_nonempty_string),
+        _ => {
+            // Some OpenAI-compat proxies put a display string in `thinking`.
+            delta.get("thinking").and_then(content_to_nonempty_string)
+        }
     }
-    None
 }
 
 fn content_to_nonempty_string(content: &Value) -> Option<String> {
@@ -1065,6 +1152,143 @@ mod tests {
         assert!(err.contains("cancelled"), "{err}");
         assert!(!err.contains("sk-stream-secret"), "{err}");
         assert_eq!(parts, vec!["aa"]);
+    }
+
+    fn write_sse_mixed(stream: &mut dyn Write, parts: &[(&str, &str)]) {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        );
+        for (field, c) in parts {
+            let payload = match *field {
+                "reasoning_content" => json!({"choices":[{"delta":{"reasoning_content": c}}]}),
+                "reasoning" => json!({"choices":[{"delta":{"reasoning": c}}]}),
+                "reasoning_summary" => json!({"choices":[{"delta":{"reasoning_summary": c}}]}),
+                "encrypted" => json!({"choices":[{"delta":{"reasoning":{"encrypted_content": c}}}]}),
+                _ => json!({"choices":[{"delta":{"content": c}}]}),
+            };
+            let _ = write!(stream, "data: {payload}\n\n");
+            let _ = stream.flush();
+            thread::sleep(Duration::from_millis(8));
+        }
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        let _ = stream.flush();
+    }
+
+    fn spawn_sse_mixed(
+        parts: &'static [(&'static str, &'static str)],
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).ok();
+        let addr = listener.local_addr().unwrap();
+        let join = thread::spawn(move || {
+            use std::net::Shutdown;
+            let deadline = Instant::now() + Duration::from_secs(6);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                        let _ = parse_http_request(&mut stream);
+                        write_sse_mixed(&mut stream, parts);
+                        let _ = stream.shutdown(Shutdown::Both);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() > deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{}/v1", addr.port()), join)
+    }
+
+    #[test]
+    fn extract_stream_piece_reasoning_not_content() {
+        let v = json!({"choices":[{"delta":{"reasoning_content":"step 1","content":null}}]});
+        let p = extract_stream_piece(&v);
+        assert_eq!(p.reasoning.as_deref(), Some("step 1"));
+        assert!(p.content.is_none());
+
+        let v = json!({"choices":[{"delta":{"reasoning":"summary A","content":"Hi"}}]});
+        let p = extract_stream_piece(&v);
+        assert_eq!(p.reasoning.as_deref(), Some("summary A"));
+        assert_eq!(p.content.as_deref(), Some("Hi"));
+
+        let v = json!({"choices":[{"delta":{"reasoning":{"summary":"ok"},"content":"x"}}]});
+        let p = extract_stream_piece(&v);
+        assert_eq!(p.reasoning.as_deref(), Some("ok"));
+        assert_eq!(p.content.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn extract_skips_encrypted_hidden_reasoning() {
+        let v = json!({"choices":[{"delta":{"reasoning":{"encrypted_content":"HIDDEN_CHAIN"}}}]});
+        let p = extract_stream_piece(&v);
+        assert!(p.reasoning.is_none(), "{p:?}");
+        assert!(p.content.is_none());
+    }
+
+    #[test]
+    fn extract_no_reasoning_does_not_fabricate() {
+        let v = json!({"choices":[{"delta":{"content":"just answer"}}]});
+        let p = extract_stream_piece(&v);
+        assert!(p.reasoning.is_none());
+        assert_eq!(p.content.as_deref(), Some("just answer"));
+        assert!(extract_stream_delta(&v).as_deref() == Some("just answer"));
+    }
+
+    #[test]
+    fn chat_complete_stream_forwards_reasoning_separately() {
+        let (base, join) = spawn_sse_mixed(&[
+            ("reasoning_content", "think "),
+            ("reasoning_content", "first"),
+            ("content", "ANS"),
+        ]);
+        let mut parts = Vec::new();
+        let mut reason = Vec::new();
+        let cancel = AtomicBool::new(false);
+        let out = chat_complete_stream_with_reasoning(
+            &base,
+            "sk-stream-secret",
+            "gpt-test",
+            &[json!({"role":"user","content":"ping"})],
+            8,
+            &cancel,
+            |d| parts.push(d.to_string()),
+            |r| reason.push(r.to_string()),
+        )
+        .unwrap();
+        let _ = join.join();
+        assert_eq!(parts, vec!["ANS"]);
+        assert_eq!(reason, vec!["think ", "first"]);
+        assert_eq!(out.text, "ANS");
+        assert!(!out.text.contains("think"), "reasoning must not mix into content");
+    }
+
+    #[test]
+    fn chat_complete_stream_without_reasoning_does_not_callback() {
+        let (base, join) = spawn_sse(&["Hel", "lo"]);
+        let mut reason = Vec::new();
+        let cancel = AtomicBool::new(false);
+        let out = chat_complete_stream_with_reasoning(
+            &base,
+            "sk-stream-secret",
+            "gpt-test",
+            &[json!({"role":"user","content":"ping"})],
+            8,
+            &cancel,
+            |_| {},
+            |r| reason.push(r.to_string()),
+        )
+        .unwrap();
+        let _ = join.join();
+        assert!(reason.is_empty(), "no provider reasoning → no fabricated chain: {reason:?}");
+        assert_eq!(out.text, "Hello");
     }
 
 }

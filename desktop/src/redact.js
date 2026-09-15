@@ -101,6 +101,82 @@ const EVENT_ID_KEYS = new Set([
   "hub_resume",
 ]);
 
+const SECRET_STARTERS = [
+  "authorization",
+  "set-cookie",
+  "cookie",
+  "token",
+  "api_key",
+  "api-key",
+  "apikey",
+  "password",
+  "passwd",
+  "secret",
+  "bearer",
+  "sk-proj-",
+  "sk-",
+  "http://",
+  "https://",
+];
+
+function suffixSecretHold(raw) {
+  const s = String(raw || "");
+  if (!s) return 0;
+  const lower = s.toLowerCase();
+  let hold = 0;
+  for (const starter of SECRET_STARTERS) {
+    const max = Math.min(starter.length, lower.length);
+    for (let n = max; n >= 1; n--) {
+      const suf = starter.slice(0, n);
+      if (lower.endsWith(suf)) {
+        const start = lower.length - n;
+        const boundary = start === 0 || !/[A-Za-z0-9]/.test(lower[start - 1]);
+        if (boundary) {
+          hold = Math.max(hold, n);
+          break;
+        }
+      }
+    }
+  }
+  const sk = lower.lastIndexOf("sk-");
+  if (sk >= 0) {
+    const boundary = sk === 0 || !/[A-Za-z0-9]/.test(lower[sk - 1]);
+    if (boundary) {
+      let rest = s.slice(sk + 3);
+      if (rest.length >= 5 && rest.slice(0, 5).toLowerCase() === "proj-") rest = rest.slice(5);
+      if (rest.length < 8 && /^[A-Za-z0-9._-]*$/.test(rest)) {
+        hold = Math.max(hold, s.length - sk);
+      }
+    }
+  }
+  return hold;
+}
+
+/** Cross-chunk display redaction. Unchecked fragments are held until safe. */
+export function safeRedactedDisplay(raw, flushed) {
+  const src = String(raw || "");
+  const redacted = redactText(src);
+  if (flushed || redacted !== src) return redacted;
+  const hold = suffixSecretHold(src);
+  return src.slice(0, Math.max(0, src.length - hold));
+}
+
+export function createStreamRedactor() {
+  let raw = "";
+  return {
+    push(chunk) {
+      raw += String(chunk || "");
+      return safeRedactedDisplay(raw, false);
+    },
+    flush() {
+      return safeRedactedDisplay(raw, true);
+    },
+    reset() {
+      raw = "";
+    },
+  };
+}
+
 /** Defense in depth: redact free-text fields on teach_chat_event payloads. */
 export function redactEventPayload(payload) {
   if (payload == null) return payload;

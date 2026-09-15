@@ -15,6 +15,8 @@ const EVENT_KINDS: &[&str] = &[
     "status",
     "user",
     "assistant_delta",
+    "thinking_delta",
+    "thinking_done",
     "assistant",
     "system",
     "tool",
@@ -102,6 +104,11 @@ pub enum EventKind {
         seq: u32,
         done: bool,
     },
+    ThinkingDelta {
+        text: String,
+        seq: u32,
+    },
+    ThinkingDone {},
     Assistant {
         role: String,
         text: String,
@@ -211,6 +218,11 @@ pub fn parse_event_line(line: &str) -> Result<Value, String> {
     Ok(v)
 }
 
+/// Log metadata for a teach event. Kind, length, timing only — never plaintext.
+pub fn event_log_meta(kind: &str, len: usize, elapsed_ms: u64) -> String {
+    format!("event kind={kind} len={len} ms={elapsed_ms}")
+}
+
 pub fn bad_event_payload(message: &str) -> Value {
     serde_json::json!({
         "v": EVENT_SCHEMA_V,
@@ -230,8 +242,31 @@ mod tests {
         assert!(parse_event_line(session).is_ok());
         let delta = r#"{"v":1,"kind":"assistant_delta","role":"assistant","text":"He","seq":0,"done":false}"#;
         assert!(parse_event_line(delta).is_ok());
+        let think = r#"{"v":1,"kind":"thinking_delta","text":"step","seq":0}"#;
+        assert!(parse_event_line(think).is_ok());
+        assert!(parse_event_line(r#"{"v":1,"kind":"thinking_done"}"#).is_ok());
         let resume = r#"{"v":1,"kind":"resume","profile":"demo","messages":[{"role":"user","text":"hi"}],"tools":[],"phase":"chat","status":"restored","hub_resume":"new_hub","note":"n"}"#;
         assert!(parse_event_line(resume).is_ok());
+    }
+
+    #[test]
+    fn thinking_delta_strict_v1_deny_unknown() {
+        let ok = parse_event_line(r#"{"v":1,"kind":"thinking_delta","text":"摘要","seq":1}"#)
+            .expect("valid thinking_delta");
+        assert_eq!(ok["kind"], "thinking_delta");
+        assert_eq!(ok["text"], "摘要");
+        assert_eq!(ok["seq"], 1);
+
+        let extra = parse_event_line(
+            r#"{"v":1,"kind":"thinking_delta","text":"x","seq":0,"extra":true}"#,
+        )
+        .unwrap_err();
+        assert!(
+            extra.contains("unknown field") || extra.contains("malformed"),
+            "{extra}"
+        );
+        assert!(parse_event_line(r#"{"v":1,"kind":"thinking_done","note":"x"}"#).is_err());
+        assert!(parse_event_line(r#"{"kind":"thinking_delta","text":"x","seq":0}"#).is_err());
     }
 
     #[test]
@@ -283,5 +318,17 @@ mod tests {
             zero.contains("schema version"),
             "v=0 must be rejected: {zero}"
         );
+    }
+
+    #[test]
+    fn event_log_meta_omits_thinking_plaintext() {
+        let secret = "token=abc123SECRETVALUE raw thinking";
+        let line = event_log_meta("thinking_delta", secret.len(), 9);
+        assert!(line.contains("kind=thinking_delta"));
+        assert!(line.contains("len="));
+        assert!(line.contains("ms=9"));
+        assert!(!line.contains("SECRETVALUE"));
+        assert!(!line.contains("token="));
+        assert!(!line.contains("raw thinking"));
     }
 }

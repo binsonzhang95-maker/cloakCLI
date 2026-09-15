@@ -15,6 +15,8 @@ The frontend cannot spawn arbitrary commands. There is no shell plugin. Proxy us
 
 Teach Chat is **live** (not a mock): `teach_chat_start` / `teach_chat_send` / `teach_chat_event` / cancel / confirm / status / reconnect. LLM, hub, and Playwright stay in `cloakcli`.
 
+While a turn is planning, Chat shows **正在思考**. If the model stream includes a provider-exposed reasoning summary, a separate **思考摘要** block appears above the answer (`thinking_delta` / optional `thinking_done`). No summary is invented when the provider does not expose reasoning. Thinking-region shimmer follows **Settings → Selection shimmer** (off by default); it stops on `thinking_done`, the first `assistant_delta`, or a terminal job state.
+
 ## Layout
 
 ```text

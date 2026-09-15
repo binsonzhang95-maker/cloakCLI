@@ -106,7 +106,9 @@ export function loadShimmerPref() {
   } catch {
     state.shimmer = false;
   }
-  document.documentElement.classList.toggle("shimmer", state.shimmer);
+  if (typeof document !== "undefined") {
+    document.documentElement.classList.toggle("shimmer", state.shimmer);
+  }
 }
 
 export function setShimmer(on) {
