@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -10,8 +11,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from run_pinterest_register_outlook_verify import (  # noqa: E402
+    _settle_result,
     classify_verify_status,
+    detect_email_confirmed_toast,
     detect_oops_modal,
+    email_badge_confirmed,
     inline_error_kind,
     redact_raw_secrets,
     snip_error,
@@ -52,6 +56,9 @@ What's your name?
 Enter the code
 Sorry! Something went wrong on our end.
 """
+
+# geo07/08 after Send-new-code retry: leftover #code error + success toast
+GABRIEL_TOAST = GABRIEL_VERIFY + "\nEmail confirmed\n"
 
 
 class ClassifyTests(unittest.TestCase):
@@ -140,6 +147,83 @@ class ClassifyTests(unittest.TestCase):
     def test_redact_does_not_touch_non_codes(self):
         self.assertEqual(redact_raw_secrets("age 31"), "age 31")
         self.assertEqual(redact_raw_secrets("pin 12345"), "pin 12345")
+
+    def test_email_confirmed_toast_is_candidate_even_with_code_modal(self):
+        self.assertTrue(detect_email_confirmed_toast("Email confirmed"))
+        self.assertTrue(detect_email_confirmed_toast("EMAIL CONFIRMED"))
+        self.assertTrue(detect_email_confirmed_toast(GABRIEL_TOAST))
+        self.assertFalse(detect_email_confirmed_toast(GABRIEL_VERIFY))
+        kind = inline_error_kind(GABRIEL_TOAST)
+        self.assertEqual(kind, "soft_oops")
+        status = classify_verify_status(
+            still_code_ui=True,
+            oops_modal=False,
+            inline_kind=kind,
+            onboarding=False,
+            login_signup_cta=True,
+        )
+        # Classify stays soft_oops until Settings badge is asserted.
+        self.assertEqual(status, "verify_soft_oops")
+
+    def test_settings_email_badge_confirmed(self):
+        self.assertTrue(email_badge_confirmed("Email\nConfirmed\nPassword"))
+        self.assertFalse(email_badge_confirmed("Email\nUnconfirmed\nConfirm Email"))
+        self.assertFalse(email_badge_confirmed("Email confirmed"))  # toast, not badge
+        self.assertFalse(email_badge_confirmed(""))
+        self.assertFalse(email_badge_confirmed(None))
+
+    def test_settle_overlay_toast_ok_and_unconfirmed_note(self):
+        class _Page:
+            url = "https://www.pinterest.com/settings/account-settings/"
+
+        snap = {
+            "still_code_ui": True,
+            "login_signup_cta": True,
+            "oops_modal": False,
+            "error_snip": "Sorry! Something went wrong on our end.",
+            "inline_kind": "soft_oops",
+            "onboarding": False,
+            "email_confirmed_toast": True,
+            "url": "https://www.pinterest.com/",
+        }
+        ok = _settle_result(
+            status="verify_soft_oops",
+            snap=snap,
+            page=_Page(),
+            continue_enabled_before=True,
+            val="xxxxxx",
+            cont_sel="form:has(#code) button:has-text(\"Continue\")",
+            retried=True,
+            extra={
+                "status": "ok",
+                "path": "toast_email_confirmed",
+                "still_code_ui": False,
+            },
+        )
+        self.assertEqual(ok["status"], "ok")
+        self.assertEqual(ok["path"], "toast_email_confirmed")
+        self.assertFalse(ok["still_code_ui"])
+        self.assertTrue(ok["email_confirmed_toast"])
+        self.assertNotIn("xxxxxx", json.dumps(ok))
+
+        nope = _settle_result(
+            status="verify_soft_oops",
+            snap=snap,
+            page=_Page(),
+            continue_enabled_before=True,
+            val="xxxxxx",
+            cont_sel="x",
+            retried=True,
+            extra={
+                "status": "verify_soft_oops",
+                "note": "toast_email_confirmed_but_settings_unconfirmed",
+            },
+        )
+        self.assertEqual(nope["status"], "verify_soft_oops")
+        self.assertEqual(
+            nope["note"], "toast_email_confirmed_but_settings_unconfirmed"
+        )
+        self.assertTrue(nope["still_code_ui"])
 
     def test_still_code_no_error_is_check_ui(self):
         status = classify_verify_status(

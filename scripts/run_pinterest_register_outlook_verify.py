@@ -11,6 +11,8 @@ Onboarding name must be a realistic given name (never email local-part).
 
 Statuses after code Continue:
 - ok: code UI gone, no verify error, not login/signup CTA
+- ok + path toast_email_confirmed: page/toast says "Email confirmed" (even if
+  leftover #code modal) and Account settings Email badge is Confirmed
 - verify_soft_oops: still on #code UI with "Something went wrong" (not invalid code)
 - oops_blocked: signup-level Oops! modal (proxy/fingerprint — selectors won't fix 风控)
 - code_error: incorrect/invalid/expired on the code field
@@ -47,7 +49,9 @@ INVALID_RE = re.compile(
 )
 EXPIRED_RE = re.compile(r"expired|too many|rate.?limit", re.I)
 OOPS_HEADING_RE = re.compile(r"\boops!", re.I)
+EMAIL_CONFIRMED_TOAST_RE = re.compile(r"email confirmed", re.I)
 CODE_DIGIT_RE = re.compile(r"(?<!\d)\d{6}(?!\d)")
+SETTINGS_ACCOUNT_URL = "https://www.pinterest.com/settings/account-settings/"
 ONBOARDING_MARKERS = (
     "What's your name",
     "Nice to meet you",
@@ -119,6 +123,18 @@ def inline_error_kind(text: str) -> str | None:
     if INVALID_RE.search(text):
         return "invalid"
     return None
+
+
+def detect_email_confirmed_toast(text: str) -> bool:
+    """True when page/toast copy says Email confirmed (case-insensitive)."""
+    return bool(text and EMAIL_CONFIRMED_TOAST_RE.search(text))
+
+
+def email_badge_confirmed(text: str) -> bool:
+    """Account settings Email badge is Confirmed (not Unconfirmed)."""
+    if not text:
+        return False
+    return "Confirmed" in text and "Unconfirmed" not in text
 
 
 def detect_oops_modal(body: str, *, code_visible: bool) -> bool:
@@ -276,6 +292,29 @@ def code_input_visible(page) -> bool:
         return False
 
 
+def scrape_toast_text(page) -> str:
+    """Visible toast/live-region copy (Pinterest success toasts often sit outside #code)."""
+    try:
+        return (
+            page.evaluate(
+                """() => {
+                  const parts = [];
+                  const nodes = document.querySelectorAll(
+                    '[role="status"], [role="alert"], [aria-live], [data-test-id*="toast"]'
+                  );
+                  for (const el of nodes) {
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (t) parts.push(t);
+                  }
+                  return parts.join('\\n').slice(0, 800);
+                }"""
+            )
+            or ""
+        )
+    except Exception:
+        return ""
+
+
 def scrape_code_ui_text(page) -> str:
     """Visible text around #code (scroll into view so scrolled modals still scrape)."""
     try:
@@ -320,6 +359,12 @@ def snapshot_verify(page) -> dict:
     onboarding = any(m in body for m in ONBOARDING_MARKERS)
     cta = "Log in" in body[:1500] and "Sign up" in body[:1500]
     err = snip_error(scoped) or snip_error(body)
+    toast_bits = scrape_toast_text(page)
+    toast = (
+        detect_email_confirmed_toast(body)
+        or detect_email_confirmed_toast(scoped)
+        or detect_email_confirmed_toast(toast_bits)
+    )
     return {
         "still_code_ui": bool(code_vis or enter),
         "oops_modal": oops_modal,
@@ -327,6 +372,7 @@ def snapshot_verify(page) -> dict:
         "onboarding": onboarding,
         "login_signup_cta": cta,
         "error_snip": err,
+        "email_confirmed_toast": toast,
         "url": page.url,
     }
 
@@ -339,18 +385,29 @@ def _try_networkidle(page, timeout_ms: int = 6000) -> None:
 
 
 def wait_after_verify_continue(page, timeout_ms: int = 25000) -> dict:
-    """Wait until code UI gone, OR inline/modal error, OR onboarding.
+    """Wait until code UI gone, OR inline/modal error, OR onboarding, OR toast.
 
     Does not treat onboarding as success while #code / verify errors remain.
+    An "Email confirmed" toast is a success candidate even if #code is still up.
+    Soft-oops inline error holds briefly so a lagging toast can still appear
+    (geo07/08 retry: leftover modal + success toast).
     """
     _try_networkidle(page, timeout_ms=min(8000, timeout_ms))
     deadline = time.time() + timeout_ms / 1000.0
     gone_since: float | None = None
+    error_since: float | None = None
     last = snapshot_verify(page)
     while time.time() < deadline:
         last = snapshot_verify(page)
-        if last["inline_kind"] or last["oops_modal"]:
+        if last.get("email_confirmed_toast"):
             return last
+        if last["inline_kind"] or last["oops_modal"]:
+            if error_since is None:
+                error_since = time.time()
+            elif time.time() - error_since >= 2.0:
+                return last
+        else:
+            error_since = None
         if last["still_code_ui"]:
             gone_since = None
         else:
@@ -362,6 +419,90 @@ def wait_after_verify_continue(page, timeout_ms: int = 25000) -> dict:
                 return last
         page.wait_for_timeout(250)
     return last
+
+
+def dismiss_overlays(page) -> None:
+    """Escape leftover #code / account-menu overlays so Settings is reachable."""
+    for _ in range(3):
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+
+def assert_settings_email_confirmed(
+    page, *, art: Path | None = None, shot: str = "run-04-settings-email.png"
+) -> bool:
+    """Open Account settings and return True if Email badge is Confirmed."""
+    dismiss_overlays(page)
+    page.goto(SETTINGS_ACCOUNT_URL, wait_until="domcontentloaded", timeout=90000)
+    page.wait_for_timeout(2500)
+    dismiss_overlays(page)
+    if art is not None:
+        try:
+            page.screenshot(path=str(art / shot))
+        except Exception:
+            pass
+    return email_badge_confirmed(page_body_text(page))
+
+
+def page_has_email_confirmed_toast(page, snap: dict | None = None) -> bool:
+    if snap and snap.get("email_confirmed_toast"):
+        return True
+    body = page_body_text(page)
+    return detect_email_confirmed_toast(body) or detect_email_confirmed_toast(
+        scrape_toast_text(page)
+    )
+
+
+def follow_email_confirmed_toast(
+    page,
+    snap: dict,
+    *,
+    art: Path | None = None,
+    shot: str = "run-04-settings-email.png",
+) -> dict | None:
+    """If toast/page says Email confirmed, confirm via Settings Email badge.
+
+    Returns a status overlay, or None if this is not a toast candidate.
+    Does not log codes. Success: ok + path toast_email_confirmed.
+    Settings still Unconfirmed: keep verify_soft_oops with a note.
+    """
+    if not page_has_email_confirmed_toast(page, snap):
+        return None
+    print(json.dumps({"status": "toast_email_confirmed_candidate"}), flush=True)
+    confirmed = assert_settings_email_confirmed(page, art=art, shot=shot)
+    if confirmed:
+        print(
+            json.dumps(
+                {"status": "ok", "path": "toast_email_confirmed"},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return {
+            "status": "ok",
+            "path": "toast_email_confirmed",
+            "still_code_ui": False,
+            "onboarding": False,
+            "url": page.url,
+        }
+    print(
+        json.dumps(
+            {
+                "status": "verify_soft_oops",
+                "note": "toast_email_confirmed_but_settings_unconfirmed",
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return {
+        "status": "verify_soft_oops",
+        "note": "toast_email_confirmed_but_settings_unconfirmed",
+        "url": page.url,
+    }
 
 
 def click_send_new_code(page) -> bool:
@@ -468,6 +609,37 @@ def _click_verify_continue(page) -> tuple[object, str, bool]:
     return cont, cont_sel, enabled
 
 
+def _settle_result(
+    *,
+    status: str,
+    snap: dict,
+    page,
+    continue_enabled_before: bool,
+    val: str,
+    cont_sel: str,
+    retried: bool,
+    extra: dict | None = None,
+) -> dict:
+    out = {
+        "status": status,
+        "still_code_ui": snap["still_code_ui"],
+        "login_signup_cta": snap["login_signup_cta"],
+        "has_oops": snap["oops_modal"],
+        "error_snip": snap.get("error_snip"),
+        "inline_kind": snap.get("inline_kind"),
+        "onboarding": snap["onboarding"],
+        "email_confirmed_toast": bool(snap.get("email_confirmed_toast")),
+        "url": snap.get("url") or page.url,
+        "continue_enabled_before_click": continue_enabled_before,
+        "code_value_len": len(val),
+        "continue_matched": cont_sel,
+        "verify_retried": retried,
+    }
+    if extra:
+        out.update(extra)
+    return out
+
+
 def submit_code_and_settle(
     page,
     *,
@@ -482,6 +654,8 @@ def submit_code_and_settle(
     """Fill #code, scoped Continue, wait/settle, one Send-new-code retry on soft oops.
 
     Never logs raw codes. Cap retry at 1.
+    If page/toast says "Email confirmed" (even with leftover #code), skip further
+    retries, dismiss the modal, and assert Settings Email badge Confirmed.
     """
     val = fill_code_react(page, code)
     print(
@@ -513,6 +687,23 @@ def submit_code_and_settle(
         page.screenshot(path=str(art / shot_after))
 
     retried = False
+    toast_now = page_has_email_confirmed_toast(page, snap)
+    # Toast can coexist with leftover #code error — don't Send-new-code over a
+    # success. Confirm via Settings instead (geo07 Gabriel / geo08 Celestino).
+    if toast_now:
+        follow = follow_email_confirmed_toast(page, snap, art=art)
+        if follow:
+            return _settle_result(
+                status=status,
+                snap=snap,
+                page=page,
+                continue_enabled_before=continue_enabled_before,
+                val=val,
+                cont_sel=cont_sel,
+                retried=retried,
+                extra=follow,
+            )
+
     if status == "verify_soft_oops":
         print(
             json.dumps(
@@ -546,21 +737,16 @@ def submit_code_and_settle(
             )
             hit = imap_wait_code(secrets, watermark, imap_timeout)
             if hit is None:
-                out = {
-                    "status": "imap_timeout",
-                    "still_code_ui": True,
-                    "login_signup_cta": snap["login_signup_cta"],
-                    "has_oops": snap["oops_modal"],
-                    "error_snip": snap.get("error_snip"),
-                    "inline_kind": snap.get("inline_kind"),
-                    "onboarding": snap["onboarding"],
-                    "url": page.url,
-                    "continue_enabled_before_click": continue_enabled_before,
-                    "code_value_len": len(val),
-                    "continue_matched": cont_sel,
-                    "verify_retried": True,
-                }
-                return out
+                return _settle_result(
+                    status="imap_timeout",
+                    snap=snap,
+                    page=page,
+                    continue_enabled_before=continue_enabled_before,
+                    val=val,
+                    cont_sel=cont_sel,
+                    retried=True,
+                    extra={"still_code_ui": True, "url": page.url},
+                )
             _log_code_received(hit)
             new_code = hit["code"]
             val = fill_code_react(page, new_code)
@@ -592,20 +778,17 @@ def submit_code_and_settle(
                 page.screenshot(path=str(art / "run-03-after-retry.png"))
                 page.screenshot(path=str(art / shot_after))
 
-    return {
-        "status": status,
-        "still_code_ui": snap["still_code_ui"],
-        "login_signup_cta": snap["login_signup_cta"],
-        "has_oops": snap["oops_modal"],
-        "error_snip": snap.get("error_snip"),
-        "inline_kind": snap.get("inline_kind"),
-        "onboarding": snap["onboarding"],
-        "url": snap.get("url") or page.url,
-        "continue_enabled_before_click": continue_enabled_before,
-        "code_value_len": len(val),
-        "continue_matched": cont_sel,
-        "verify_retried": retried,
-    }
+    follow = follow_email_confirmed_toast(page, snap, art=art)
+    return _settle_result(
+        status=status,
+        snap=snap,
+        page=page,
+        continue_enabled_before=continue_enabled_before,
+        val=val,
+        cont_sel=cont_sel,
+        retried=retried,
+        extra=follow,
+    )
 
 
 def _log_oops_blocked(page, *, retried_continue: bool, dismissed_okay: bool) -> None:

@@ -24,13 +24,15 @@ ROOT = Path(__file__).resolve().parents[1]
 # Reuse helpers from the register+verify runner
 sys.path.insert(0, str(ROOT / "scripts"))
 from run_pinterest_register_outlook_verify import (  # noqa: E402
+    SETTINGS_ACCOUNT_URL,
+    dismiss_overlays,
+    email_badge_confirmed,
     load_env,
     snip_error,
     submit_code_and_settle,
     wait_continue_enabled,
 )
 
-SETTINGS_ACCOUNT_URL = "https://www.pinterest.com/settings/account-settings/"
 CONFIRM_EMAIL_SEL = 'button:has-text("Confirm Email"), button:has-text("Confirm email")'
 
 
@@ -46,15 +48,6 @@ def is_emailish_name(val: str, human: str) -> bool:
     if " " not in v and len(v) > 10:
         return True
     return True  # prefer overwriting unknown autofill with human name
-
-
-def dismiss_overlays(page) -> None:
-    for _ in range(2):
-        try:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(200)
-        except Exception:
-            pass
 
 
 def body_text(page, n: int = 3000) -> str:
@@ -392,7 +385,11 @@ def main() -> int:
         result["urls"].append(page.url)
         page.screenshot(path=str(art / "settings-runner-01-account.png"))
         b = body_text(page)
-        if "Confirmed" in b and "Unconfirmed" not in b and "Confirm Email" not in b and "Confirm email" not in b:
+        if (
+            email_badge_confirmed(b)
+            and "Confirm Email" not in b
+            and "Confirm email" not in b
+        ):
             result["status"] = "already_verified"
             result["final_verified"] = True
             print(json.dumps(result, ensure_ascii=False), flush=True)
@@ -467,6 +464,10 @@ def main() -> int:
         result["inline_kind"] = settle.get("inline_kind")
         result["still_code_ui"] = settle.get("still_code_ui")
         result["code_len"] = settle.get("code_value_len") or result.get("code_len")
+        if settle.get("path"):
+            result["path"] = settle["path"]
+        if settle.get("note"):
+            result["note"] = settle["note"]
         if settle["status"] == "imap_timeout":
             result["status"] = "imap_timeout"
             print(json.dumps(result, ensure_ascii=False), flush=True)
@@ -487,10 +488,12 @@ def main() -> int:
         dismiss_overlays(page)
         page.screenshot(path=str(art / "settings-runner-05-final.png"))
         b2 = body_text(page)
-        verified = ("Confirmed" in b2) and ("Unconfirmed" not in b2)
+        verified = email_badge_confirmed(b2)
         result["final_verified"] = verified
         if verified:
             result["status"] = "ok"
+            if settle.get("path"):
+                result["path"] = settle["path"]
         elif settle["status"] != "ok":
             result["status"] = settle["status"]
             if not result.get("error_snip"):

@@ -10,7 +10,7 @@
 1. Escape 关掉账号菜单遮罩
 2. `settings/account-settings/` → **Confirm Email**
 3. `#code` → Continue → Email 徽章 **Confirmed**
-4. Continue 后与 path A 相同：等到码 UI 消失 / 可见错误 / 再查 Confirmed。`verify_soft_oops` 会 **Send new code** 重试一次（`verify_retry`）。日志不回显验证码。
+4. Continue 后与 path A 相同：等到码 UI 消失 / 可见错误 / **Email confirmed** toast / 再查 Confirmed。`verify_soft_oops` 会 **Send new code** 重试一次（`verify_retry`）。toast **Email confirmed** 即使 `#code` 还在也先当成功候选，Escape 后打开 Account settings，徽章 Confirmed → `ok` / `path: toast_email_confirmed`。日志不回显验证码。
 
 ## Runner
 ```bash

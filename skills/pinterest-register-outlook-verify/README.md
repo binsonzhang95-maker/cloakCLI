@@ -24,11 +24,12 @@ python3 scripts/run_pinterest_register_outlook_verify.py \
 - `#email` `#password` `#birthdate` → 表单 Continue（避开 Google）
 - 验证页 `#code`；React 友好逐字填入后点 **验证弹窗内** Continue（不要只按 Enter）
 - Continue 选择器优先：`verification-code-form` / `form:has(#code)` / `[role=dialog]`
-- 点 Continue 后等到：**码框消失** / **码框下可见错误** / **onboarding**。不要只凭 onboarding 文案判成功（须先排除 verify 错误）。
+- 点 Continue 后等到：**码框消失** / **码框下可见错误** / **Email confirmed toast** / **onboarding**。不要只凭 onboarding 文案判成功（须先排除 verify 错误）。toast 即使 `#code` 还在也先当成功候选，再查 Settings 徽章。
 
 ## 验证错误分类（batch 04–10）
 - `ok`：码 UI 消失且无 verify 错误（geo05 Augustine、geo09 Prudence path A）
 - `verify_soft_oops`：仍在 `#code` UI，红框 + **Sorry! Something went wrong on our end.**（不是 invalid code）。geo07 Gabriel / geo08 Celestino。会点一次 **Send new code** → 重基 IMAP uid → 再填码 Continue（`verify_retry`，最多 1 次）
+- `ok` + `path: toast_email_confirmed`：页面/toast 出现 **Email confirmed**（即使 `#code` 模态还在）。Escape 关掉模态 → 打开 `settings/account-settings/`，Email 徽章为 **Confirmed** 才算成功。徽章仍是 Unconfirmed 则保持 `verify_soft_oops` 并记 note
 - `oops_blocked`：注册 Continue 后弹出 **Oops!** 模态（Okay）。geo06 Titus / geo10 Ethelyn。代理/指纹风控，选择器救不了；runner 可 Okay 关掉再点一次 Continue，仍 Oops 则原样失败
 - `code_error`：incorrect / invalid / expired
 - 日志只记 `error_snip` / `code_len`，**不回显** 6 位码或密码
