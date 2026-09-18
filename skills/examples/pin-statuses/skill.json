@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "name": "pin-statuses",
+  "description": "Fixture python_runner with Pinterest-like terminal statuses (logged_in / email_confirmed / oops_park). No browser.",
+  "params": [],
+  "steps": []
+}

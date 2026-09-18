@@ -49,6 +49,7 @@ Response to latest re-review: `astra-rereview-response.md`.
 | TLS / WebSocket | **TODO before production** |
 | Per-client identity, rotation, revoke | **TODO** (still shared token) |
 | `skill_sync` tar + SHA-256 / version lock / ACK / rollback | **Works (dev)** — safe extract, immutable digest cache; rollback = sync an older published digest (in-flight jobs keep the digest they started with). TLS still TODO. |
+| Per-skill terminal `statuses` on `manifest.json` | **Works (dev)** — digest-bound declaration; last-line JSON report; master re-validates; protocol errors ≠ forged skill `failed`; ledger partitioned by `skill_id`. |
 
 Layers:
 

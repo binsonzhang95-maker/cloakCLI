@@ -179,6 +179,11 @@ pub enum MasterCmd {
         #[arg(long)]
         get: bool,
     },
+    /// Per-skill ledger (no global email_confirmed column)
+    Ledger {
+        #[arg(long)]
+        skill: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1188,6 +1193,18 @@ pub async fn handle_master(root: &Path, action: MasterCmd) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp)?);
             if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
                 bail!("{}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("config_update failed"));
+            }
+            Ok(())
+        }
+        MasterCmd::Ledger { skill } => {
+            let mut body = serde_json::json!({"cmd": "ledger"});
+            if let Some(s) = skill {
+                body["skill"] = serde_json::Value::String(s);
+            }
+            let resp = crate::master_hub::control_request(root, body).await?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+            if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
+                bail!("{}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("ledger failed"));
             }
             Ok(())
         }

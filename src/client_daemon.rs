@@ -23,6 +23,7 @@ use crate::locks::ProfileLock;
 use crate::profiles;
 use crate::protocol::{ConfigRevision, Envelope, PROTOCOL_VERSION};
 use crate::skill_pkg;
+use crate::skill_status;
 use crate::skills;
 use crate::state;
 use crate::worker::{self, Request as WorkerReq};
@@ -419,13 +420,22 @@ async fn handle_job<W: AsyncWriteExt + Unpin + Send + 'static>(
             );
             send_line(
                 writer,
-                &Envelope::new("job_state").with_client(client_id).with_data(json!({
-                    "job_id": job_id,
-                    "state": existing.state,
-                    "error": existing.error,
-                    "data": existing.data,
-                    "idempotent": true,
-                })),
+                &Envelope::new("job_state").with_client(client_id).with_data({
+                    let mut v = json!({
+                        "job_id": job_id,
+                        "state": existing.state,
+                        "error": existing.error,
+                        "data": existing.data,
+                        "idempotent": true,
+                    });
+                    if let Some(pe) = &existing.protocol_error {
+                        v["protocol_error"] = json!(pe);
+                    }
+                    if let Some(r) = &existing.result {
+                        v["result"] = skill_status::result_to_json(r);
+                    }
+                    v
+                }),
             )
             .await?;
             return Ok(());
@@ -544,31 +554,122 @@ async fn handle_job<W: AsyncWriteExt + Unpin + Send + 'static>(
 
     match result {
         Ok(data) => {
-            let _ = jobs::upsert_state(
-                root,
-                &job_id,
-                client_id,
-                &skill_name,
-                &profile,
-                headed,
-                "succeeded",
-                None,
-                Some(data.clone()),
-            );
-            send_line(
-                writer,
-                &Envelope::new("job_state").with_client(client_id).with_data(json!({
-                    "job_id": job_id,
-                    "state": "succeeded",
-                    "data": data,
-                })),
-            )
-            .await?;
+            if skill_status::is_paused_report(&data) {
+                let _ = jobs::upsert_state(
+                    root,
+                    &job_id,
+                    client_id,
+                    &skill_name,
+                    &profile,
+                    headed,
+                    "paused",
+                    None,
+                    Some(data.clone()),
+                );
+                send_line(
+                    writer,
+                    &Envelope::new("job_state").with_client(client_id).with_data(json!({
+                        "job_id": job_id,
+                        "state": "paused",
+                        "data": data,
+                    })),
+                )
+                .await?;
+                return Ok(());
+            }
+            let identity = match skill_status::identity_from_job(&skill_name, &version, &digest) {
+                Ok(id) => id,
+                Err(e) => {
+                    send_protocol_fail(
+                        root,
+                        writer,
+                        client_id,
+                        &job_id,
+                        &skill_name,
+                        &profile,
+                        headed,
+                        &e.to_string(),
+                        Some(data),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let manifest = match skill_pkg::lookup_installed(root, &skill_name, &digest)
+                .and_then(|d| skill_pkg::entry_from_package(&d))
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    send_protocol_fail(
+                        root,
+                        writer,
+                        client_id,
+                        &job_id,
+                        &skill_name,
+                        &profile,
+                        headed,
+                        &e.to_string(),
+                        Some(data),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let decls = skill_status::decls_from_manifest(&manifest);
+            let adapted = match manifest.entry.kind {
+                skill_pkg::SkillEntryKind::PythonRunner => {
+                    skill_status::adapt_python_report(&data, &identity, decls.as_deref())
+                }
+                skill_pkg::SkillEntryKind::SkillSteps => {
+                    skill_status::adapt_skill_steps_report(&data, &identity, decls.as_deref())
+                }
+            };
+            match adapted {
+                Ok(res) => {
+                    let state_name = skill_status::scheduler_state_for(&res);
+                    let _ = jobs::upsert_state(
+                        root,
+                        &job_id,
+                        client_id,
+                        &skill_name,
+                        &profile,
+                        headed,
+                        state_name,
+                        None,
+                        Some(data.clone()),
+                    );
+                    send_line(
+                        writer,
+                        &Envelope::new("job_state").with_client(client_id).with_data(json!({
+                            "job_id": job_id,
+                            "state": state_name,
+                            "data": data,
+                            // Master re-validates; success/label here are not authoritative.
+                        })),
+                    )
+                    .await?;
+                }
+                Err(pe) => {
+                    send_protocol_fail(
+                        root,
+                        writer,
+                        client_id,
+                        &job_id,
+                        &skill_name,
+                        &profile,
+                        headed,
+                        &pe.as_message(),
+                        Some(data),
+                    )
+                    .await?;
+                }
+            }
         }
         Err(e) => {
             let msg = e.to_string();
             let cancelled = cancel_flag.load(Ordering::SeqCst) || msg.contains("cancelled");
             let paused = msg.contains("ASK_HUMAN") || msg.contains("paused_ask_human");
+            let protocol = msg.starts_with("protocol:");
             let state_name = if cancelled {
                 "cancelled"
             } else if paused {
@@ -587,16 +688,56 @@ async fn handle_job<W: AsyncWriteExt + Unpin + Send + 'static>(
                 Some(e.to_string()),
                 None,
             );
+            let mut payload = json!({
+                "job_id": job_id,
+                "state": state_name,
+                "error": e.to_string(),
+            });
+            if protocol {
+                payload["protocol_error"] = json!(e.to_string());
+            }
             send_line(
                 writer,
-                &Envelope::new("job_state").with_client(client_id).with_data(json!({
-                    "job_id": job_id,
-                    "state": state_name,
-                    "error": e.to_string(),
-                })),
+                &Envelope::new("job_state").with_client(client_id).with_data(payload),
             )
             .await?;
         }
     }
+    Ok(())
+}
+
+async fn send_protocol_fail<W: AsyncWriteExt + Unpin>(
+    root: &Path,
+    writer: &Arc<Mutex<W>>,
+    client_id: &str,
+    job_id: &str,
+    skill_name: &str,
+    profile: &str,
+    headed: bool,
+    message: &str,
+    data: Option<serde_json::Value>,
+) -> Result<()> {
+    let _ = jobs::upsert_state(
+        root,
+        job_id,
+        client_id,
+        skill_name,
+        profile,
+        headed,
+        "failed",
+        Some(message.to_string()),
+        data.clone(),
+    );
+    send_line(
+        writer,
+        &Envelope::new("job_state").with_client(client_id).with_data(json!({
+            "job_id": job_id,
+            "state": "failed",
+            "error": message,
+            "protocol_error": message,
+            "data": data,
+        })),
+    )
+    .await?;
     Ok(())
 }

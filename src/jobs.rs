@@ -9,6 +9,22 @@ use std::path::{Path, PathBuf};
 
 use crate::state;
 
+/// Validated business result stored on the job (declaration snapshot).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobBusinessResult {
+    pub skill_id: String,
+    pub version: String,
+    /// Bound digest. Absent only for pre-digest historical records (never forged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    pub status: String,
+    pub success: bool,
+    pub retryable: bool,
+    pub label: String,
+    #[serde(default)]
+    pub optional: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRecord {
     pub job_id: String,
@@ -33,6 +49,15 @@ pub struct JobRecord {
     pub account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geo: Option<String>,
+    /// Validated business result (declaration snapshot for this job's digest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<JobBusinessResult>,
+    /// Protocol/execution diagnosis — never a forged skill `failed` status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_error: Option<String>,
+    /// Success was counted at most once for this job_id.
+    #[serde(default)]
+    pub success_counted: bool,
 }
 
 pub fn jobs_dir(root: &Path) -> PathBuf {
@@ -87,6 +112,9 @@ pub fn upsert_state(
         skill_digest: None,
         account_id: None,
         geo: None,
+        result: None,
+        protocol_error: None,
+        success_counted: false,
     });
     rec.client_id = client_id.to_string();
     if !skill.is_empty() {
@@ -153,5 +181,8 @@ pub fn to_json(rec: &JobRecord) -> serde_json::Value {
         "skill_digest": rec.skill_digest,
         "account_id": rec.account_id,
         "geo": rec.geo,
+        "result": rec.result,
+        "protocol_error": rec.protocol_error,
+        "success_counted": rec.success_counted,
     })
 }

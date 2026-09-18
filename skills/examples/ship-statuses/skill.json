@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "name": "ship-statuses",
+  "description": "Fixture python_runner with a different status set (shipped / returned). Used to prove cross-skill status ids are rejected.",
+  "params": [],
+  "steps": []
+}

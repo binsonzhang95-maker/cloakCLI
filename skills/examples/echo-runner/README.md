@@ -11,7 +11,7 @@ skills/examples/echo-runner/
   scripts/echo.py     # package-relative runner (fixed interpreter, argv array, no shell)
 ```
 
-`manifest.json` `entry.path` is relative to the package root. Master packs the directory into tar + SHA-256. Clients only run this path from an installed digest cache — never a job-supplied command.
+`manifest.json` `entry.path` is relative to the package root. Master packs the directory into tar + SHA-256. Clients only run this path from an installed digest cache — never a job-supplied command. This fixture omits `statuses` (legacy `ok|failed|cancelled`); last stdout line is still a JSON object.
 
 ```bash
 # Master: pack + publish, then push to a connected client

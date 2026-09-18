@@ -1,0 +1,12 @@
+{
+  "version": "1.0.0",
+  "entry": {
+    "kind": "python_runner",
+    "path": "scripts/run.py"
+  },
+  "secrets": [],
+  "statuses": [
+    {"id": "shipped", "success": true, "retryable": false, "label": "Shipped"},
+    {"id": "returned", "success": false, "retryable": true, "label": "Returned"}
+  ]
+}

@@ -38,6 +38,19 @@ const SKIP_FILE_EXACT: &[&str] = &[
     "cookies.json",
 ];
 
+/// One declared terminal status for a skill. Unique `id` is the only wire value.
+/// `success` / `retryable` / `label` are taken from this declaration, never from the runner.
+/// `optional` is display-only and does not affect success counting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillStatusDecl {
+    pub id: String,
+    pub success: bool,
+    pub retryable: bool,
+    pub label: String,
+    #[serde(default)]
+    pub optional: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillManifest {
     pub version: String,
@@ -45,6 +58,9 @@ pub struct SkillManifest {
     /// Secret *names* only (never values).
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Absent field → legacy `ok|failed|cancelled`. Present empty/illegal array → reject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statuses: Option<Vec<SkillStatusDecl>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +99,9 @@ pub struct ReleaseRecord {
     pub entry: String,
     #[serde(default)]
     pub secret_names: Vec<String>,
+    /// Snapshot of the packed manifest's `statuses` (None = legacy three-state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statuses: Option<Vec<SkillStatusDecl>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +190,7 @@ pub fn default_manifest(version: &str) -> SkillManifest {
             path: None,
         },
         secrets: vec![],
+        statuses: None,
     }
 }
 
@@ -223,7 +243,85 @@ pub fn validate_manifest(m: &SkillManifest, skill_dir: Option<&Path>) -> Result<
     for name in &m.secrets {
         util::validate_name(name, "secret")?;
     }
+    validate_status_decls(m.statuses.as_deref())?;
     Ok(())
+}
+
+/// Validate `manifest.statuses`. Missing (`None`) is legacy and allowed.
+/// An empty array or illegal entries must reject publish/install — no silent fallback.
+pub fn validate_status_decls(statuses: Option<&[SkillStatusDecl]>) -> Result<()> {
+    let Some(list) = statuses else {
+        return Ok(());
+    };
+    if list.is_empty() {
+        bail!(
+            "statuses must be a non-empty array (omit the field for legacy ok|failed|cancelled)"
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    for s in list {
+        let id = s.id.trim();
+        if id.is_empty() || id != s.id {
+            bail!("status id must be non-empty and must not have surrounding whitespace");
+        }
+        util::validate_name(id, "status id")?;
+        if !seen.insert(id.to_string()) {
+            bail!("duplicate status id '{id}'");
+        }
+        if s.label.trim().is_empty() {
+            bail!("status '{id}' label must be non-empty");
+        }
+    }
+    Ok(())
+}
+
+/// Look up the status declaration that was packed with this exact digest.
+/// Never falls back to the latest published version or a local same-name skill.
+pub fn statuses_for_digest(
+    root: &Path,
+    skill_id: &str,
+    digest: &str,
+) -> Result<Option<Vec<SkillStatusDecl>>> {
+    util::validate_name(skill_id, "skill")?;
+    let digest = normalize_digest(digest)?;
+    let cat = load_catalog(root)?;
+    let mut matches: Vec<&ReleaseRecord> = cat
+        .releases
+        .iter()
+        .filter(|r| r.skill_id == skill_id && r.digest == digest)
+        .collect();
+    if matches.is_empty() {
+        bail!("no release for skill '{skill_id}' digest {digest} (refusing latest/local fallback)");
+    }
+    matches.sort_by_key(|r| r.created_at);
+    Ok(matches.last().unwrap().statuses.clone())
+}
+
+/// Built-in three-state used only when `manifest.statuses` is omitted.
+pub fn legacy_status_decls() -> Vec<SkillStatusDecl> {
+    vec![
+        SkillStatusDecl {
+            id: "ok".into(),
+            success: true,
+            retryable: false,
+            label: "ok".into(),
+            optional: false,
+        },
+        SkillStatusDecl {
+            id: "failed".into(),
+            success: false,
+            retryable: false,
+            label: "failed".into(),
+            optional: false,
+        },
+        SkillStatusDecl {
+            id: "cancelled".into(),
+            success: false,
+            retryable: false,
+            label: "cancelled".into(),
+            optional: false,
+        },
+    ]
 }
 
 pub fn validate_version(v: &str) -> Result<()> {
@@ -447,6 +545,7 @@ pub fn pack_skill(
         created_at: chrono::Utc::now().timestamp(),
         entry: manifest.entry.kind.as_str().to_string(),
         secret_names: manifest.secrets.clone(),
+        statuses: manifest.statuses.clone(),
     };
     fs::write(
         dest_dir.join("release.json"),
@@ -979,11 +1078,11 @@ pub async fn run_python_runner(
         }
     };
 
-    let stdout_s = String::from_utf8_lossy(&stdout).trim().to_string();
+    let stdout_s = String::from_utf8_lossy(&stdout);
     let stderr_s = String::from_utf8_lossy(&stderr).trim().to_string();
     if !status.success() {
         let err = if stderr_s.is_empty() {
-            stdout_s
+            stdout_s.trim().to_string()
         } else {
             stderr_s
         };
@@ -993,23 +1092,9 @@ pub async fn run_python_runner(
             truncate(&err, 800)
         );
     }
-    if stdout_s.is_empty() {
-        return Ok(json!({"ok": true}));
-    }
-    match serde_json::from_str::<Value>(&stdout_s) {
-        Ok(v) => {
-            if v.get("ok") == Some(&Value::Bool(false)) {
-                bail!(
-                    "{}",
-                    v.get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("python_runner reported ok=false")
-                );
-            }
-            Ok(v)
-        }
-        Err(_) => Ok(json!({"ok": true, "stdout": truncate(&stdout_s, 800)})),
-    }
+    // Last non-empty stdout line must be a JSON object. Empty / non-JSON is not success.
+    crate::skill_status::parse_stdout_report(&stdout_s)
+        .map_err(|e| anyhow::anyhow!("{}", e.as_message()))
 }
 
 fn kill_tree(pid: u32) {
@@ -1047,6 +1132,7 @@ pub fn release_to_json(rec: &ReleaseRecord) -> Value {
         "created_at": rec.created_at,
         "entry": rec.entry,
         "secret_names": rec.secret_names,
+        "statuses": rec.statuses,
     })
 }
 
@@ -1296,6 +1382,204 @@ mod tests {
         .unwrap();
         assert_eq!(out["ok"], true);
         assert_eq!(out["echo"], true);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn write_status_skill(root: &Path, name: &str, statuses_json: &str, script: &str) -> PathBuf {
+        let dir = state::skills_dir(root).join(name);
+        fs::create_dir_all(dir.join("scripts")).unwrap();
+        fs::write(
+            dir.join("skill.json"),
+            format!(
+                "{{\n  \"schema_version\": 1,\n  \"name\": \"{name}\",\n  \"description\": \"fixture\",\n  \"params\": [],\n  \"steps\": []\n}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("manifest.json"),
+            format!(
+                "{{\n  \"version\": \"1.0.0\",\n  \"entry\": {{\"kind\": \"python_runner\", \"path\": \"scripts/run.py\"}},\n  \"secrets\": [],\n  \"statuses\": {statuses_json}\n}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("scripts").join("run.py"), script).unwrap();
+        dir
+    }
+
+    #[test]
+    fn statuses_empty_or_illegal_reject_pack() {
+        let root = tmp_root();
+        write_status_skill(&root, "bad-empty", "[]", "print('x')\n");
+        let err = pack_skill(&root, "bad-empty", Some("1.0.0"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-empty"), "{err}");
+
+        let root = tmp_root();
+        write_status_skill(
+            &root,
+            "bad-dup",
+            r#"[{"id":"ok","success":true,"retryable":false,"label":"A"},{"id":"ok","success":false,"retryable":false,"label":"B"}]"#,
+            "print('x')\n",
+        );
+        let err = pack_skill(&root, "bad-dup", Some("1.0.0"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate"), "{err}");
+
+        let root = tmp_root();
+        write_status_skill(
+            &root,
+            "bad-label",
+            r#"[{"id":"ok","success":true,"retryable":false,"label":"  "}]"#,
+            "print('x')\n",
+        );
+        let err = pack_skill(&root, "bad-label", Some("1.0.0"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("label"), "{err}");
+
+        let root = tmp_root();
+        write_status_skill(
+            &root,
+            "bad-id",
+            r#"[{"id":"","success":true,"retryable":false,"label":"x"}]"#,
+            "print('x')\n",
+        );
+        let err = pack_skill(&root, "bad-id", Some("1.0.0"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("id") || err.contains("empty"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_statuses_is_legacy_and_changing_statuses_changes_digest() {
+        let root = tmp_root();
+        write_echo_skill(&root, "echo-runner");
+        let legacy = pack_skill(&root, "echo-runner", Some("1.0.0"), true).unwrap();
+        assert!(legacy.statuses.is_none());
+
+        write_status_skill(
+            &root,
+            "pin-reg",
+            r#"[{"id":"logged_in","success":true,"retryable":false,"label":"已登录"},{"id":"email_confirmed","success":true,"retryable":false,"label":"邮箱已确认","optional":true},{"id":"oops_park","success":false,"retryable":true,"label":"风控先放"}]"#,
+            "import json,sys\np=json.loads(sys.stdin.read() or '{}')\nprint(json.dumps({'skill_id':p.get('skill_id'),'version':p.get('version'),'digest':p.get('digest'),'status':(p.get('vars') or {}).get('status') or 'logged_in'}))\n",
+        );
+        let a = pack_skill(&root, "pin-reg", Some("1.0.0"), true).unwrap();
+        assert_eq!(a.statuses.as_ref().unwrap().len(), 3);
+        let got = statuses_for_digest(&root, "pin-reg", &a.digest).unwrap();
+        assert_eq!(got.as_ref().unwrap()[0].id, "logged_in");
+
+        // Bump version with a different set → new digest.
+        let dir = state::skills_dir(&root).join("pin-reg");
+        fs::write(
+            dir.join("manifest.json"),
+            r#"{"version":"1.1.0","entry":{"kind":"python_runner","path":"scripts/run.py"},"secrets":[],"statuses":[{"id":"logged_in","success":true,"retryable":false,"label":"Signed in"}]}"#,
+        )
+        .unwrap();
+        let b = pack_skill(&root, "pin-reg", Some("1.1.0"), true).unwrap();
+        assert_ne!(a.digest, b.digest);
+        // Old digest still returns v1 labels.
+        let old = statuses_for_digest(&root, "pin-reg", &a.digest).unwrap().unwrap();
+        assert_eq!(old[0].label, "已登录");
+        let new = statuses_for_digest(&root, "pin-reg", &b.digest).unwrap().unwrap();
+        assert_eq!(new[0].label, "Signed in");
+        assert_eq!(new.len(), 1);
+
+        // Same published version with different statuses (digest change) is refused.
+        fs::write(
+            dir.join("manifest.json"),
+            r#"{"version":"1.0.0","entry":{"kind":"python_runner","path":"scripts/run.py"},"secrets":[],"statuses":[{"id":"logged_in","success":true,"retryable":false,"label":"nope"}]}"#,
+        )
+        .unwrap();
+        let err = pack_skill(&root, "pin-reg", Some("1.0.0"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already published") || err.contains("bump"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_skills_different_status_sets_stored_per_digest() {
+        let root = tmp_root();
+        write_status_skill(
+            &root,
+            "pin-reg",
+            r#"[{"id":"logged_in","success":true,"retryable":false,"label":"已登录"}]"#,
+            "print('x')\n",
+        );
+        write_status_skill(
+            &root,
+            "ship-demo",
+            r#"[{"id":"shipped","success":true,"retryable":false,"label":"Shipped"}]"#,
+            "print('x')\n",
+        );
+        let pin = pack_skill(&root, "pin-reg", Some("1.0.0"), true).unwrap();
+        let ship = pack_skill(&root, "ship-demo", Some("1.0.0"), true).unwrap();
+        let pin_s = statuses_for_digest(&root, "pin-reg", &pin.digest).unwrap().unwrap();
+        let ship_s = statuses_for_digest(&root, "ship-demo", &ship.digest).unwrap().unwrap();
+        assert_eq!(pin_s[0].id, "logged_in");
+        assert_eq!(ship_s[0].id, "shipped");
+        let err = statuses_for_digest(&root, "pin-reg", &ship.digest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no release") || err.contains("digest"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn python_runner_empty_or_non_json_is_not_success() {
+        let root = tmp_root();
+        let dir = write_echo_skill(&root, "echo-runner");
+        fs::write(dir.join("scripts").join("empty.py"), "import sys\nsys.exit(0)\n").unwrap();
+        let err = run_python_runner(
+            &dir,
+            "scripts/empty.py",
+            &json!({}),
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("empty stdout") || err.contains("protocol"), "{err}");
+
+        fs::write(
+            dir.join("scripts").join("tail.py"),
+            "print('{\"ok\": true}')\nprint('log after report')\n",
+        )
+        .unwrap();
+        let err = run_python_runner(
+            &dir,
+            "scripts/tail.py",
+            &json!({}),
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("not a JSON object") || err.contains("protocol"),
+            "{err}"
+        );
+
+        fs::write(
+            dir.join("scripts").join("logs_then_json.py"),
+            "print('starting')\nprint('{\"ok\": true, \"echo\": true}')\n",
+        )
+        .unwrap();
+        let out = run_python_runner(
+            &dir,
+            "scripts/logs_then_json.py",
+            &json!({}),
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["ok"], true);
         let _ = fs::remove_dir_all(&root);
     }
 

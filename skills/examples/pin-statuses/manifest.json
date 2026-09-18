@@ -1,0 +1,13 @@
+{
+  "version": "1.0.0",
+  "entry": {
+    "kind": "python_runner",
+    "path": "scripts/run.py"
+  },
+  "secrets": [],
+  "statuses": [
+    {"id": "logged_in", "success": true, "retryable": false, "label": "已登录"},
+    {"id": "email_confirmed", "success": true, "retryable": false, "label": "邮箱已确认", "optional": true},
+    {"id": "oops_park", "success": false, "retryable": true, "label": "风控先放"}
+  ]
+}

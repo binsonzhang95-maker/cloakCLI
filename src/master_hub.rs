@@ -325,6 +325,23 @@ async fn handle_control(stream: tokio::net::UnixStream, hub: SharedHub) -> Resul
             let state = hub.read().await;
             json!({"ok": true, "desired": state.desired})
         }
+        "ledger" => {
+            let root = hub.read().await.root.clone();
+            let skill = req.get("skill").and_then(|v| v.as_str());
+            match skill {
+                Some(s) if !s.is_empty() => match crate::ledger::load_partition(&root, s) {
+                    Ok(p) => json!({"ok": true, "ledger": crate::ledger::partition_to_json(&p)}),
+                    Err(e) => json!({"ok": false, "error": e.to_string()}),
+                },
+                _ => match crate::ledger::list_partitions(&root) {
+                    Ok(list) => json!({
+                        "ok": true,
+                        "ledgers": list.iter().map(crate::ledger::partition_to_json).collect::<Vec<_>>(),
+                    }),
+                    Err(e) => json!({"ok": false, "error": e.to_string()}),
+                },
+            }
+        }
         _ => json!({"ok": false, "error": format!("unknown control cmd: {cmd}")}),
     };
     let line = serde_json::to_string(&resp)? + "\n";
@@ -564,9 +581,6 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) -> Result<()> {
                     serde_json::to_string(&env.data).unwrap_or_default()
                 ));
                 if env.msg_type == "job_state" {
-                    if let Some(h) = state.clients.get_mut(&cid) {
-                        h.info.last_job_state = Some(env.data.clone());
-                    }
                     let job_id = env
                         .data
                         .get("job_id")
@@ -577,6 +591,7 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) -> Result<()> {
                         .get("state")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
+                    let mut shown = env.data.clone();
                     if !job_id.is_empty() {
                         let err = env
                             .data
@@ -584,24 +599,39 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) -> Result<()> {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
                         let data = env.data.get("data").cloned();
-                        let (skill, profile, headed) = state
-                            .jobs
-                            .get(job_id)
-                            .map(|r| (r.skill.clone(), r.profile.clone(), r.headed))
-                            .unwrap_or_else(|| ("".into(), "".into(), false));
-                        if let Ok(rec) = jobs::upsert_state(
-                            &state.root,
-                            job_id,
-                            &cid,
-                            &skill,
-                            &profile,
-                            headed,
-                            st,
-                            err,
+                        let protocol_error = env
+                            .data
+                            .get("protocol_error")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let upd = crate::skill_status::ClientJobUpdate {
+                            job_id: job_id.to_string(),
+                            client_id: cid.clone(),
+                            reported_state: st.to_string(),
+                            error: err,
+                            protocol_error,
                             data,
-                        ) {
-                            state.jobs.insert(job_id.to_string(), rec);
+                        };
+                        match crate::skill_status::ingest_client_update(&state.root, upd) {
+                            Ok(rec) => {
+                                shown["state"] = json!(rec.state);
+                                if let Some(r) = &rec.result {
+                                    shown["result"] = crate::skill_status::result_to_json(r);
+                                }
+                                if let Some(pe) = &rec.protocol_error {
+                                    shown["protocol_error"] = json!(pe);
+                                }
+                                state.jobs.insert(job_id.to_string(), rec);
+                            }
+                            Err(e) => {
+                                state.push_log(format!(
+                                    "ingest job_state {job_id} failed: {e}"
+                                ));
+                            }
                         }
+                    }
+                    if let Some(h) = state.clients.get_mut(&cid) {
+                        h.info.last_job_state = Some(shown);
                     }
                 }
             }
@@ -857,6 +887,11 @@ async fn wait_skill_sync_ack(
 pub async fn cancel_job(hub: &SharedHub, client_id: &str, job_id: &str) -> Result<()> {
     {
         let mut state = hub.write().await;
+        if let Some(existing) = state.jobs.get(job_id) {
+            if jobs::is_terminal(&existing.state) || existing.result.is_some() {
+                return Ok(());
+            }
+        }
         let _ = jobs::upsert_state(
             &state.root,
             job_id,
@@ -1129,6 +1164,14 @@ mod digest_bind_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(ok_state, "succeeded", "digest-bound python_runner should succeed");
+        {
+            let st = hub.read().await;
+            let j = st.jobs.get("job-ok").expect("job-ok");
+            let res = j.result.as_ref().expect("legacy result");
+            assert_eq!(res.status, "ok");
+            assert!(res.success);
+            assert_eq!(j.skill_digest.as_deref(), Some(rec.digest.as_str()));
+        }
 
         let err = submit_job(
             &hub,
@@ -1154,6 +1197,159 @@ mod digest_bind_tests {
             err.contains("digest") || err.contains("published"),
             "{err}"
         );
+
+        client.abort();
+        serve.abort();
+        let _ = fs::remove_dir_all(&master_root);
+        let _ = fs::remove_dir_all(&client_root);
+    }
+
+    fn write_status_skill(root: &Path, name: &str, statuses: &str) {
+        let dir = state::skills_dir(root).join(name);
+        fs::create_dir_all(dir.join("scripts")).unwrap();
+        fs::write(
+            dir.join("skill.json"),
+            format!(
+                r#"{{"schema_version":1,"name":"{name}","description":"t","params":[],"steps":[]}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"{{"version":"1.0.0","entry":{{"kind":"python_runner","path":"scripts/run.py"}},"secrets":[],"statuses":{statuses}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("scripts").join("run.py"),
+            "import json,sys\np=json.loads(sys.stdin.read() or '{}')\nprint(json.dumps({'skill_id':p.get('skill_id'),'version':p.get('version'),'digest':p.get('digest'),'status':(p.get('vars') or {}).get('status') or 'logged_in'}))\n",
+        )
+        .unwrap();
+    }
+
+    async fn wait_job(hub: &SharedHub, job_id: &str) -> JobRecord {
+        for _ in 0..100 {
+            {
+                let st = hub.read().await;
+                if let Some(j) = st.jobs.get(job_id) {
+                    if jobs::is_terminal(&j.state) || j.protocol_error.is_some() {
+                        return j.clone();
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timeout waiting for {job_id}");
+    }
+
+    #[tokio::test]
+    async fn custom_statuses_count_once_and_cross_reject() {
+        let master_root = tmp("ms");
+        let client_root = tmp("cs");
+        write_status_skill(
+            &master_root,
+            "pin-reg",
+            r#"[{"id":"logged_in","success":true,"retryable":false,"label":"已登录"},{"id":"email_confirmed","success":true,"retryable":false,"label":"邮箱已确认","optional":true},{"id":"oops_park","success":false,"retryable":true,"label":"风控先放"}]"#,
+        );
+        write_status_skill(
+            &master_root,
+            "ship-demo",
+            r#"[{"id":"shipped","success":true,"retryable":false,"label":"Shipped"},{"id":"returned","success":false,"retryable":true,"label":"Returned"}]"#,
+        );
+        profiles::create(&client_root, "noproxy", None, None).unwrap();
+        let pin = skill_pkg::pack_skill(&master_root, "pin-reg", Some("1.0.0"), true).unwrap();
+        let ship = skill_pkg::pack_skill(&master_root, "ship-demo", Some("1.0.0"), true).unwrap();
+
+        let port = free_port();
+        let bind = format!("127.0.0.1:{port}");
+        let token = "dev-token-test";
+        let hub = new_hub(&master_root, token);
+        write_master_meta(&master_root, &bind).unwrap();
+        let ctrl = control_sock_path(&master_root);
+        let hub_s = hub.clone();
+        let bind_s = bind.clone();
+        let serve = tokio::spawn(async move {
+            let _ = serve_with_control(&bind_s, hub_s, Some(ctrl)).await;
+        });
+        for _ in 0..80 {
+            if control_sock_path(&master_root).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let client = tokio::spawn({
+            let client_root = client_root.clone();
+            let bind = bind.clone();
+            async move {
+                let _ = client_daemon::run(ClientDaemonConfig {
+                    root: client_root,
+                    master: bind,
+                    token: token.into(),
+                    client_id: "box-st".into(),
+                })
+                .await;
+            }
+        });
+        for _ in 0..100 {
+            let st = hub.read().await;
+            if st.clients.get("box-st").map(|h| h.info.online).unwrap_or(false) {
+                break;
+            }
+            drop(st);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        push_skill_sync(&hub, "box-st", "pin-reg", Some("1.0.0"))
+            .await
+            .expect("sync pin");
+        push_skill_sync(&hub, "box-st", "ship-demo", Some("1.0.0"))
+            .await
+            .expect("sync ship");
+
+        let spec = |job_id: &str, skill: &str, digest: &str, status: &str| JobSubmit {
+            client_id: "box-st".into(),
+            job_id: job_id.into(),
+            skill_id: skill.into(),
+            profile: "noproxy".into(),
+            headed: false,
+            vars: json!({"status": status}),
+            version: Some("1.0.0".into()),
+            digest: Some(digest.into()),
+            account_id: None,
+            geo: None,
+        };
+
+        submit_job(&hub, spec("j-login", "pin-reg", &pin.digest, "logged_in"))
+            .await
+            .unwrap();
+        let rec = wait_job(&hub, "j-login").await;
+        assert_eq!(rec.result.as_ref().unwrap().status, "logged_in");
+        assert!(rec.success_counted);
+        assert_eq!(crate::ledger::success_count(&master_root, "pin-reg").unwrap(), 1);
+
+        submit_job(&hub, spec("j-oops", "pin-reg", &pin.digest, "oops_park"))
+            .await
+            .unwrap();
+        let rec = wait_job(&hub, "j-oops").await;
+        assert_eq!(rec.result.as_ref().unwrap().status, "oops_park");
+        assert!(!rec.success_counted);
+        assert_eq!(crate::ledger::success_count(&master_root, "pin-reg").unwrap(), 1);
+
+        submit_job(&hub, spec("j-cross", "pin-reg", &pin.digest, "shipped"))
+            .await
+            .unwrap();
+        let rec = wait_job(&hub, "j-cross").await;
+        assert!(rec.result.is_none(), "cross-skill status must not land");
+        assert!(rec.protocol_error.as_ref().unwrap().contains("unknown status"));
+        assert_eq!(crate::ledger::success_count(&master_root, "pin-reg").unwrap(), 1);
+
+        submit_job(&hub, spec("j-ship", "ship-demo", &ship.digest, "shipped"))
+            .await
+            .unwrap();
+        let rec = wait_job(&hub, "j-ship").await;
+        assert_eq!(rec.result.as_ref().unwrap().status, "shipped");
+        assert_eq!(crate::ledger::success_count(&master_root, "ship-demo").unwrap(), 1);
+        assert_eq!(crate::ledger::success_count(&master_root, "pin-reg").unwrap(), 1);
 
         client.abort();
         serve.abort();

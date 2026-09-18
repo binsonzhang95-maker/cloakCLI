@@ -117,6 +117,8 @@ cloakcli master job-state --job-id <id>
 
 **python_runner entry:** `skills/<name>/manifest.json` may set `"entry": {"kind": "python_runner", "path": "scripts/foo.py"}` (package-relative `.py`, fixed interpreter, argv array, no `shell=True`, secret **names** only). The runner is taken from the installed digest cache, not from the job JSON.
 
+**Per-skill terminal statuses:** optional `statuses` array on `manifest.json` is the only declaration source (unique non-empty `id`, `success`/`retryable` bools, non-empty `label`; `optional` is display-only). Omit the field for legacy `ok|failed|cancelled`. An empty or illegal array is refused at pack/install — no silent fallback. The job’s last non-empty stdout line must be a JSON object with `skill_id`/`version`/`digest`/`status`; master re-validates against **that job’s digest**, never the latest package. Success count = declared `success: true`, at most once per job. Ledger/UI is partitioned by `skill_id` (`cloakcli master ledger [--skill NAME]`); there is no global `email_confirmed` column. Fixtures: `skills/examples/pin-statuses`, `skills/examples/ship-statuses`.
+
 ### TUI keys
 
 Ops-console layout: **header** (shimmering `CloakCLI` / version / DEV STUB / headed / concurrency / hub) → **tabs** → **list+detail** → **context help** → **status**. Forms open as a centered modal. Lightweight shimmer on the brand, current pane title, and short busy text; ASCII `| / - \` throbber only while starting/refreshing the worker, running a skill, connecting the hub, or loading sessions. `NO_COLOR` or `CLOAKCLI_ANIMATIONS=0` freezes animation but still shows `[busy]` plus the wait reason.

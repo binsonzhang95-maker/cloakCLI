@@ -20,18 +20,37 @@ function fmtTime(unix) {
 export function runFromJobEvent(payload, profile) {
   if (!payload || typeof payload !== "object") return null;
   const jobId = payload.job_id || "pending";
+  const result = payload.result && typeof payload.result === "object" ? payload.result : null;
+  const fleet = payload.kind === "fleet" || payload.source === "fleet";
   return {
-    id: `teach:${jobId}`,
-    kind: "teach",
+    id: fleet ? `fleet:${jobId}` : `teach:${jobId}`,
+    kind: fleet ? "fleet" : "teach",
     job_id: jobId,
-    profile: profile || "",
-    skill: payload.skill || "",
+    profile: profile || payload.profile || "",
+    skill: payload.skill || payload.skill_id || (result && result.skill_id) || "",
     state: payload.state || "unknown",
+    status: result && result.status ? result.status : "",
+    label: result && result.label ? result.label : "",
+    success: result ? !!result.success : null,
+    digest: (result && result.digest) || payload.skill_digest || "",
     summary: payload.summary || "",
-    error: payload.error || null,
+    error: payload.error || payload.protocol_error || null,
+    protocol_error: payload.protocol_error || null,
     updated_at: Math.floor(Date.now() / 1000),
-    source: "teach_chat",
+    source: payload.source || "teach_chat",
   };
+}
+
+/** Group runs by skill_id. Columns are per-skill status/label — never a global email_confirmed field. */
+export function partitionRunsBySkill(runs) {
+  const list = Array.isArray(runs) ? runs : [];
+  const by = {};
+  for (const r of list) {
+    const key = r.skill || "(none)";
+    if (!by[key]) by[key] = [];
+    by[key].push(r);
+  }
+  return by;
 }
 
 export function openRunFromChat(jobId) {
@@ -73,6 +92,7 @@ export function renderRuns(root) {
         <div class="row-meta">${esc(r.profile || "—")}</div>
         <div class="row-meta">${esc(r.skill || "—")}</div>
         <div class="row-meta">${esc(r.state)}</div>
+        <div class="row-meta">${esc(r.status || r.label || "—")}</div>
       </div>`;
     })
     .join("");
@@ -97,6 +117,8 @@ export function renderRuns(root) {
       <span>state</span><span>${esc(selected.state)}</span>
       <span>profile</span><span>${esc(selected.profile || "—")}</span>
       <span>skill</span><span>${esc(selected.skill || "—")}</span>
+      <span>status</span><span>${esc(selected.status || "—")}</span>
+      <span>label</span><span>${esc(selected.label || "—")}</span>
       <span>source</span><span>${esc(selected.source || "—")}</span>
       <span>updated</span><span>${esc(fmtTime(selected.updated_at))}</span>
       <span>summary</span><span>${esc(selected.summary || "—")}</span>

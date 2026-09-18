@@ -593,7 +593,7 @@ fn detail_skill(app: &App) -> Vec<Line<'static>> {
     };
     let steps = s.steps.len();
     let params = s.params.len();
-    vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             format!("  {}", s.name),
             Style::default()
@@ -622,12 +622,46 @@ fn detail_skill(app: &App) -> Vec<Line<'static>> {
             truncate(&s.path.to_string_lossy(), 42),
             Style::default().fg(MUTED),
         ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Enter = run on selected profile (local)",
-            Style::default().fg(CHROME).add_modifier(Modifier::ITALIC),
-        )),
-    ]
+    ];
+    if let Ok(Some(m)) = crate::skill_pkg::load_manifest_file(&s.path) {
+        match m.statuses.as_ref() {
+            None => lines.push(kv(
+                "statuses",
+                "legacy ok|failed|cancelled".to_string(),
+                Style::default().fg(MUTED),
+            )),
+            Some(list) => {
+                let ids: Vec<String> = list
+                    .iter()
+                    .map(|st| {
+                        format!(
+                            "{}{}",
+                            st.id,
+                            if st.success { "*" } else { "" }
+                        )
+                    })
+                    .collect();
+                lines.push(kv(
+                    "statuses",
+                    truncate(&ids.join(", "), 42),
+                    Style::default().fg(FG),
+                ));
+            }
+        }
+    }
+    if let Ok(n) = crate::ledger::success_count(&app.root, &s.name) {
+        lines.push(kv(
+            "successes",
+            n.to_string(),
+            Style::default().fg(if n > 0 { OK } else { MUTED }),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Enter = run on selected profile (local)",
+        Style::default().fg(CHROME).add_modifier(Modifier::ITALIC),
+    )));
+    lines
 }
 
 fn detail_session(app: &App) -> Vec<Line<'static>> {
@@ -696,7 +730,7 @@ fn detail_client(app: &App) -> Vec<Line<'static>> {
         .map(|v| v.to_string())
         .unwrap_or_else(|| "-".into());
     let job_short = truncate(&job, 48);
-    vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             format!("  {}", c.client_id),
             Style::default()
@@ -720,12 +754,30 @@ fn detail_client(app: &App) -> Vec<Line<'static>> {
             Style::default().fg(FG),
         ),
         kv("job", job_short, Style::default().fg(WARN)),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  J = submit job (published digest; pack+sync first)",
-            Style::default().fg(CHROME).add_modifier(Modifier::ITALIC),
-        )),
-    ]
+    ];
+    if let Some(v) = &c.last_job_state {
+        if let Some(res) = v.get("result") {
+            let status = res.get("status").and_then(|s| s.as_str()).unwrap_or("-");
+            let label = res.get("label").and_then(|s| s.as_str()).unwrap_or("");
+            lines.push(kv(
+                "result",
+                truncate(&format!("{status} {label}"), 42),
+                Style::default().fg(FG),
+            ));
+        } else if let Some(pe) = v.get("protocol_error").and_then(|s| s.as_str()) {
+            lines.push(kv(
+                "protocol",
+                truncate(pe, 42),
+                Style::default().fg(WARN),
+            ));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  J = submit job (published digest; pack+sync first)",
+        Style::default().fg(CHROME).add_modifier(Modifier::ITALIC),
+    )));
+    lines
 }
 
 fn hint_line(msg: &str) -> Line<'static> {
