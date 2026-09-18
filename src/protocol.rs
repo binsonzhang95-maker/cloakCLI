@@ -1,5 +1,10 @@
 //! Versioned JSON messages for master ↔ client (outbound long-lived TCP).
-//! MVP stub — TCP JSONL now; schema ready for WebSocket/TLS later.
+//! DEV STUB: plaintext TCP JSONL + shared token. Schema is ready for WebSocket/TLS later.
+//! TODO(prod): replace this hub with authenticated TLS/mTLS (or a controlled tunnel).
+//!
+//! Types: `hello` / `hello_ok`, `heartbeat`, `job_submit` / `job_state` / `job_cancel`,
+//! `config_update` / `config_ack`, `skill_sync` / `skill_sync_ack`, `log_chunk`.
+//! `job_submit` carries `skill_id + version + digest` (no local same-name fallback).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

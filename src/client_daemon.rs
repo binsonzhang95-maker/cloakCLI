@@ -2,6 +2,8 @@
 //! NAT-friendly — no inbound port required on the client.
 //!
 //! DEV STUB: plaintext TCP + shared token. Cancel kills local oneshot worker.
+//! TODO(prod): authenticated TLS/mTLS (or a controlled tunnel). Digest checks
+//! do not replace source authentication.
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -20,6 +22,7 @@ use crate::jobs;
 use crate::locks::ProfileLock;
 use crate::profiles;
 use crate::protocol::{ConfigRevision, Envelope, PROTOCOL_VERSION};
+use crate::skill_pkg;
 use crate::skills;
 use crate::state;
 use crate::worker::{self, Request as WorkerReq};
@@ -86,8 +89,11 @@ async fn connect_session(cfg: &ClientDaemonConfig) -> Result<()> {
                 "protocol": PROTOCOL_VERSION,
                 "cancel": true,
                 "config_update": true,
+                "skill_sync": true,
+                "skill_digest": true,
             },
             "observed": obs_snapshot,
+            "installed_skills": skill_pkg::installed_for_hello(&cfg.root),
         }));
     send_line(&writer, &hello).await?;
 
@@ -143,6 +149,7 @@ async fn connect_session(cfg: &ClientDaemonConfig) -> Result<()> {
                     .with_data(json!({
                         "daemon_running": st.running,
                         "observed": obs,
+                        "installed_skills": skill_pkg::installed_for_hello(&root),
                     }));
                 send_line(&writer_hb, &env).await?;
             }
@@ -190,16 +197,14 @@ async fn connect_session(cfg: &ClientDaemonConfig) -> Result<()> {
                         handle_config_update(&client_id, &env, &observed, &writer).await?;
                     }
                     "skill_sync" => {
-                        eprintln!("[client] skill_sync stub (hashes/TODO) — ack only");
-                        let ack = Envelope::new("config_ack")
-                            .with_client(&client_id)
-                            .with_data(json!({
-                                "kind": "skill_sync",
-                                "ok": false,
-                                "error": "skill_sync not implemented (dev stub)",
-                                "observed": observed.lock().await.clone(),
-                            }));
-                        send_line(&writer, &ack).await?;
+                        let writer = writer.clone();
+                        let root = root.clone();
+                        let client_id = client_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_skill_sync(&root, &client_id, &env, &writer).await {
+                                eprintln!("[client] skill_sync error: {e}");
+                            }
+                        });
                     }
                     "error" => {
                         eprintln!("[client] master error: {:?}", env.data);
@@ -275,6 +280,81 @@ async fn send_line<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+async fn handle_skill_sync<W: AsyncWriteExt + Unpin>(
+    root: &Path,
+    client_id: &str,
+    env: &Envelope,
+    writer: &Arc<Mutex<W>>,
+) -> Result<()> {
+    let skill_id = env
+        .data
+        .get("skill_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let version = env
+        .data
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let digest = env
+        .data
+        .get("digest")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let size = env.data.get("size").and_then(|v| v.as_u64());
+
+    let result = (|| -> Result<skill_pkg::InstalledSkill> {
+        if skill_id.is_empty() || digest.is_empty() {
+            bail!("skill_sync requires skill_id and digest");
+        }
+        let b64 = env
+            .data
+            .get("package_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("skill_sync missing package_b64"))?;
+        let bytes = skill_pkg::decode_package_b64(b64)?;
+        if let Some(sz) = size {
+            if sz != bytes.len() as u64 {
+                bail!("package size mismatch: b64 decoded {} bytes, header size {sz}", bytes.len());
+            }
+        }
+        skill_pkg::install_package(root, &skill_id, &version, &digest, &bytes)
+    })();
+
+    let (ok, error, ack_digest) = match &result {
+        Ok(inst) => {
+            eprintln!(
+                "[client] skill_sync installed {}@{} digest={}",
+                inst.skill_id, inst.version, inst.digest
+            );
+            (true, None, inst.digest.clone())
+        }
+        Err(e) => {
+            eprintln!("[client] skill_sync failed: {e}");
+            (false, Some(e.to_string()), digest)
+        }
+    };
+
+    let mut ack = Envelope::new("skill_sync_ack")
+        .with_client(client_id)
+        .with_data(json!({
+            "kind": "skill_sync",
+            "ok": ok,
+            "skill_id": skill_id,
+            "version": version,
+            "digest": ack_digest,
+            "error": error,
+        }));
+    if let Some(rid) = &env.request_id {
+        ack = ack.with_request(rid);
+    }
+    send_line(writer, &ack).await?;
+    Ok(())
+}
+
 async fn handle_job<W: AsyncWriteExt + Unpin + Send + 'static>(
     root: &Path,
     client_id: &str,
@@ -290,9 +370,26 @@ async fn handle_job<W: AsyncWriteExt + Unpin + Send + 'static>(
         .to_string();
     let skill_name = env
         .data
-        .get("skill")
+        .get("skill_id")
+        .or_else(|| env.data.get("skill"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("skill required"))?
+        .ok_or_else(|| anyhow::anyhow!("skill_id required"))?
+        .to_string();
+    let version = env
+        .data
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let digest = env
+        .data
+        .get("digest")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "job_submit requires skill digest (no local same-name fallback)"
+            )
+        })?
         .to_string();
     let profile = env
         .data
@@ -306,6 +403,12 @@ async fn handle_job<W: AsyncWriteExt + Unpin + Send + 'static>(
         .and_then(|v| v.as_bool())
         .unwrap_or_else(state::default_headed);
     let vars = env.data.get("vars").cloned().unwrap_or(json!({}));
+    let timeout_secs = env
+        .data
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(300);
+    skills::assert_no_plaintext_secrets(&vars)?;
 
     // Idempotent recovery: if already terminal locally, report and skip re-run.
     if let Ok(Some(existing)) = jobs::load(root, &job_id) {
@@ -369,36 +472,68 @@ async fn handle_job<W: AsyncWriteExt + Unpin + Send + 'static>(
         if cancel_flag.load(Ordering::SeqCst) {
             bail!("cancelled before start");
         }
-        let _lock = ProfileLock::acquire(root, &profile, Duration::from_secs(300)).await?;
+        let _lock = ProfileLock::acquire(root, &profile, Duration::from_secs(timeout_secs)).await?;
         let prof = profiles::get(root, &profile)?;
-        let skill = skills::get(root, &skill_name)?;
-        let resp = worker::oneshot_killable(
-            root,
-            WorkerReq {
-                id: worker::next_id(),
-                cmd: "run_skill".into(),
-                profile: Some(prof.name.clone()),
-                url: None,
-                headed: Some(headed),
-                skill: Some(skill.name.clone()),
-                vars: Some(vars),
-                session: None,
-                proxy: prof.proxy.clone(),
-                user_data_dir: Some(prof.user_data_dir.clone()),
-                skill_path: Some(skill.path.join("skill.json").to_string_lossy().to_string()),
-                root: Some(root.to_string_lossy().to_string()),
-                cookie_file: cookies::cookie_file_for_open(root, &prof.name)?,
-            },
-            cancel_flag.clone(),
-        )
-        .await?;
-        if cancel_flag.load(Ordering::SeqCst) {
-            bail!("cancelled");
+        // Digest cache only — never fall back to skills/<name> on this node.
+        let pkg_dir = skill_pkg::lookup_installed(root, &skill_name, &digest)?;
+        let manifest = skill_pkg::entry_from_package(&pkg_dir)?;
+        match manifest.entry.kind {
+            skill_pkg::SkillEntryKind::PythonRunner => {
+                let rel = manifest
+                    .entry
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("python_runner missing path"))?;
+                let payload = json!({
+                    "job_id": job_id,
+                    "skill_id": skill_name,
+                    "version": version,
+                    "digest": digest,
+                    "profile": profile,
+                    "geo": env.data.get("geo"),
+                    "account_id": env.data.get("account_id"),
+                    "vars": vars.clone(),
+                });
+                skill_pkg::run_python_runner(
+                    &pkg_dir,
+                    rel,
+                    &payload,
+                    Some(cancel_flag.clone()),
+                    Duration::from_secs(timeout_secs),
+                )
+                .await
+            }
+            skill_pkg::SkillEntryKind::SkillSteps => {
+                let skill_json = pkg_dir.join("skill.json");
+                let resp = worker::oneshot_killable(
+                    root,
+                    WorkerReq {
+                        id: worker::next_id(),
+                        cmd: "run_skill".into(),
+                        profile: Some(prof.name.clone()),
+                        url: None,
+                        headed: Some(headed),
+                        skill: Some(skill_name.clone()),
+                        vars: Some(vars),
+                        session: None,
+                        proxy: prof.proxy.clone(),
+                        user_data_dir: Some(prof.user_data_dir.clone()),
+                        skill_path: Some(skill_json.to_string_lossy().to_string()),
+                        root: Some(root.to_string_lossy().to_string()),
+                        cookie_file: cookies::cookie_file_for_open(root, &prof.name)?,
+                    },
+                    cancel_flag.clone(),
+                )
+                .await?;
+                if cancel_flag.load(Ordering::SeqCst) {
+                    bail!("cancelled");
+                }
+                if !resp.ok {
+                    bail!(resp.error.unwrap_or_else(|| "run_skill failed".into()));
+                }
+                Ok(resp.data.unwrap_or(json!({})))
+            }
         }
-        if !resp.ok {
-            bail!(resp.error.unwrap_or_else(|| "run_skill failed".into()));
-        }
-        Ok::<_, anyhow::Error>(resp.data.unwrap_or(json!({})))
     }
     .await;
 

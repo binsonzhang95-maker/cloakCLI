@@ -100,7 +100,8 @@ pub enum MasterCmd {
         #[arg(long, default_value = "dev-token", env = "CLOAKCLI_MASTER_TOKEN")]
         token: String,
     },
-    /// Submit a job to a connected client (via master control socket)
+    /// Submit a job to a connected client (via master control socket).
+    /// Requires a **published** skill digest the client already ACK'd (`master skill-sync`).
     Submit {
         #[arg(long)]
         client: String,
@@ -115,6 +116,42 @@ pub enum MasterCmd {
         /// Optional stable job id (idempotent if already terminal)
         #[arg(long)]
         job_id: Option<String>,
+        /// Published skill version (default: latest published)
+        #[arg(long)]
+        version: Option<String>,
+        /// SHA-256 digest of the published package (must match catalog + client ACK)
+        #[arg(long)]
+        digest: Option<String>,
+        #[arg(long)]
+        account_id: Option<String>,
+        #[arg(long)]
+        geo: Option<String>,
+    },
+    /// Pack `skills/<name>/` into tar + SHA-256 and store a master release record
+    SkillPack {
+        #[arg(long)]
+        skill: String,
+        #[arg(long)]
+        version: Option<String>,
+        /// Leave unpublished (jobs cannot bind this digest until `skill-publish`)
+        #[arg(long)]
+        draft: bool,
+    },
+    /// Mark a packed release published so jobs may bind its digest
+    SkillPublish {
+        #[arg(long)]
+        skill: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Push a published package to a connected client (`skill_sync`) and wait for ACK
+    SkillSync {
+        #[arg(long)]
+        client: String,
+        #[arg(long)]
+        skill: String,
+        #[arg(long)]
+        version: Option<String>,
     },
     /// List clients currently connected to the running master hub
     Clients,
@@ -423,6 +460,8 @@ pub enum BrowserCmd {
 #[derive(Subcommand, Debug)]
 pub enum SkillCmd {
     List,
+    /// DEBUG ONLY: run a local skill (test account / isolated profile).
+    /// Production / fleet batch must use `cloakcli master submit` after skill-sync.
     Run {
         name: String,
         #[arg(long)]
@@ -717,6 +756,9 @@ pub async fn handle_skill(root: &Path, action: SkillCmd) -> Result<()> {
             headless,
             vars,
         } => {
+            eprintln!(
+                "note: `cloakcli skill run` is DEBUG ONLY (local test account / isolated profile). Fleet batch uses `cloakcli master submit` after skill-pack + skill-sync."
+            );
             let skill = skills::get(root, &name)?;
             let prof = profiles::get(root, &profile)?;
             let headed = resolve_headed(headed, headless);
@@ -727,7 +769,31 @@ pub async fn handle_skill(root: &Path, action: SkillCmd) -> Result<()> {
                     .with_context(|| format!("--var expects KEY=VALUE, got {v}"))?;
                 var_map.insert(k.to_string(), serde_json::Value::String(val.to_string()));
             }
+            let vars_json = serde_json::Value::Object(var_map);
+            crate::skills::assert_no_plaintext_secrets(&vars_json)?;
             let _lock = ProfileLock::acquire(root, &prof.name, Duration::from_secs(300)).await?;
+            if let Ok(Some(manifest)) = crate::skill_pkg::load_manifest_file(&skill.path) {
+                if manifest.entry.kind == crate::skill_pkg::SkillEntryKind::PythonRunner {
+                    let rel = manifest.entry.path.as_deref().unwrap_or("");
+                    let payload = serde_json::json!({
+                        "skill_id": skill.name,
+                        "version": manifest.version,
+                        "profile": prof.name,
+                        "vars": vars_json,
+                        "debug_local": true,
+                    });
+                    let data = crate::skill_pkg::run_python_runner(
+                        &skill.path,
+                        rel,
+                        &payload,
+                        None,
+                        Duration::from_secs(300),
+                    )
+                    .await?;
+                    println!("{}", serde_json::to_string_pretty(&data)?);
+                    return Ok(());
+                }
+            }
             let resp = worker::oneshot(
                 root,
                 Request {
@@ -737,7 +803,7 @@ pub async fn handle_skill(root: &Path, action: SkillCmd) -> Result<()> {
                     url: None,
                     headed: Some(headed),
                     skill: Some(skill.name.clone()),
-                    vars: Some(serde_json::Value::Object(var_map)),
+                    vars: Some(vars_json),
                     session: None,
                     proxy: prof.proxy.clone(),
                     user_data_dir: Some(prof.user_data_dir.clone()),
@@ -985,6 +1051,10 @@ pub async fn handle_master(root: &Path, action: MasterCmd) -> Result<()> {
             headed,
             headless,
             job_id,
+            version,
+            digest,
+            account_id,
+            geo,
         } => {
             let headed = if headed {
                 true
@@ -997,16 +1067,63 @@ pub async fn handle_master(root: &Path, action: MasterCmd) -> Result<()> {
                 "cmd": "submit",
                 "client_id": client,
                 "skill": skill,
+                "skill_id": skill,
                 "profile": profile,
                 "headed": headed,
             });
             if let Some(jid) = job_id {
                 body["job_id"] = serde_json::Value::String(jid);
             }
+            if let Some(v) = version {
+                body["version"] = serde_json::Value::String(v);
+            }
+            if let Some(d) = digest {
+                body["digest"] = serde_json::Value::String(d);
+            }
+            if let Some(a) = account_id {
+                body["account_id"] = serde_json::Value::String(a);
+            }
+            if let Some(g) = geo {
+                body["geo"] = serde_json::Value::String(g);
+            }
             let resp = crate::master_hub::control_request(root, body).await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
             if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
                 bail!("{}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("submit failed"));
+            }
+            Ok(())
+        }
+        MasterCmd::SkillPack {
+            skill,
+            version,
+            draft,
+        } => {
+            let rec = crate::skill_pkg::pack_skill(root, &skill, version.as_deref(), !draft)?;
+            println!("{}", serde_json::to_string_pretty(&crate::skill_pkg::release_to_json(&rec))?);
+            Ok(())
+        }
+        MasterCmd::SkillPublish { skill, version } => {
+            let rec = crate::skill_pkg::publish_skill(root, &skill, version.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&crate::skill_pkg::release_to_json(&rec))?);
+            Ok(())
+        }
+        MasterCmd::SkillSync {
+            client,
+            skill,
+            version,
+        } => {
+            let mut body = serde_json::json!({
+                "cmd": "skill_sync",
+                "client_id": client,
+                "skill": skill,
+            });
+            if let Some(v) = version {
+                body["version"] = serde_json::Value::String(v);
+            }
+            let resp = crate::master_hub::control_request(root, body).await?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+            if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
+                bail!("{}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("skill-sync failed"));
             }
             Ok(())
         }

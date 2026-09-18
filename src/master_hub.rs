@@ -2,6 +2,8 @@
 //! Clients dial in (NAT-friendly); master never requires inbound on clients.
 //!
 //! DEV STUB: plaintext TCP JSONL + shared token — not production security.
+//! TODO(prod): replace plaintext shared-token hub with authenticated TLS/mTLS
+//! or a controlled tunnel. Digest checks do not replace source authentication.
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -15,6 +17,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::jobs::{self, JobRecord};
 use crate::protocol::{ConfigRevision, Envelope, PROTOCOL_VERSION};
+use crate::skill_pkg::{self, InstalledSkill};
 
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
@@ -24,6 +27,9 @@ pub struct ClientInfo {
     pub capabilities: serde_json::Value,
     pub observed: ConfigRevision,
     pub last_job_state: Option<serde_json::Value>,
+    /// skill_id → last ACK'd installed digest (from hello / skill_sync_ack).
+    pub installed_skills: HashMap<String, InstalledSkill>,
+    pub last_skill_sync: Option<serde_json::Value>,
 }
 
 struct ClientHandle {
@@ -206,6 +212,11 @@ async fn handle_control(stream: tokio::net::UnixStream, hub: SharedHub) -> Resul
                         "observed_revision": c.observed.revision,
                         "desired_revision": state.desired.revision,
                         "last_job_state": c.last_job_state,
+                        "installed_skills": c.installed_skills.values().map(|s| json!({
+                            "skill_id": s.skill_id,
+                            "version": s.version,
+                            "digest": s.digest,
+                        })).collect::<Vec<_>>(),
                     })
                 })
                 .collect();
@@ -213,7 +224,11 @@ async fn handle_control(stream: tokio::net::UnixStream, hub: SharedHub) -> Resul
         }
         "submit" => {
             let client_id = req.get("client_id").and_then(|v| v.as_str()).unwrap_or("");
-            let skill = req.get("skill").and_then(|v| v.as_str()).unwrap_or("hello");
+            let skill = req
+                .get("skill_id")
+                .or_else(|| req.get("skill"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("hello");
             let profile = req.get("profile").and_then(|v| v.as_str()).unwrap_or("noproxy");
             let headed = req.get("headed").and_then(|v| v.as_bool()).unwrap_or(false);
             let job_id = req
@@ -221,18 +236,63 @@ async fn handle_control(stream: tokio::net::UnixStream, hub: SharedHub) -> Resul
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-            match submit_job(
-                &hub,
-                client_id,
-                &job_id,
-                skill,
-                profile,
+            let spec = JobSubmit {
+                client_id: client_id.to_string(),
+                job_id: job_id.clone(),
+                skill_id: skill.to_string(),
+                profile: profile.to_string(),
                 headed,
-                req.get("vars").cloned().unwrap_or(json!({})),
-            )
-            .await
-            {
-                Ok(()) => json!({"ok": true, "job_id": job_id}),
+                vars: req.get("vars").cloned().unwrap_or(json!({})),
+                version: req
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                digest: req
+                    .get("digest")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                account_id: req
+                    .get("account_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                geo: req.get("geo").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            };
+            match submit_job(&hub, spec).await {
+                Ok(rec) => json!({
+                    "ok": true,
+                    "job_id": rec.job_id,
+                    "skill_id": rec.skill,
+                    "version": rec.skill_version,
+                    "digest": rec.skill_digest,
+                }),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+        "skill_pack" => {
+            let skill = req.get("skill").and_then(|v| v.as_str()).unwrap_or("");
+            let version = req.get("version").and_then(|v| v.as_str());
+            let draft = req.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
+            let root = hub.read().await.root.clone();
+            match skill_pkg::pack_skill(&root, skill, version, !draft) {
+                Ok(rec) => json!({"ok": true, "release": skill_pkg::release_to_json(&rec)}),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+        "skill_publish" => {
+            let skill = req.get("skill").and_then(|v| v.as_str()).unwrap_or("");
+            let version = req.get("version").and_then(|v| v.as_str());
+            let root = hub.read().await.root.clone();
+            match skill_pkg::publish_skill(&root, skill, version) {
+                Ok(rec) => json!({"ok": true, "release": skill_pkg::release_to_json(&rec)}),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+        "skill_sync" => {
+            let client_id = req.get("client_id").and_then(|v| v.as_str()).unwrap_or("");
+            let skill = req.get("skill").and_then(|v| v.as_str()).unwrap_or("");
+            let version = req.get("version").and_then(|v| v.as_str());
+            match push_skill_sync(&hub, client_id, skill, version).await {
+                Ok(rec) => json!({"ok": true, "release": skill_pkg::release_to_json(&rec)}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
         }
@@ -385,6 +445,12 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) -> Result<()> {
                 )
                 .unwrap_or_default();
 
+                let installed = env
+                    .data
+                    .get("installed_skills")
+                    .map(skill_pkg::parse_installed_list)
+                    .unwrap_or_default();
+
                 let info = ClientInfo {
                     client_id: cid.clone(),
                     last_seen: Instant::now(),
@@ -392,6 +458,8 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) -> Result<()> {
                     capabilities: caps,
                     observed,
                     last_job_state: None,
+                    installed_skills: installed,
+                    last_skill_sync: None,
                 };
 
                 {
@@ -429,6 +497,44 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) -> Result<()> {
                         if let Some(obs) = env.data.get("observed") {
                             if let Ok(o) = serde_json::from_value::<ConfigRevision>(obs.clone()) {
                                 h.info.observed = o;
+                            }
+                        }
+                        if let Some(inst) = env.data.get("installed_skills") {
+                            h.info.installed_skills = skill_pkg::parse_installed_list(inst);
+                        }
+                    }
+                }
+            }
+            "skill_sync_ack" => {
+                let cid = env.client_id.clone().or(client_id.clone()).unwrap_or_default();
+                let mut state = hub.write().await;
+                let mut ack = env.data.clone();
+                if let Some(rid) = &env.request_id {
+                    ack["request_id"] = json!(rid);
+                }
+                state.push_log(format!(
+                    "{cid} skill_sync_ack: {}",
+                    serde_json::to_string(&ack).unwrap_or_default()
+                ));
+                if let Some(h) = state.clients.get_mut(&cid) {
+                    h.info.last_skill_sync = Some(ack.clone());
+                    let ok = ack.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if ok {
+                        if let (Some(sid), Some(ver), Some(dig)) = (
+                            ack.get("skill_id").and_then(|v| v.as_str()),
+                            ack.get("version").and_then(|v| v.as_str()),
+                            ack.get("digest").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(digest) = skill_pkg::normalize_digest(dig) {
+                                h.info.installed_skills.insert(
+                                    sid.to_string(),
+                                    InstalledSkill {
+                                        skill_id: sid.to_string(),
+                                        version: ver.to_string(),
+                                        digest,
+                                        installed_at: chrono::Utc::now().timestamp(),
+                                    },
+                                );
                             }
                         }
                     }
@@ -521,64 +627,230 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) -> Result<()> {
     Ok(())
 }
 
+/// Digest-bound job submit. Caller may omit version/digest to use the latest published release.
+#[derive(Debug, Clone)]
+pub struct JobSubmit {
+    pub client_id: String,
+    pub job_id: String,
+    pub skill_id: String,
+    pub profile: String,
+    pub headed: bool,
+    pub vars: serde_json::Value,
+    pub version: Option<String>,
+    pub digest: Option<String>,
+    pub account_id: Option<String>,
+    pub geo: Option<String>,
+}
+
 /// Submit a job to a connected client.
 /// Idempotent: if job_id already terminal on disk, do not re-dispatch (return Ok).
-pub async fn submit_job(
-    hub: &SharedHub,
-    client_id: &str,
-    job_id: &str,
-    skill: &str,
-    profile: &str,
-    headed: bool,
-    vars: serde_json::Value,
-) -> Result<()> {
+/// Requires a published skill digest that the target client has ACK'd via skill_sync.
+pub async fn submit_job(hub: &SharedHub, spec: JobSubmit) -> Result<JobRecord> {
+    crate::skills::assert_no_plaintext_secrets(&spec.vars)?;
+    let client_id = spec.client_id.as_str();
+    let job_id = spec.job_id.as_str();
+
     {
+        let state = hub.read().await;
+        if let Some(existing) = state.jobs.get(job_id) {
+            if jobs::is_terminal(&existing.state) {
+                return Ok(existing.clone());
+            }
+        }
+    }
+
+    let release = {
+        let state = hub.read().await;
+        skill_pkg::resolve_published(
+            &state.root,
+            &spec.skill_id,
+            spec.version.as_deref(),
+            spec.digest.as_deref(),
+        )?
+    };
+
+    {
+        let state = hub.read().await;
+        let Some(h) = state.clients.get(client_id) else {
+            bail!("client not connected: {client_id}");
+        };
+        if !h.info.online {
+            bail!("client offline: {client_id}");
+        }
+        if !skill_pkg::client_has_digest(&h.info.installed_skills, &spec.skill_id, &release.digest)
+        {
+            bail!(
+                "client {client_id} has not ACK'd skill '{}' digest {} — run `cloakcli master skill-sync --client {client_id} --skill {}` first",
+                spec.skill_id,
+                release.digest,
+                spec.skill_id
+            );
+        }
+    }
+
+    let rec = {
         let mut state = hub.write().await;
         if let Some(existing) = state.jobs.get(job_id) {
             if jobs::is_terminal(&existing.state) {
-                let st = existing.state.clone();
-                state.push_log(format!("job {job_id} already {st} — idempotent skip"));
-                return Ok(());
+                let rec = existing.clone();
+                state.push_log(format!(
+                    "job {job_id} already {} — idempotent skip",
+                    rec.state
+                ));
+                return Ok(rec);
             }
         }
         let rec = jobs::upsert_state(
             &state.root,
             job_id,
             client_id,
-            skill,
-            profile,
-            headed,
+            &spec.skill_id,
+            &spec.profile,
+            spec.headed,
             "queued",
             None,
             None,
         )?;
-        state.jobs.insert(job_id.to_string(), rec);
-        state.push_log(format!("submit {job_id} → {client_id} skill={skill}"));
-    }
-
-    let state = hub.read().await;
-    let Some(h) = state.clients.get(client_id) else {
-        bail!("client not connected: {client_id}");
+        let rec = jobs::set_binding(
+            &state.root,
+            job_id,
+            Some(&release.version),
+            Some(&release.digest),
+            spec.account_id.as_deref(),
+            spec.geo.as_deref(),
+        )
+        .unwrap_or(rec);
+        state.jobs.insert(job_id.to_string(), rec.clone());
+        state.push_log(format!(
+            "submit {job_id} → {client_id} skill={}@{} digest={}",
+            spec.skill_id, release.version, release.digest
+        ));
+        rec
     };
-    if !h.info.online {
-        bail!("client offline: {client_id}");
-    }
+
     let env = Envelope::new("job_submit")
         .with_client(client_id)
         .with_request(job_id)
         .with_data(json!({
             "job_id": job_id,
-            "skill": skill,
-            "profile": profile,
-            "headed": headed,
-            "vars": vars,
+            "skill": spec.skill_id,
+            "skill_id": spec.skill_id,
+            "version": release.version,
+            "digest": release.digest,
+            "profile": spec.profile,
+            "geo": spec.geo,
+            "account_id": spec.account_id,
+            "headed": spec.headed,
+            "vars": spec.vars,
             "timeout_secs": 300,
         }));
     let line = serde_json::to_string(&env)?;
-    h.tx
-        .send(line)
-        .map_err(|_| anyhow::anyhow!("failed to send to client {client_id}"))?;
-    Ok(())
+    {
+        let state = hub.read().await;
+        let Some(h) = state.clients.get(client_id) else {
+            bail!("client not connected: {client_id}");
+        };
+        h.tx
+            .send(line)
+            .map_err(|_| anyhow::anyhow!("failed to send to client {client_id}"))?;
+    }
+    Ok(rec)
+}
+
+/// Push a published package to a connected client and wait for skill_sync_ack.
+pub async fn push_skill_sync(
+    hub: &SharedHub,
+    client_id: &str,
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<skill_pkg::ReleaseRecord> {
+    if client_id.is_empty() {
+        bail!("client_id required");
+    }
+    if skill_id.is_empty() {
+        bail!("skill required");
+    }
+    let release = {
+        let state = hub.read().await;
+        skill_pkg::resolve_published(&state.root, skill_id, version, None)?
+    };
+    let bytes = {
+        let state = hub.read().await;
+        skill_pkg::read_package_bytes(&state.root, &release)?
+    };
+    let req_id = uuid::Uuid::new_v4().simple().to_string();
+    let env = Envelope::new("skill_sync")
+        .with_client(client_id)
+        .with_request(&req_id)
+        .with_data(json!({
+            "skill_id": release.skill_id,
+            "version": release.version,
+            "digest": release.digest,
+            "package_b64": skill_pkg::encode_package_b64(&bytes),
+            "size": bytes.len(),
+        }));
+    let line = serde_json::to_string(&env)?;
+
+    {
+        let mut state = hub.write().await;
+        let Some(h) = state.clients.get_mut(client_id) else {
+            bail!("client not connected: {client_id}");
+        };
+        if !h.info.online {
+            bail!("client offline: {client_id}");
+        }
+        h.info.last_skill_sync = None;
+        h.tx
+            .send(line)
+            .map_err(|_| anyhow::anyhow!("failed to send skill_sync to {client_id}"))?;
+        state.push_log(format!(
+            "skill_sync → {client_id} skill={}@{} digest={}",
+            release.skill_id, release.version, release.digest
+        ));
+    }
+
+    wait_skill_sync_ack(hub, client_id, &req_id, &release.digest, Duration::from_secs(20)).await?;
+    Ok(release)
+}
+
+async fn wait_skill_sync_ack(
+    hub: &SharedHub,
+    client_id: &str,
+    request_id: &str,
+    digest: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        {
+            let state = hub.read().await;
+            if let Some(h) = state.clients.get(client_id) {
+                if let Some(ack) = &h.info.last_skill_sync {
+                    let rid = ack.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let d = ack.get("digest").and_then(|v| v.as_str()).unwrap_or("");
+                    let ok_digest = skill_pkg::normalize_digest(d).ok()
+                        == skill_pkg::normalize_digest(digest).ok();
+                    if rid == request_id || ok_digest {
+                        let ok = ack.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if ok {
+                            return Ok(());
+                        }
+                        let err = ack
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("skill_sync failed");
+                        bail!("{err}");
+                    }
+                }
+            } else {
+                bail!("client disconnected during skill_sync: {client_id}");
+            }
+        }
+        if start.elapsed() > timeout {
+            bail!("timeout waiting for skill_sync ACK (digest={digest})");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Cancel job on client (client must stop local worker work).
@@ -701,5 +973,191 @@ pub async fn reap_stale(hub: &SharedHub) {
         if h.info.online && now.duration_since(h.info.last_seen) > Duration::from_secs(60) {
             h.info.online = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod digest_bind_tests {
+    use super::*;
+    use crate::client_daemon::{self, ClientDaemonConfig};
+    use crate::profiles;
+    use crate::state;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp(prefix: &str) -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("cloakcli_{prefix}_{n}"));
+        fs::create_dir_all(p.join("skills")).unwrap();
+        fs::create_dir_all(p.join("data")).unwrap();
+        fs::create_dir_all(p.join("profiles")).unwrap();
+        p
+    }
+
+    fn write_echo(root: &Path) {
+        let dir = state::skills_dir(root).join("echo-runner");
+        fs::create_dir_all(dir.join("scripts")).unwrap();
+        fs::write(
+            dir.join("skill.json"),
+            r#"{"schema_version":1,"name":"echo-runner","description":"t","params":[],"steps":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("manifest.json"),
+            r#"{"version":"1.0.0","entry":{"kind":"python_runner","path":"scripts/echo.py"},"secrets":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("scripts").join("echo.py"),
+            "import json,sys\np=json.loads(sys.stdin.read() or '{}')\nprint(json.dumps({'ok': True, 'echo': True, 'digest': p.get('digest')}))\n",
+        )
+        .unwrap();
+    }
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn pack_sync_submit_and_reject_wrong_digest() {
+        let master_root = tmp("m");
+        let client_root = tmp("c");
+        write_echo(&master_root);
+        let decoy = state::skills_dir(&client_root).join("echo-runner");
+        fs::create_dir_all(&decoy).unwrap();
+        fs::write(
+            decoy.join("skill.json"),
+            r#"{"schema_version":1,"name":"echo-runner","steps":[]}"#,
+        )
+        .unwrap();
+        profiles::create(&client_root, "noproxy", None, None).unwrap();
+
+        let rec = skill_pkg::pack_skill(&master_root, "echo-runner", Some("1.0.0"), true).unwrap();
+
+        let port = free_port();
+        let bind = format!("127.0.0.1:{port}");
+        let token = "dev-token-test";
+        let hub = new_hub(&master_root, token);
+        write_master_meta(&master_root, &bind).unwrap();
+        let ctrl = control_sock_path(&master_root);
+        let hub_s = hub.clone();
+        let bind_s = bind.clone();
+        let serve = tokio::spawn(async move {
+            let _ = serve_with_control(&bind_s, hub_s, Some(ctrl)).await;
+        });
+
+        for _ in 0..80 {
+            if control_sock_path(&master_root).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let client = tokio::spawn({
+            let client_root = client_root.clone();
+            let bind = bind.clone();
+            async move {
+                let _ = client_daemon::run(ClientDaemonConfig {
+                    root: client_root,
+                    master: bind,
+                    token: token.into(),
+                    client_id: "test-box".into(),
+                })
+                .await;
+            }
+        });
+
+        let mut online = false;
+        for _ in 0..100 {
+            {
+                let st = hub.read().await;
+                if st
+                    .clients
+                    .get("test-box")
+                    .map(|h| h.info.online)
+                    .unwrap_or(false)
+                {
+                    online = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(online, "client never registered");
+
+        push_skill_sync(&hub, "test-box", "echo-runner", Some("1.0.0"))
+            .await
+            .expect("skill_sync");
+
+        let job = submit_job(
+            &hub,
+            JobSubmit {
+                client_id: "test-box".into(),
+                job_id: "job-ok".into(),
+                skill_id: "echo-runner".into(),
+                profile: "noproxy".into(),
+                headed: false,
+                vars: json!({}),
+                version: Some("1.0.0".into()),
+                digest: Some(rec.digest.clone()),
+                account_id: None,
+                geo: Some("geo01".into()),
+            },
+        )
+        .await
+        .expect("submit matching digest");
+        assert_eq!(job.skill_digest.as_deref(), Some(rec.digest.as_str()));
+
+        let mut ok_state = String::new();
+        for _ in 0..100 {
+            {
+                let st = hub.read().await;
+                if let Some(j) = st.jobs.get("job-ok") {
+                    if jobs::is_terminal(&j.state) {
+                        ok_state = j.state.clone();
+                        if let Some(err) = &j.error {
+                            panic!("job failed: {err}");
+                        }
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(ok_state, "succeeded", "digest-bound python_runner should succeed");
+
+        let err = submit_job(
+            &hub,
+            JobSubmit {
+                client_id: "test-box".into(),
+                job_id: "job-bad".into(),
+                skill_id: "echo-runner".into(),
+                profile: "noproxy".into(),
+                headed: false,
+                vars: json!({}),
+                version: None,
+                digest: Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                ),
+                account_id: None,
+                geo: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("digest") || err.contains("published"),
+            "{err}"
+        );
+
+        client.abort();
+        serve.abort();
+        let _ = fs::remove_dir_all(&master_root);
+        let _ = fs::remove_dir_all(&client_root);
     }
 }

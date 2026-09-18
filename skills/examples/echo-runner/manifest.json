@@ -1,0 +1,8 @@
+{
+  "version": "1.0.0",
+  "entry": {
+    "kind": "python_runner",
+    "path": "scripts/echo.py"
+  },
+  "secrets": []
+}

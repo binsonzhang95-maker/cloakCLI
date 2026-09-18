@@ -11,6 +11,7 @@ mod llm_client;
 mod master_hub;
 mod profiles;
 mod protocol;
+mod skill_pkg;
 mod skills;
 mod state;
 mod teach;

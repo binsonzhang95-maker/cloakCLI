@@ -830,19 +830,28 @@ impl App {
         };
         let job_id = Uuid::new_v4().simple().to_string();
         self.log(format!(
-            "submit job {job_id} → client={cid} skill={skill_name} profile={profile_name}"
+            "submit job {job_id} → client={cid} skill={skill_name} profile={profile_name} (published digest)"
         ));
-        master_hub::submit_job(
+        let rec = master_hub::submit_job(
             &self.hub,
-            &cid,
-            &job_id,
-            &skill_name,
-            &profile_name,
-            self.headed,
-            serde_json::json!({}),
+            master_hub::JobSubmit {
+                client_id: cid,
+                job_id: job_id.clone(),
+                skill_id: skill_name,
+                profile: profile_name,
+                headed: self.headed,
+                vars: serde_json::json!({}),
+                version: None,
+                digest: None,
+                account_id: None,
+                geo: None,
+            },
         )
         .await?;
-        self.status = format!("job {job_id} submitted");
+        self.status = format!(
+            "job {job_id} submitted digest={}",
+            rec.skill_digest.as_deref().unwrap_or("?")
+        );
         Ok(())
     }
 

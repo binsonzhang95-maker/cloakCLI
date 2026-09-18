@@ -21,9 +21,9 @@ cloakcli master serve (optional)          ▼
 
 - **Master**: configure, schedule, observe (TUI primary; CLI for scripting).
 - **Client**: execute; dials **out** to master (NAT-friendly). Local multi-browser is client-internal via `worker serve`.
-- **Protocol (DEV STUB)**: versioned JSONL over **plaintext TCP** (`hello`, `heartbeat`, `job_submit` / `job_state` / `job_cancel`, `config_update` / `config_ack`, `log_chunk`, …). See `astra-fleet-advice.md`.
-- **Security honesty**: shared `CLOAKCLI_MASTER_TOKEN` in cleartext is **dev-only**. **Not production.**
-- **TODO before production**: TLS/WebSocket, per-client identity (pair/rotate/revoke), `skill_sync` content hashes, HA/relay/RBAC.
+- **Protocol (DEV STUB)**: versioned JSONL over **plaintext TCP** (`hello`, `heartbeat`, `skill_sync` / `skill_sync_ack`, `job_submit` / `job_state` / `job_cancel`, `config_update` / `config_ack`, `log_chunk`, …). See `astra-fleet-advice.md`.
+- **Security honesty**: shared `CLOAKCLI_MASTER_TOKEN` in cleartext is **dev-only**. **Not production.** Digest checks do not replace source authentication.
+- **TODO before production**: TLS/WebSocket (or mTLS / controlled tunnel), per-client identity (pair/rotate/revoke), HA/relay/RBAC.
 
 本仓库在 box 上：`/workspace/CloakCLI`（Mac 稍后同步到 `~/Documents/CloakCLI`）。
 
@@ -90,6 +90,7 @@ cloakcli profile create demo --proxy http://user:pass@127.0.0.1:7890
 cloakcli profile list                    # proxy credentials redacted
 cloakcli profile edit demo --proxy http://127.0.0.1:7890
 cloakcli skill list
+# DEBUG ONLY (local test account / isolated profile — not fleet production)
 cloakcli skill run hello --profile demo --headless
 
 # Batch (unique temp files; per-profile locks)
@@ -102,10 +103,19 @@ cloakcli client connect --master 127.0.0.1:7750 --id box1 --token dev-token
 # from master side:
 cloakcli master clients
 cloakcli master config --concurrency 3 --headless   # persists data/hub_desired.json + push
+# Pack → publish (default) → skill_sync (client ACK) → digest-bound submit
+cloakcli master skill-pack --skill hello            # tar + SHA-256; omit --draft to publish
+cloakcli master skill-sync --client box1 --skill hello
 cloakcli master submit --client box1 --skill hello --profile noproxy --headless
+# optional: --version / --digest / --account-id / --geo (digest must match published + client ACK)
 cloakcli master job-state --job-id <id>
+# python_runner fixture (no browser): skill echo-runner — see skills/examples/echo-runner/
 # smoke: scripts/e2e-fleet-stub.sh
 ```
+
+`master submit` / TUI `J` only dispatch a **published** package digest the target client has ACK'd. A missing, unpublished, or mismatched digest is refused; the client never falls back to a local same-name skill. `cloakcli skill run` stays as a **debug-only** local path.
+
+**python_runner entry:** `skills/<name>/manifest.json` may set `"entry": {"kind": "python_runner", "path": "scripts/foo.py"}` (package-relative `.py`, fixed interpreter, argv array, no `shell=True`, secret **names** only). The runner is taken from the installed digest cache, not from the job JSON.
 
 ### TUI keys
 
@@ -306,7 +316,7 @@ TUI Config: `b` base_url, `K` masked session key (sets process env / `api_key_en
 - Worker re-validates cookie schema on apply; origins/localStorage injection is **off by default** (`CLOAKCLI_APPLY_ORIGINS=1` for strict http(s) allowlist).
 - `export --out` refuses project `data/` + `artifacts/` and directory targets; always `0600`.
 - `**/cookie.json` and cookie export patterns are gitignored — do not sync secrets into git/artifacts.
-- **Fleet is a DEV STUB**: plaintext TCP + shared token. TLS/WS, per-client identity, and skill_sync hashes remain **TODO** before any production use.
+- **Fleet is a DEV STUB**: plaintext TCP + shared token. TLS/WS and per-client identity remain **TODO** before any production use. Skill packages use tar + SHA-256 with safe extract; that is **not** a substitute for an authenticated channel.
 
 ## Dev
 

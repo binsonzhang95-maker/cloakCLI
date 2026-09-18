@@ -23,6 +23,16 @@ pub struct JobRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
     pub updated_at: i64,
+    /// Published skill version bound at submit (digest-locked jobs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_version: Option<String>,
+    /// SHA-256 of the published package the client must execute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo: Option<String>,
 }
 
 pub fn jobs_dir(root: &Path) -> PathBuf {
@@ -73,6 +83,10 @@ pub fn upsert_state(
         error: None,
         data: None,
         updated_at: 0,
+        skill_version: None,
+        skill_digest: None,
+        account_id: None,
+        geo: None,
     });
     rec.client_id = client_id.to_string();
     if !skill.is_empty() {
@@ -86,6 +100,33 @@ pub fn upsert_state(
     rec.error = error;
     if data.is_some() {
         rec.data = data;
+    }
+    rec.updated_at = chrono::Utc::now().timestamp();
+    save(root, &rec)?;
+    Ok(rec)
+}
+
+/// Attach digest-binding fields without clearing them on later state updates.
+pub fn set_binding(
+    root: &Path,
+    job_id: &str,
+    version: Option<&str>,
+    digest: Option<&str>,
+    account_id: Option<&str>,
+    geo: Option<&str>,
+) -> Result<JobRecord> {
+    let mut rec = load(root, job_id)?.context("job not found for binding")?;
+    if let Some(v) = version {
+        rec.skill_version = Some(v.to_string());
+    }
+    if let Some(d) = digest {
+        rec.skill_digest = Some(d.to_string());
+    }
+    if let Some(a) = account_id {
+        rec.account_id = Some(a.to_string());
+    }
+    if let Some(g) = geo {
+        rec.geo = Some(g.to_string());
     }
     rec.updated_at = chrono::Utc::now().timestamp();
     save(root, &rec)?;
@@ -108,5 +149,9 @@ pub fn to_json(rec: &JobRecord) -> serde_json::Value {
         "error": rec.error,
         "data": rec.data,
         "updated_at": rec.updated_at,
+        "skill_version": rec.skill_version,
+        "skill_digest": rec.skill_digest,
+        "account_id": rec.account_id,
+        "geo": rec.geo,
     })
 }

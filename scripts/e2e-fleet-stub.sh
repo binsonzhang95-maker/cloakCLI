@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Minimal fleet DEV STUB e2e: master serve → client connect → clients → config → submit → job_state
-# NOT a production security test. Plaintext shared token.
+# Minimal fleet DEV STUB e2e:
+#   master serve → client connect → pack+publish → skill_sync ACK → digest-bound submit
+# NOT a production security test. Plaintext shared token. Digest ≠ TLS.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -25,6 +26,7 @@ for f in /tmp/cloakcli-master-e2e.pid /tmp/cloakcli-client-e2e.pid; do
 done
 sleep 0.3
 rm -f data/master_ctrl.sock
+rm -f data/jobs/e2e-hello-1.json data/jobs/e2e-echo-1.json
 
 echo "== master serve =="
 "$BIN" master serve --bind "$BIND" --token "$TOKEN" > /tmp/cloakcli-master-e2e.log 2>&1 &
@@ -79,12 +81,45 @@ echo "$OBS" | grep -q '"observed_revision": [1-9]' || echo "$OBS" | grep -q '"ob
   echo "$OBS"
 }
 
-echo "== submit hello =="
+echo "== pack + publish skills =="
 # Ensure noproxy profile exists
 "$BIN" profile list >/dev/null 2>&1 || true
 if ! "$BIN" profile list 2>/dev/null | grep -q noproxy; then
   "$BIN" profile create noproxy || true
 fi
+"$BIN" master skill-pack --skill echo-runner
+"$BIN" master skill-pack --skill hello
+echo "== skill-sync echo-runner + hello =="
+"$BIN" master skill-sync --client "$CLIENT_ID" --skill echo-runner
+"$BIN" master skill-sync --client "$CLIENT_ID" --skill hello
+
+echo "== wrong digest refused =="
+if "$BIN" master submit --client "$CLIENT_ID" --skill echo-runner --profile noproxy --headless \
+    --digest aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    --job-id e2e-bad-digest; then
+  echo "expected digest reject"; exit 1
+fi
+
+echo "== submit echo-runner (python_runner, digest-bound) =="
+ECHO_JSON=$("$BIN" master submit --client "$CLIENT_ID" --skill echo-runner --profile noproxy --headless --job-id e2e-echo-1)
+echo "$ECHO_JSON"
+echo "$ECHO_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('ok') is True and d.get('digest'), d"
+
+echo "== poll echo job_state =="
+ECHO_FINAL=""
+for i in $(seq 1 30); do
+  ST=$("$BIN" master job-state --job-id e2e-echo-1 2>/dev/null || true)
+  echo "$ST" | head -c 400; echo
+  if echo "$ST" | grep -Eq '"state": "(succeeded|failed|cancelled)"'; then
+    ECHO_FINAL="$ST"
+    break
+  fi
+  sleep 0.25
+done
+[[ -n "$ECHO_FINAL" ]] || { echo "echo-runner job did not finish"; cat /tmp/cloakcli-client-e2e.log; exit 1; }
+echo "$ECHO_FINAL" | grep -q '"state": "succeeded"' || { echo "echo-runner did not succeed"; exit 1; }
+
+echo "== submit hello =="
 JOB_JSON=$("$BIN" master submit --client "$CLIENT_ID" --skill hello --profile noproxy --headless --job-id e2e-hello-1)
 echo "$JOB_JSON"
 JOB_ID=$(echo "$JOB_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('job_id',''))")

@@ -722,7 +722,7 @@ fn detail_client(app: &App) -> Vec<Line<'static>> {
         kv("job", job_short, Style::default().fg(WARN)),
         Line::from(""),
         Line::from(Span::styled(
-            "  J = submit job (selected skill@profile)",
+            "  J = submit job (published digest; pack+sync first)",
             Style::default().fg(CHROME).add_modifier(Modifier::ITALIC),
         )),
     ]
@@ -964,11 +964,11 @@ fn context_help(tab: Tab) -> Vec<Span<'static>> {
             ("Enter", "run skill"),
         ]),
         Tab::Skills => help_bits(&[
-            ("Enter", "run on selected profile (local)"),
+            ("Enter", "run local (debug only)"),
             ("T", "teach on selected profile"),
         ]),
         Tab::Sessions => help_bits(&[("x", "close session"), ("o", "open from Profiles")]),
-        Tab::Clients => help_bits(&[("J", "submit remote job (skill@profile)")]),
+        Tab::Clients => help_bits(&[("J", "submit remote job (published digest)")]),
         Tab::Config => help_bits(&[
             ("b", "base_url"),
             ("K", "session key"),

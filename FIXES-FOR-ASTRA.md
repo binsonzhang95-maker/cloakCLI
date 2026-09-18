@@ -48,7 +48,7 @@ Response to latest re-review: `astra-rereview-response.md`.
 | `job_cancel` kills local oneshot worker process | Works (best-effort SIGTERM/KILL) |
 | TLS / WebSocket | **TODO before production** |
 | Per-client identity, rotation, revoke | **TODO** (still shared token) |
-| `skill_sync` content hashes / version lock / rollback | **TODO** (stub ack only) |
+| `skill_sync` tar + SHA-256 / version lock / ACK / rollback | **Works (dev)** — safe extract, immutable digest cache; rollback = sync an older published digest (in-flight jobs keep the digest they started with). TLS still TODO. |
 
 Layers:
 
@@ -80,6 +80,8 @@ cargo build
 ./target/debug/cloakcli client connect --master 127.0.0.1:7750 --id box1 --token dev-token &
 ./target/debug/cloakcli master clients
 ./target/debug/cloakcli master config --concurrency 3 --headless
+./target/debug/cloakcli master skill-pack --skill hello
+./target/debug/cloakcli master skill-sync --client box1 --skill hello
 ./target/debug/cloakcli master submit --client box1 --skill hello --profile noproxy --headless
 ./target/debug/cloakcli master job-state --job-id <id>
 # optional: ./target/debug/cloakcli master cancel --client box1 --job-id <id>
@@ -90,7 +92,8 @@ Automated smoke: `scripts/e2e-fleet-stub.sh`.
 ## Remaining / next (production blockers — explicit)
 
 - TLS WebSocket transport; pairing codes → long-lived **per-client** identity + rotate/revoke
-- `skill_sync` with manifest + content hash + rollback
+- Full secret-manager UI; account lease mutex beyond per-profile lock
+- Move Pinterest IMAP runners into package `scripts/` (python_runner contract is in `skills/examples/echo-runner/`)
 - Screenshot streaming polish; log resume/checkpoints
 - Replace legacy HTTP `client serve` stub (deferred for rustc 1.85 deps)
 - **Never** treat plaintext shared `CLOAKCLI_MASTER_TOKEN` as production auth

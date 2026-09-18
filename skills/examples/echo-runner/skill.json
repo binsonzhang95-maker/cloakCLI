@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "name": "echo-runner",
+  "description": "Fixture python_runner (debug). Echoes job metadata as JSON; no browser, no secrets.",
+  "params": [],
+  "steps": []
+}
