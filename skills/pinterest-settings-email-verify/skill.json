@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "name": "pinterest-settings-email-verify",
+  "description": "After signup_ok_no_code_challenge (IP/geo skip): finish onboarding with a human given name, open Account settings, Confirm Email, fill #code (CODE from Outlook IMAP), until Email badge is Confirmed.",
+  "params": [
+    "CODE",
+    "DISPLAY_NAME"
+  ],
+  "steps": [
+    {
+      "action": "note",
+      "text": "IP/geo dependent. Use after signup skipped inline code. Secrets/IMAP stay in runner."
+    },
+    {
+      "action": "goto",
+      "url": "https://www.pinterest.com/",
+      "timeout": 90000
+    },
+    {
+      "action": "wait",
+      "ms": 2000
+    },
+    {
+      "action": "note",
+      "text": "If onboarding name: clear emailish autofill; fill DISPLAY_NAME (human first name); Continue through gender/country/topics until settings reachable."
+    },
+    {
+      "action": "goto",
+      "url": "https://www.pinterest.com/settings/account-settings/",
+      "timeout": 90000
+    },
+    {
+      "action": "wait",
+      "ms": 2500
+    },
+    {
+      "action": "press",
+      "key": "Escape"
+    },
+    {
+      "action": "wait",
+      "ms": 300
+    },
+    {
+      "action": "screenshot",
+      "path": "artifacts/pinterest/settings-01-account.png"
+    },
+    {
+      "action": "click",
+      "selector": "button:has-text('Confirm Email'), button:has-text('Confirm email')",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 1500
+    },
+    {
+      "action": "fill",
+      "selector": "#code",
+      "text": "{{vars.CODE}}",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 500
+    },
+    {
+      "action": "screenshot",
+      "path": "artifacts/pinterest/settings-02-code-filled.png"
+    },
+    {
+      "action": "click",
+      "selector": "div:has(#code) button:has-text('Continue'), [role='dialog'] button:has-text('Continue')",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 8000
+    },
+    {
+      "action": "screenshot",
+      "path": "artifacts/pinterest/settings-03-after-code.png"
+    },
+    {
+      "action": "extract_text",
+      "css": "body",
+      "as": "settings_body",
+      "timeout": 15000
+    }
+  ]
+}

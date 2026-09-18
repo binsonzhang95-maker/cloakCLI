@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "name": "pinterest-register-outlook-verify",
+  "description": "Pinterest signup email/password/birthday (ISO). Path A: stop at 6-digit #code UI (runner IMAP). Path B (IP/geo): signup_ok_no_code_challenge → use pinterest-settings-email-verify / scripts/run_pinterest_settings_email_verify.py until Confirmed.",
+  "params": [
+    "EMAIL",
+    "PASSWORD",
+    "BIRTHDAY",
+    "CODE"
+  ],
+  "steps": [
+    {
+      "action": "goto",
+      "url": "https://www.pinterest.com/",
+      "timeout": 90000
+    },
+    {
+      "action": "wait",
+      "ms": 2500
+    },
+    {
+      "action": "click",
+      "selector": "button:has-text('Sign up')",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 1500
+    },
+    {
+      "action": "fill",
+      "selector": "#email",
+      "text": "{{vars.EMAIL}}",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 500
+    },
+    {
+      "action": "fill",
+      "selector": "#password",
+      "text": "{{vars.PASSWORD}}",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 500
+    },
+    {
+      "action": "fill",
+      "selector": "#birthdate",
+      "text": "{{vars.BIRTHDAY}}",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 2000
+    },
+    {
+      "action": "screenshot",
+      "path": "artifacts/pinterest/01-filled.png"
+    },
+    {
+      "action": "click",
+      "selector": "button:has-text('Continue')",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 8000
+    },
+    {
+      "action": "screenshot",
+      "path": "artifacts/pinterest/02-after-continue.png"
+    },
+    {
+      "action": "extract_text",
+      "css": "body",
+      "as": "after_continue_body",
+      "timeout": 15000
+    }
+  ]
+}
