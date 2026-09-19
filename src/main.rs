@@ -10,6 +10,7 @@ mod locks;
 mod llm;
 mod llm_client;
 mod master_hub;
+mod ops;
 mod profiles;
 mod protocol;
 mod skill_pkg;

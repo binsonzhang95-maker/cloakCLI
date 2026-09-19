@@ -34,6 +34,33 @@ pub struct RunDto {
     pub error: Option<String>,
     pub updated_at: i64,
     pub source: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// Business status id from the job's digest-bound result. Never inferred.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub label: String,
+    /// `Some(true)` only when the validated result says so. Absence ≠ failure guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
+    /// Whitelisted, redacted JSON for the detail pane. Never includes job `data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -108,6 +135,14 @@ fn sanitize_run(mut run: RunDto) -> RunDto {
             "teach_chat".into()
         };
     }
+    run.client_id = redact_text(&run.client_id);
+    run.status = redact_text(&run.status);
+    run.label = redact_text(&run.label);
+    run.protocol_error = run
+        .protocol_error
+        .map(|e| redact_text(&e))
+        .filter(|s| !s.is_empty());
+    run.detail = run.detail.map(|d| redact_text(&d)).filter(|s| !s.is_empty());
     run
 }
 
@@ -183,6 +218,18 @@ pub fn record_teach_run(home: &Path, event: &Value, profile: &str) -> Result<(),
         error,
         updated_at: now_unix(),
         source: "teach_chat".into(),
+        client_id: String::new(),
+        digest: None,
+        version: None,
+        geo: None,
+        account_id: None,
+        status: String::new(),
+        label: String::new(),
+        success: None,
+        retryable: false,
+        protocol_error: None,
+        disposition: None,
+        detail: None,
     });
 
     let mut file = load_file(home);
@@ -209,7 +256,130 @@ fn from_job_stub(j: JobStub) -> RunDto {
         error: None,
         updated_at: j.updated_at,
         source: "data/jobs".into(),
+        client_id: String::new(),
+        digest: None,
+        version: None,
+        geo: None,
+        account_id: None,
+        status: String::new(),
+        label: String::new(),
+        success: None,
+        retryable: false,
+        protocol_error: None,
+        disposition: None,
+        detail: None,
     })
+}
+
+fn from_job_file(home: &Path, path: &Path) -> Option<RunDto> {
+    let text = fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let job_id = v.get("job_id").and_then(|x| x.as_str())?.to_string();
+    if job_id.is_empty() {
+        return None;
+    }
+    let result = v.get("result");
+    let success = result.and_then(|r| r.get("success")).and_then(|x| x.as_bool());
+    let status = result
+        .and_then(|r| r.get("status"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let label = result
+        .and_then(|r| r.get("label"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let retryable = result
+        .and_then(|r| r.get("retryable"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let digest = v
+        .get("skill_digest")
+        .and_then(|x| x.as_str())
+        .or_else(|| result.and_then(|r| r.get("digest")).and_then(|x| x.as_str()))
+        .map(|s| s.to_string());
+    let version = v
+        .get("skill_version")
+        .and_then(|x| x.as_str())
+        .or_else(|| result.and_then(|r| r.get("version")).and_then(|x| x.as_str()))
+        .map(|s| s.to_string());
+    let protocol_error = v
+        .get("protocol_error")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let disposition = disposition_for(home, &job_id);
+    let detail = whitelist_detail(&v, disposition.as_deref());
+    Some(sanitize_run(RunDto {
+        id: format!("job:{job_id}"),
+        kind: "job".into(),
+        job_id,
+        profile: v.get("profile").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        skill: v.get("skill").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        state: v.get("state").and_then(|x| x.as_str()).unwrap_or("unknown").to_string(),
+        summary: String::new(),
+        error: v.get("error").and_then(|x| x.as_str()).map(|s| s.to_string()),
+        updated_at: v.get("updated_at").and_then(|x| x.as_i64()).unwrap_or(0),
+        source: "data/jobs".into(),
+        client_id: v.get("client_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        digest,
+        version,
+        geo: v.get("geo").and_then(|x| x.as_str()).map(|s| s.to_string()),
+        account_id: v.get("account_id").and_then(|x| x.as_str()).map(|s| s.to_string()),
+        status,
+        label,
+        success,
+        retryable,
+        protocol_error,
+        disposition,
+        detail: Some(detail),
+    }))
+}
+
+fn disposition_for(home: &Path, job_id: &str) -> Option<String> {
+    let path = home.join("data").join("ops").join("dispositions.json");
+    let text = fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v.get("entries")
+        .and_then(|x| x.as_array())
+        .and_then(|arr| {
+            arr.iter().find_map(|e| {
+                if e.get("job_id").and_then(|x| x.as_str()) == Some(job_id) {
+                    e.get("disposition").and_then(|x| x.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn whitelist_detail(v: &Value, disposition: Option<&str>) -> String {
+    let result = v.get("result");
+    let filtered = serde_json::json!({
+        "job_id": v.get("job_id"),
+        "client_id": v.get("client_id"),
+        "skill": v.get("skill"),
+        "profile": v.get("profile"),
+        "geo": v.get("geo"),
+        "account_id": v.get("account_id"),
+        "state": v.get("state"),
+        "skill_version": v.get("skill_version"),
+        "skill_digest": v.get("skill_digest"),
+        "result": result.map(|r| serde_json::json!({
+            "skill_id": r.get("skill_id"),
+            "version": r.get("version"),
+            "digest": r.get("digest"),
+            "status": r.get("status"),
+            "success": r.get("success"),
+            "retryable": r.get("retryable"),
+            "label": r.get("label"),
+            "optional": r.get("optional"),
+        })),
+        "protocol_error": v.get("protocol_error"),
+        "updated_at": v.get("updated_at"),
+        "disposition": disposition,
+    });
+    redact_text(&serde_json::to_string_pretty(&filtered).unwrap_or_default())
 }
 
 fn snapshot_run(home: &Path) -> Option<RunDto> {
@@ -238,12 +408,42 @@ fn snapshot_run(home: &Path) -> Option<RunDto> {
         error: None,
         updated_at: mtime,
         source: SNAPSHOT_REL.into(),
+        client_id: String::new(),
+        digest: None,
+        version: None,
+        geo: None,
+        account_id: None,
+        status: String::new(),
+        label: String::new(),
+        success: None,
+        retryable: false,
+        protocol_error: None,
+        disposition: None,
+        detail: None,
     }))
 }
 
-/// Merged, newest-first, redacted history (teach log + fleet stubs + snapshot).
+/// Merged, newest-first, redacted history (teach log + fleet jobs + snapshot).
 pub fn list_runs(home: &Path) -> Vec<RunDto> {
     let mut runs = load_file(home).runs;
+    let dir = home.join("data").join("jobs");
+    if dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for e in entries.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Some(dto) = from_job_file(home, &p) {
+                    if let Some(existing) = runs.iter_mut().find(|r| r.id == dto.id) {
+                        *existing = dto;
+                    } else {
+                        runs.push(dto);
+                    }
+                }
+            }
+        }
+    }
     let (_running, jobs) = catalog::list_job_stubs_n(home, 0);
     for j in jobs {
         let dto = from_job_stub(j);
@@ -459,6 +659,35 @@ mod tests {
         assert_eq!(list[0].job_id, "j1");
         let json = serde_json::to_string(&list).unwrap();
         assert!(!json.contains("NOPE"), "{json}");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn list_runs_copies_validated_result_not_payload() {
+        let home = temp_home();
+        let dir = home.join("data").join("jobs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("j2.json"),
+            r#"{
+  "job_id":"j2","client_id":"box1","skill":"pin-reg","profile":"geo01","state":"succeeded",
+  "data":{"token":"NOPE","cookie":"SESSIONID_SUPER_SECRET"},
+  "skill_digest":"aaa","skill_version":"1.0.0","geo":"geo01",
+  "result":{"skill_id":"pin-reg","version":"1.0.0","digest":"aaa","status":"logged_in","success":true,"retryable":false,"label":"已登录","optional":false},
+  "updated_at":9
+}"#,
+        )
+        .unwrap();
+        let list = list_runs(&home);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, "logged_in");
+        assert_eq!(list[0].label, "已登录");
+        assert_eq!(list[0].success, Some(true));
+        assert_eq!(list[0].state, "succeeded");
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(!json.contains("NOPE"), "{json}");
+        assert!(!json.contains("SESSIONID_SUPER_SECRET"), "{json}");
+        assert!(!json.contains("email_confirmed"), "{json}");
         fs::remove_dir_all(&home).ok();
     }
 

@@ -171,6 +171,9 @@ pub enum MasterCmd {
     Config {
         #[arg(long)]
         concurrency: Option<usize>,
+        /// Master dispatch spacing in milliseconds (0 = none)
+        #[arg(long)]
+        interval_ms: Option<u64>,
         #[arg(long, group = "mode")]
         headed: bool,
         #[arg(long, group = "mode")]
@@ -183,6 +186,18 @@ pub enum MasterCmd {
     Ledger {
         #[arg(long)]
         skill: Option<String>,
+    },
+    /// Ops park ("先放") — does not change the skill's business status
+    Park {
+        #[arg(long)]
+        job_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Retry a job whose validated result has retryable:true (same account+profile+digest)
+    Retry {
+        #[arg(long)]
+        job_id: String,
     },
 }
 
@@ -1167,6 +1182,7 @@ pub async fn handle_master(root: &Path, action: MasterCmd) -> Result<()> {
         }
         MasterCmd::Config {
             concurrency,
+            interval_ms,
             headed,
             headless,
             get,
@@ -1184,6 +1200,9 @@ pub async fn handle_master(root: &Path, action: MasterCmd) -> Result<()> {
             if let Some(c) = concurrency {
                 body["concurrency"] = serde_json::json!(c);
             }
+            if let Some(ms) = interval_ms {
+                body["interval_ms"] = serde_json::json!(ms);
+            }
             if headed {
                 body["headed"] = serde_json::json!(true);
             } else if headless {
@@ -1193,6 +1212,23 @@ pub async fn handle_master(root: &Path, action: MasterCmd) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp)?);
             if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
                 bail!("{}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("config_update failed"));
+            }
+            Ok(())
+        }
+        MasterCmd::Park { job_id, reason } => {
+            let d = crate::ops::park_job(root, &job_id, reason.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&d)?);
+            Ok(())
+        }
+        MasterCmd::Retry { job_id } => {
+            let resp = crate::master_hub::control_request(
+                root,
+                serde_json::json!({"cmd": "retry", "job_id": job_id}),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+            if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
+                bail!("{}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("retry failed"));
             }
             Ok(())
         }

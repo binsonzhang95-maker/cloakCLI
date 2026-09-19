@@ -45,6 +45,7 @@ pub struct HubState {
     /// In-memory job index (also mirrored under data/jobs/).
     pub jobs: HashMap<String, JobRecord>,
     pub job_log: Vec<String>,
+    last_dispatch: Option<Instant>,
 }
 
 impl HubState {
@@ -53,6 +54,7 @@ impl HubState {
             revision: 1,
             concurrency: 2,
             headed: false,
+            interval_ms: 0,
             labels: vec![],
         });
         let jobs = load_all_jobs(&root);
@@ -63,6 +65,7 @@ impl HubState {
             clients: HashMap::new(),
             jobs,
             job_log: vec![],
+            last_dispatch: None,
         }
     }
 
@@ -340,6 +343,36 @@ async fn handle_control(stream: tokio::net::UnixStream, hub: SharedHub) -> Resul
                     }),
                     Err(e) => json!({"ok": false, "error": e.to_string()}),
                 },
+            }
+        }
+        "park" => {
+            let root = hub.read().await.root.clone();
+            let job_id = req.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+            let reason = req.get("reason").and_then(|v| v.as_str());
+            match crate::ops::park_job(&root, job_id, reason) {
+                Ok(d) => json!({"ok": true, "disposition": d, "note": "ops park; not a skill status"}),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+        "retry" => {
+            let job_id = req.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+            match retry_job(&hub, job_id).await {
+                Ok(rec) => json!({
+                    "ok": true,
+                    "job_id": rec.job_id,
+                    "skill_id": rec.skill,
+                    "profile": rec.profile,
+                    "digest": rec.skill_digest,
+                    "account_id": rec.account_id,
+                    "geo": rec.geo,
+                }),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+        "submit_batch" => {
+            match submit_batch(&hub, &req).await {
+                Ok(rows) => json!({"ok": true, "jobs": rows}),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
         }
         _ => json!({"ok": false, "error": format!("unknown control cmd: {cmd}")}),
@@ -702,21 +735,29 @@ pub async fn submit_job(hub: &SharedHub, spec: JobSubmit) -> Result<JobRecord> {
     {
         let state = hub.read().await;
         let Some(h) = state.clients.get(client_id) else {
-            bail!("client not connected: {client_id}");
+            bail!("client not connected: {client_id} (refusing silent retarget)");
         };
         if !h.info.online {
-            bail!("client offline: {client_id}");
+            bail!("client offline: {client_id} (refusing silent retarget)");
         }
         if !skill_pkg::client_has_digest(&h.info.installed_skills, &spec.skill_id, &release.digest)
         {
             bail!(
-                "client {client_id} has not ACK'd skill '{}' digest {} — run `cloakcli master skill-sync --client {client_id} --skill {}` first",
+                "client {client_id} has not ACK'd skill '{}' digest {} — run `cloakcli master skill-sync --client {client_id} --skill {}` first (refusing silent retarget)",
                 spec.skill_id,
                 release.digest,
                 spec.skill_id
             );
         }
+        if crate::ops::profile_has_active_job(&state.jobs, &spec.profile) {
+            bail!(
+                "profile '{}' is occupied by an in-flight job (refusing concurrent reuse)",
+                spec.profile
+            );
+        }
     }
+
+    wait_dispatch_interval(hub).await;
 
     let rec = {
         let mut state = hub.write().await;
@@ -729,6 +770,18 @@ pub async fn submit_job(hub: &SharedHub, spec: JobSubmit) -> Result<JobRecord> {
                 ));
                 return Ok(rec);
             }
+        }
+        if crate::ops::profile_has_active_job(&state.jobs, &spec.profile)
+            && !state
+                .jobs
+                .get(job_id)
+                .map(|j| j.profile == spec.profile && !jobs::is_terminal(&j.state))
+                .unwrap_or(false)
+        {
+            bail!(
+                "profile '{}' is occupied by an in-flight job (refusing concurrent reuse)",
+                spec.profile
+            );
         }
         let rec = jobs::upsert_state(
             &state.root,
@@ -784,7 +837,162 @@ pub async fn submit_job(hub: &SharedHub, spec: JobSubmit) -> Result<JobRecord> {
             .send(line)
             .map_err(|_| anyhow::anyhow!("failed to send to client {client_id}"))?;
     }
+    {
+        let mut state = hub.write().await;
+        state.last_dispatch = Some(Instant::now());
+    }
     Ok(rec)
+}
+
+/// Operator retry: same client + profile + account + digest. Never auto-fired.
+pub async fn retry_job(hub: &SharedHub, job_id: &str) -> Result<JobRecord> {
+    if job_id.is_empty() {
+        bail!("job_id required");
+    }
+    let rec = {
+        let state = hub.read().await;
+        if let Some(j) = state.jobs.get(job_id) {
+            j.clone()
+        } else {
+            jobs::load(&state.root, job_id)?.context("job not found")?
+        }
+    };
+    crate::ops::assert_retryable(&rec)?;
+    let key = crate::ops::retry_key(&rec.skill, &rec.profile, rec.account_id.as_deref());
+    let now = chrono::Utc::now().timestamp();
+    let remain = {
+        let state = hub.read().await;
+        crate::ops::cooldown_remaining_secs(
+            &state.root,
+            &key,
+            now,
+            crate::ops::DEFAULT_RETRY_COOLDOWN_SECS,
+        )
+    };
+    if remain > 0 {
+        bail!("retry cooldown {remain}s for profile '{}' skill '{}'", rec.profile, rec.skill);
+    }
+    let digest = rec
+        .skill_digest
+        .clone()
+        .context("job has no bound digest; cannot retry")?;
+    {
+        let state = hub.read().await;
+        crate::ops::note_retry(&state.root, &key, now)?;
+    }
+    submit_job(
+        hub,
+        JobSubmit {
+            client_id: rec.client_id.clone(),
+            job_id: uuid::Uuid::new_v4().simple().to_string(),
+            skill_id: rec.skill.clone(),
+            profile: rec.profile.clone(),
+            headed: rec.headed,
+            vars: serde_json::json!({}),
+            version: rec.skill_version.clone(),
+            digest: Some(digest),
+            account_id: rec.account_id.clone(),
+            geo: rec.geo.clone(),
+        },
+    )
+    .await
+}
+
+async fn submit_batch(hub: &SharedHub, req: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
+    let items = req
+        .get("jobs")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if items.is_empty() {
+        bail!("submit_batch requires jobs[]");
+    }
+    let mut out = Vec::new();
+    for item in items {
+        let client_id = item
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let skill = item
+            .get("skill_id")
+            .or_else(|| item.get("skill"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let profile = item
+            .get("profile")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let headed = item.get("headed").and_then(|v| v.as_bool()).unwrap_or(false);
+        let job_id = item
+            .get("job_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        let spec = JobSubmit {
+            client_id: client_id.clone(),
+            job_id: job_id.clone(),
+            skill_id: skill.clone(),
+            profile: profile.clone(),
+            headed,
+            vars: item.get("vars").cloned().unwrap_or(json!({})),
+            version: item
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            digest: item
+                .get("digest")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            account_id: item
+                .get("account_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            geo: item
+                .get("geo")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+        match submit_job(hub, spec).await {
+            Ok(rec) => out.push(json!({
+                "ok": true,
+                "job_id": rec.job_id,
+                "client_id": rec.client_id,
+                "skill_id": rec.skill,
+                "profile": rec.profile,
+                "digest": rec.skill_digest,
+            })),
+            Err(e) => out.push(json!({
+                "ok": false,
+                "job_id": job_id,
+                "client_id": client_id,
+                "skill_id": skill,
+                "profile": profile,
+                "error": e.to_string(),
+            })),
+        }
+    }
+    Ok(out)
+}
+
+async fn wait_dispatch_interval(hub: &SharedHub) {
+    let (interval_ms, last) = {
+        let state = hub.read().await;
+        (state.desired.interval_ms, state.last_dispatch)
+    };
+    if interval_ms == 0 {
+        return;
+    }
+    if let Some(last) = last {
+        let need = Duration::from_millis(interval_ms);
+        if let Some(remain) = need.checked_sub(last.elapsed()) {
+            if !remain.is_zero() {
+                tokio::time::sleep(remain).await;
+            }
+        }
+    }
 }
 
 /// Push a published package to a connected client and wait for skill_sync_ack.
@@ -934,6 +1142,9 @@ pub async fn push_config_update(
     if let Some(h) = req.get("headed").and_then(|v| v.as_bool()) {
         desired.headed = h;
     }
+    if let Some(ms) = req.get("interval_ms").and_then(|v| v.as_u64()) {
+        desired.interval_ms = ms;
+    }
     if let Some(labels) = req.get("labels").and_then(|v| v.as_array()) {
         desired.labels = labels
             .iter()
@@ -944,8 +1155,8 @@ pub async fn push_config_update(
     save_desired(&state.root, &desired)?;
     state.desired = desired.clone();
     state.push_log(format!(
-        "config_update rev={} concurrency={} headed={}",
-        desired.revision, desired.concurrency, desired.headed
+        "config_update rev={} concurrency={} interval_ms={} headed={}",
+        desired.revision, desired.concurrency, desired.interval_ms, desired.headed
     ));
 
     let env = Envelope::new("config_update").with_data(json!({

@@ -412,7 +412,164 @@ html.shimmer .row.is-selected {
 }
 
 .runs-row {
-  grid-template-columns: 160px 90px 90px 110px;
+  grid-template-columns: 160px 90px 110px minmax(0, 1fr);
+}
+
+.fleet-client-row,
+.fleet-queue-row,
+.ledger-row {
+  grid-template-columns: minmax(90px, 0.7fr) 70px minmax(0, 1.2fr) minmax(80px, 0.8fr);
+}
+
+.tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.tab {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.tab.is-active {
+  color: var(--text);
+  border-bottom-color: var(--cyan);
+}
+
+.chip {
+  display: inline-block;
+  border: 1px solid var(--line-strong);
+  padding: 0 6px;
+  color: var(--muted);
+}
+
+.chip.ok {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.chip.warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.skill-part-h {
+  padding: 8px 12px 4px;
+  color: var(--cyan);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+
+.fleet-layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(280px, 0.9fr);
+}
+
+.fleet-main,
+.fleet-side {
+  min-height: 0;
+  overflow: auto;
+}
+
+.fleet-side {
+  border-left: 1px solid var(--line);
+  padding: 8px 12px 40px;
+}
+
+.fleet-side label,
+.fleet-side select,
+.fleet-side input[type="text"],
+.fleet-side input[type="number"] {
+  display: block;
+  width: 100%;
+}
+
+.fleet-side select,
+.fleet-side input[type="text"],
+.fleet-side input[type="number"] {
+  background: var(--bg-raised);
+  border: 1px solid var(--line-strong);
+  padding: 4px 8px;
+  margin: 2px 0 8px;
+}
+
+.fleet-kv {
+  margin: 6px 0 10px;
+  font-size: 11px;
+}
+
+.fleet-kv .mono {
+  max-height: 2.8em;
+  overflow: auto;
+}
+
+.fleet-note {
+  margin: 0 0 8px;
+}
+
+.fleet-profiles {
+  max-height: 140px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  padding: 6px;
+  margin-bottom: 8px;
+}
+
+.fleet-config label {
+  margin-bottom: 6px;
+}
+
+.fleet-last,
+.runs-json {
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  padding: 8px;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.mono {
+  word-break: break-all;
+}
+
+.row-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.row-actions button,
+.fleet-side button {
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--cyan);
+  background: transparent;
+  color: var(--cyan);
+  cursor: pointer;
+}
+
+.row-actions button:disabled,
+.fleet-side button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.row-actions button.ghost {
+  border-color: var(--line-strong);
+  color: var(--muted);
 }
 
 .runs-split {
@@ -483,9 +640,10 @@ html.shimmer .row.is-selected {
   white-space: pre-wrap;
 }
 
+.kv,
 .insp-body .kv {
   display: grid;
-  grid-template-columns: 72px 1fr;
+  grid-template-columns: 88px 1fr;
   gap: 4px 8px;
 }
 

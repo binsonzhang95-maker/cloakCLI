@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fleet-submit"
+description = "Enables the fleet_submit command without any pre-configured scope."
+commands.allow = ["fleet_submit"]
+
+[[permission]]
+identifier = "deny-fleet-submit"
+description = "Denies the fleet_submit command without any pre-configured scope."
+commands.deny = ["fleet_submit"]

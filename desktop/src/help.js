@@ -1,9 +1,10 @@
 export const SHORTCUTS = [
-  { key: "1", action: "Teach Chat (home)" },
-  { key: "2", action: "Profiles" },
+  { key: "1", action: "Fleet (ops home)" },
+  { key: "2", action: "Teach Chat" },
   { key: "3", action: "Skills" },
-  { key: "4", action: "Runs / History" },
-  { key: "5", action: "Diagnostics (Raw TUI)" },
+  { key: "4", action: "Profiles" },
+  { key: "5", action: "Runs (history / ledger)" },
+  { key: "6", action: "Diagnostics (Raw TUI)" },
   { key: "[", action: "Toggle inspector" },
   { key: ",", action: "Settings" },
   { key: "?", action: "Keyboard shortcuts overlay" },
@@ -12,7 +13,7 @@ export const SHORTCUTS = [
 ];
 
 export function shortcutsStatusHint() {
-  return "1–5 nav · [ inspector · , settings · ? help";
+  return "1–6 nav · [ inspector · , settings · ? help";
 }
 
 export function renderShortcutsTable() {

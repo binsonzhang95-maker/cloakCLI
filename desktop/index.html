@@ -76,37 +76,42 @@
       <div class="workspace">
         <nav class="nav" aria-label="Primary">
           <div class="nav-head">NAV</div>
-          <button type="button" class="nav-item is-active" data-route="chat" data-key="1">
+          <button type="button" class="nav-item is-active" data-route="fleet" data-key="1">
             <span class="nav-key">1</span>
-            <span class="nav-label">Teach Chat</span>
+            <span class="nav-label">Fleet</span>
           </button>
-          <button type="button" class="nav-item" data-route="profiles" data-key="2">
+          <button type="button" class="nav-item" data-route="chat" data-key="2">
             <span class="nav-key">2</span>
-            <span class="nav-label">Profiles</span>
+            <span class="nav-label">Teach Chat</span>
           </button>
           <button type="button" class="nav-item" data-route="skills" data-key="3">
             <span class="nav-key">3</span>
             <span class="nav-label">Skills</span>
           </button>
-          <button type="button" class="nav-item" data-route="runs" data-key="4">
+          <button type="button" class="nav-item" data-route="profiles" data-key="4">
             <span class="nav-key">4</span>
-            <span class="nav-label">Runs / History</span>
+            <span class="nav-label">Profiles</span>
           </button>
-          <button type="button" class="nav-item" data-route="diagnostics" data-key="5">
+          <button type="button" class="nav-item" data-route="runs" data-key="5">
             <span class="nav-key">5</span>
+            <span class="nav-label">Runs</span>
+          </button>
+          <button type="button" class="nav-item" data-route="diagnostics" data-key="6">
+            <span class="nav-key">6</span>
             <span class="nav-label">Diagnostics</span>
             <span class="nav-sub">Raw TUI</span>
           </button>
           <div class="nav-foot">
             <div class="nav-meta" id="nav-counts">profiles — · skills —</div>
-            <div class="nav-meta muted">M3 ops console</div>
+            <div class="nav-meta muted">ops console</div>
           </div>
         </nav>
 
         <main class="main" id="main">
-          <section class="page is-active" id="page-chat" data-route="chat"></section>
-          <section class="page" id="page-profiles" data-route="profiles"></section>
+          <section class="page is-active" id="page-fleet" data-route="fleet"></section>
+          <section class="page" id="page-chat" data-route="chat"></section>
           <section class="page" id="page-skills" data-route="skills"></section>
+          <section class="page" id="page-profiles" data-route="profiles"></section>
           <section class="page" id="page-runs" data-route="runs"></section>
           <section class="page" id="page-diagnostics" data-route="diagnostics">
             <div class="diag-bar">
@@ -199,7 +204,7 @@
         <span id="status-worker">worker —</span>
         <span id="status-bin">bin: …</span>
         <span id="status-ver">v—</span>
-        <span id="status-keys" class="status-keys" title="Keyboard shortcuts (?)">1–5 nav · [ inspector · , settings · ? help</span>
+        <span id="status-keys" class="status-keys" title="Keyboard shortcuts (?)">1–6 nav · [ inspector · , settings · ? help</span>
       </footer>
     </div>
 

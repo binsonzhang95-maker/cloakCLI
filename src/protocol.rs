@@ -62,6 +62,9 @@ pub struct ConfigRevision {
     pub concurrency: usize,
     #[serde(default)]
     pub headed: bool,
+    /// Milliseconds the master waits between job dispatches. 0 = no extra delay.
+    #[serde(default)]
+    pub interval_ms: u64,
     #[serde(default)]
     pub labels: Vec<String>,
 }

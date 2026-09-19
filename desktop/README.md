@@ -162,7 +162,7 @@ Apple Silicon vs Intel: build on the Mini you will run on (no cross-compile in t
 
 - window chrome: drag, minimize, maximize/restore, close, is-maximized
 - events for PTY I/O
-- app commands: `shell_status`, `set_home`, `list_profiles`, `list_skills`, `ops_status`, `list_runs`, `llm_status`, `teach_resume_hint`, `pty_start`, `pty_write`, `pty_resize`, `pty_stop`, `teach_chat_start`, `teach_chat_send`, `teach_chat_cancel`, `teach_chat_confirm`, `teach_chat_status`, `teach_chat_stop`, `job_start`, `job_cancel`
+- app commands: `shell_status`, `set_home`, `list_profiles`, `list_skills`, `ops_status`, `list_runs`, `llm_status`, `teach_resume_hint`, `pty_start`, `pty_write`, `pty_resize`, `pty_stop`, `teach_chat_start`, `teach_chat_send`, `teach_chat_cancel`, `teach_chat_confirm`, `teach_chat_status`, `teach_chat_stop`, `job_start`, `job_cancel`, `fleet_status`, `fleet_submit`, `fleet_submit_batch`, `fleet_sync`, `fleet_config`, `fleet_park`, `fleet_retry`, `list_ledgers`
 - events: `teach_chat_event` (JSONL v=1 kinds: session/status/user/assistant_delta/assistant/system/tool/job/error/closed/resume), `pty-status` / `pty-exit`
 
 No `shell`, `os`, `fs`, or `opener` plugins. `pty_start` always execs the resolved `cloakcli` binary with the single argument `tui`. Catalog commands read files under `CLOAKCLI_HOME`; they never scrape terminal text.
@@ -198,7 +198,7 @@ M2 writes `data/teach/events-snapshot.json` (messages, profile, last request id,
 - Teach Chat is live JSONL to `cloakcli`; Profiles/Skills catalogs stay read-only except selection (profile + optional skill are passed into the turn context).
 - Assistant text is streamed as `assistant_delta` chunks (live LLM: HTTP SSE; mock: chunked mock JSON) then a final `assistant` (`done: true`). Stop/cancel is honored between chunks.
 - **Hub port is not reused on reconnect.** Each `cloakcli teach chat --events` child binds a new ephemeral teach-hub port and new pairing codes.
-- Fleet `master submit` job start is **not wired** in the desktop (`job_start` returns an honest stub). The job card is the in-flight teach turn (start/progress/cancel via teach-chat). History merges those turns with `data/jobs` stubs.
+- Fleet `master submit` is wired through the master control socket (`fleet_submit` / `fleet_submit_batch`). `job_start` reports `via=fleet` when Teach Chat is idle. Offline, unsynced, or geo-mismatched targets are refused (no silent retarget). Teach-turn job cards remain the Chat path.
 - Top-bar hub/worker lamps are a file + unix-socket connect probe of the **master** control socket / `worker.pid`. Teach hub/worker/extension lamps live on the Chat pair strip.
 - Raw TUI still exists on Diagnostics; ratatui is not the product home.
 - Linux `.deb` is unsigned and does not bundle the `cloakcli` sidecar. macOS `.app` is unsigned; no notarization/DMG. No Windows installer.

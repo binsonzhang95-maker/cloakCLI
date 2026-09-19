@@ -1,7 +1,7 @@
 const SHIMMER_KEY = "cloakcli.desktop.shimmer";
 
 const state = {
-  route: "chat",
+  route: "fleet",
   inspectorOpen: true,
   shimmer: false,
   profiles: [],
@@ -16,6 +16,9 @@ const state = {
   llm: null,
   resumeHint: null,
   error: null,
+  fleet: null,
+  ledgers: [],
+  runsTab: "history",
 };
 
 const listeners = new Set();
@@ -57,6 +60,8 @@ export function setCatalog({
   runs,
   llm,
   resumeHint,
+  fleet,
+  ledgers,
   error,
 }) {
   if (profiles) state.profiles = profiles;
@@ -67,6 +72,8 @@ export function setCatalog({
   if (runs) state.runs = runs;
   if (llm !== undefined) state.llm = llm;
   if (resumeHint !== undefined) state.resumeHint = resumeHint;
+  if (fleet !== undefined) state.fleet = fleet;
+  if (ledgers) state.ledgers = ledgers;
   if (error !== undefined) state.error = error;
   if (!state.selectedProfile && state.profiles.length) {
     state.selectedProfile = state.profiles[0].name;
@@ -97,6 +104,11 @@ export function selectProfile(name) {
 
 export function selectSkill(name) {
   state.selectedSkill = name;
+  emit();
+}
+
+export function setRunsTab(tab) {
+  state.runsTab = tab === "ledger" ? "ledger" : "history";
   emit();
 }
 

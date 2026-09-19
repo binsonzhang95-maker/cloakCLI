@@ -90,3 +90,39 @@ export async function llmStatus() {
 export async function teachResumeHint() {
   return invoke("teach_resume_hint");
 }
+
+export async function fleetStatus() {
+  return invoke("fleet_status");
+}
+
+export async function fleetSubmit(spec) {
+  return invoke("fleet_submit", { spec });
+}
+
+export async function fleetSubmitBatch(jobs) {
+  return invoke("fleet_submit_batch", { spec: { jobs } });
+}
+
+export async function fleetSync(clientId, skillId, version) {
+  return invoke("fleet_sync", {
+    clientId,
+    skillId,
+    version: version || null,
+  });
+}
+
+export async function fleetConfig(spec) {
+  return invoke("fleet_config", { spec });
+}
+
+export async function fleetPark(jobId, reason) {
+  return invoke("fleet_park", { jobId, reason: reason || null });
+}
+
+export async function fleetRetry(jobId) {
+  return invoke("fleet_retry", { jobId });
+}
+
+export async function listLedgers() {
+  return invoke("list_ledgers");
+}

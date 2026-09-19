@@ -565,9 +565,9 @@ pub fn job_start_dto(slot: &SharedTeach) -> JobStartDto {
         }
     } else {
         JobStartDto {
-            wired: false,
-            via: "none".into(),
-            hint: "start Teach Chat first. Fleet master submit is not wired in desktop.".into(),
+            wired: true,
+            via: "fleet".into(),
+            hint: "Fleet master submit is wired. Open Fleet to pick client + published digest + profile/geo.".into(),
         }
     }
 }
@@ -668,9 +668,9 @@ mod tests {
     fn job_start_honest_when_idle() {
         let slot: SharedTeach = Arc::new(Mutex::new(None));
         let dto = job_start_dto(&slot);
-        assert!(!dto.wired);
-        assert_eq!(dto.via, "none");
-        assert!(dto.hint.contains("not wired") || dto.hint.contains("Teach Chat"));
+        assert!(dto.wired);
+        assert_eq!(dto.via, "fleet");
+        assert!(dto.hint.contains("Fleet"), "{}", dto.hint);
     }
 
     #[test]

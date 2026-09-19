@@ -14,9 +14,9 @@ export function renderProfiles(root) {
     <div class="page-head">
       <div>
         <div class="page-kicker">PROFILES</div>
-        <div class="page-title">Local catalog</div>
+        <div class="page-title">Anon env + occupancy</div>
       </div>
-      <div class="page-sub">${profiles.length} profile(s) · proxy redacted · cookie counts only</div>
+      <div class="page-sub">${profiles.length} profile(s) · geo bound to jobs · retry keeps this env · no default wipe</div>
     </div>
     <div class="table" id="profile-table"></div>
   `;
@@ -35,11 +35,13 @@ export function renderProfiles(root) {
       const cookies = p.cookie_present
         ? `${p.cookie_count} ck · ${p.cookie_valid}v/${p.cookie_expired}e`
         : "no cookies";
+      const occ = p.occupied ? `occupied ${p.occupied_by || ""}` : "free";
+      const env = p.anon_env ? "anon env" : "no user-data";
       return `
         <div class="row profiles-row${sel}" data-name="${esc(p.name)}" role="button" tabindex="0">
           <div class="row-name">${esc(p.name)}</div>
-          <div class="row-meta">${esc(p.proxy || "direct")} · ${esc(p.notes || "—")}</div>
-          <div class="row-meta">${esc(cookies)}</div>
+          <div class="row-meta">geo ${esc(p.geo || p.name)} · ${esc(p.proxy || "direct")} · ${esc(env)}</div>
+          <div class="row-meta">${esc(occ)} · ${esc(cookies)}</div>
         </div>`;
     })
     .join("");

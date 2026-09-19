@@ -517,7 +517,7 @@ async function startSession(force) {
     chat.connecting = false;
     paint();
     const hint = await jobStart();
-    chat.fleetHint = hint?.wired ? null : hint?.hint || null;
+    chat.fleetHint = hint?.via === "teach_chat" ? null : hint?.hint || null;
     paint();
     return dto;
   } catch (err) {

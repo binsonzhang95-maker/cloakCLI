@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fleet-sync"
+description = "Enables the fleet_sync command without any pre-configured scope."
+commands.allow = ["fleet_sync"]
+
+[[permission]]
+identifier = "deny-fleet-sync"
+description = "Denies the fleet_sync command without any pre-configured scope."
+commands.deny = ["fleet_sync"]

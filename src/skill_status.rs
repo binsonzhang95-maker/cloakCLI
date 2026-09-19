@@ -265,7 +265,19 @@ pub fn ingest_client_update(root: &std::path::Path, upd: ClientJobUpdate) -> Res
     jobs::save(root, &rec)?;
     if outcome == FinalizeOutcome::Applied {
         if let Some(res) = &rec.result {
-            ledger::record(root, res, &rec.job_id, rec.success_counted)?;
+            ledger::record(
+                root,
+                res,
+                &rec.job_id,
+                rec.success_counted,
+                if rec.profile.is_empty() {
+                    None
+                } else {
+                    Some(rec.profile.as_str())
+                },
+                rec.account_id.as_deref(),
+                rec.geo.as_deref(),
+            )?;
         }
     }
     Ok(rec)

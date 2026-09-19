@@ -32,6 +32,13 @@ pub struct ProfileDto {
     pub cookie_count: usize,
     pub cookie_valid: usize,
     pub cookie_expired: usize,
+    /// Geo label from profile metadata (name/label/geo). Not inferred from a platform.
+    pub geo: Option<String>,
+    /// Chromium user-data dir exists (anonymous env). Path only, never contents.
+    pub anon_env: bool,
+    /// In-flight lock or non-terminal job holds this profile.
+    pub occupied: bool,
+    pub occupied_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +49,13 @@ pub struct SkillDto {
     pub step_count: usize,
     pub param_count: usize,
     pub on_stall: Option<String>,
+    pub published: bool,
+    pub version: Option<String>,
+    pub digest: Option<String>,
+    /// `published` | `draft` | `local` | `unknown`
+    pub publish_state: String,
+    /// How many connected clients have ACK'd this digest (0 if hub down).
+    pub synced_clients: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,7 +122,7 @@ pub fn list_profiles(home: &Path) -> Result<Vec<ProfileDto>, String> {
         if p.is_dir() {
             let meta = p.join("profile.json");
             if meta.is_file() {
-                if let Some(dto) = load_profile_dto(&meta) {
+                if let Some(dto) = load_profile_dto(&meta, home) {
                     if seen.insert(dto.name.clone()) {
                         out.push(dto);
                     }
@@ -122,7 +136,7 @@ pub fn list_profiles(home: &Path) -> Result<Vec<ProfileDto>, String> {
         if p.file_name().and_then(|x| x.to_str()) == Some("cookie.json") {
             continue;
         }
-        if let Some(dto) = load_profile_dto(&p) {
+        if let Some(dto) = load_profile_dto(&p, home) {
             if seen.insert(dto.name.clone()) {
                 out.push(dto);
             }
@@ -149,6 +163,7 @@ pub fn list_skills(home: &Path) -> Result<SkillListDto, String> {
     }
     let mut skills: Vec<_> = by_name.into_values().collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
+    enrich_skills(home, &mut skills);
     Ok(SkillListDto { skills, invalid })
 }
 
@@ -199,7 +214,7 @@ pub fn ops_status(
     }
 }
 
-fn load_profile_dto(path: &Path) -> Option<ProfileDto> {
+fn load_profile_dto(path: &Path, home: &Path) -> Option<ProfileDto> {
     let text = fs::read_to_string(path).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     let name = v.get("name")?.as_str()?.to_string();
@@ -235,6 +250,26 @@ fn load_profile_dto(path: &Path) -> Option<ProfileDto> {
         .unwrap_or_else(|| PathBuf::from("cookie.json"));
 
     let cookies = cookie_counts(&cookie_path);
+    let geo = v
+        .get("geo")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            v.get("label")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| Some(name.clone()));
+    let udd = v
+        .get("user_data_dir")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("data").join("profiles").join(&name));
+    let anon_env = udd.is_dir();
+    let (occupied, occupied_by) = profile_occupancy(Some(home), &name);
 
     Some(ProfileDto {
         name,
@@ -245,7 +280,55 @@ fn load_profile_dto(path: &Path) -> Option<ProfileDto> {
         cookie_count: cookies.count,
         cookie_valid: cookies.valid,
         cookie_expired: cookies.expired,
+        geo,
+        anon_env,
+        occupied,
+        occupied_by,
     })
+}
+
+pub(crate) fn profile_occupancy(home: Option<&Path>, name: &str) -> (bool, Option<String>) {
+    let Some(home) = home else {
+        return (false, None);
+    };
+    let lock = home.join("data").join("locks").join(format!("{name}.lock"));
+    if lock.is_dir() {
+        let pid = fs::read_to_string(lock.join("pid"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let alive = pid.map(process_alive).unwrap_or(true);
+        if alive {
+            return (
+                true,
+                Some(pid.map(|p| format!("lock pid {p}")).unwrap_or_else(|| "lock".into())),
+            );
+        }
+    }
+    let dir = home.join("data").join("jobs");
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for e in entries.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&p) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let profile = v.get("profile").and_then(|x| x.as_str()).unwrap_or("");
+            if profile != name {
+                continue;
+            }
+            let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("");
+            if !is_terminal_job(state) {
+                let job_id = v.get("job_id").and_then(|x| x.as_str()).unwrap_or("job");
+                return (true, Some(format!("job {job_id}")));
+            }
+        }
+    }
+    (false, None)
 }
 
 struct CookieCounts {
@@ -407,7 +490,86 @@ fn load_skill_dto(path: &Path) -> Result<SkillDto, String> {
         step_count,
         param_count,
         on_stall,
+        published: false,
+        version: None,
+        digest: None,
+        publish_state: "local".into(),
+        synced_clients: 0,
     })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReleaseInfo {
+    pub skill_id: String,
+    pub version: String,
+    pub digest: String,
+    pub published: bool,
+}
+
+pub(crate) fn load_releases(home: &Path) -> Vec<ReleaseInfo> {
+    let path = home
+        .join("data")
+        .join("skill_releases")
+        .join("catalog.json");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return vec![];
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return vec![];
+    };
+    let Some(arr) = v.get("releases").and_then(|x| x.as_array()) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for r in arr {
+        let skill_id = r
+            .get("skill_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let digest = r
+            .get("digest")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if skill_id.is_empty() || digest.is_empty() {
+            continue;
+        }
+        out.push(ReleaseInfo {
+            skill_id,
+            version: r
+                .get("version")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            digest,
+            published: r.get("published").and_then(|x| x.as_bool()).unwrap_or(false),
+        });
+    }
+    out
+}
+
+pub(crate) fn latest_release<'a>(
+    releases: &'a [ReleaseInfo],
+    skill_id: &str,
+) -> Option<&'a ReleaseInfo> {
+    releases.iter().rev().find(|r| r.skill_id == skill_id)
+}
+
+fn enrich_skills(home: &Path, skills: &mut [SkillDto]) {
+    let releases = load_releases(home);
+    for s in skills.iter_mut() {
+        if let Some(rel) = latest_release(&releases, &s.name) {
+            s.published = rel.published;
+            s.version = Some(rel.version.clone());
+            s.digest = Some(rel.digest.clone());
+            s.publish_state = if rel.published {
+                "published".into()
+            } else {
+                "draft".into()
+            };
+        }
+    }
 }
 
 fn hub_status(root: &Path) -> ComponentStatus {
@@ -696,6 +858,8 @@ mod tests {
         assert!(!json.contains("expired-secret"), "{json}");
         assert!(!json.contains("sessionid"), "{json}");
         assert!(!json.contains("user:"), "{json}");
+        assert_eq!(p.geo.as_deref(), Some("secretbox"));
+        assert!(!p.occupied);
 
         fs::remove_dir_all(&home).ok();
     }

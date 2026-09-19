@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fleet-submit-batch"
+description = "Enables the fleet_submit_batch command without any pre-configured scope."
+commands.allow = ["fleet_submit_batch"]
+
+[[permission]]
+identifier = "deny-fleet-submit-batch"
+description = "Denies the fleet_submit_batch command without any pre-configured scope."
+commands.deny = ["fleet_submit_batch"]

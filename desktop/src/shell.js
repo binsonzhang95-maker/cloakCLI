@@ -1,5 +1,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  fleetStatus,
+  listLedgers,
   listProfiles,
   listRuns,
   listSkills,
@@ -23,6 +25,7 @@ import {
   toggleInspector,
 } from "./store.js";
 import { ensureChatEvents, refreshResumeHint, renderChat, updateChatChrome } from "./features/teach-chat.js";
+import { renderFleet } from "./features/fleet.js";
 import { renderProfiles } from "./features/profiles.js";
 import { renderSkills } from "./features/skills.js";
 import { renderRuns } from "./features/runs.js";
@@ -30,7 +33,7 @@ import { ensureDiagnostics, focusDiagnostics, paintDiagHealth } from "./features
 import { safeRender, showFatal } from "./errors.js";
 import { renderShortcutsTable, shortcutsStatusHint } from "./help.js";
 
-const ROUTES = ["chat", "profiles", "skills", "runs", "diagnostics"];
+const ROUTES = ["fleet", "chat", "skills", "profiles", "runs", "diagnostics"];
 const appWindow = getCurrentWindow();
 
 function $(id) {
@@ -100,9 +103,11 @@ function paintInspector(state) {
     el.className = "insp-body";
     el.innerHTML = `<div class="kv">
       <span>name</span><span>${escapeHtml(p.name)}</span>
+      <span>geo</span><span>${escapeHtml(p.geo || p.name)}</span>
       <span>proxy</span><span>${escapeHtml(p.proxy || "direct")}</span>
+      <span>anon</span><span>${p.anon_env ? "user-data dir" : "missing"}</span>
+      <span>occupied</span><span>${p.occupied ? escapeHtml(p.occupied_by || "yes") : "free"}</span>
       <span>cookies</span><span>${p.cookie_present ? `${p.cookie_count} (${p.cookie_valid} valid)` : "none"}</span>
-      <span>notes</span><span>${escapeHtml(p.notes || "—")}</span>
       <span>skill</span><span>${escapeHtml(state.selectedSkill || "—")}</span>
     </div>`;
   }
@@ -141,6 +146,9 @@ function escapeHtml(s) {
 
 function paintRoute(state) {
   try {
+    if (state.route === "fleet") {
+      safeRender($("page-fleet"), "Fleet", renderFleet);
+    }
     if (state.route === "chat") {
       safeRender($("page-chat"), "Teach Chat", renderChat);
     }
@@ -151,7 +159,7 @@ function paintRoute(state) {
       safeRender($("page-skills"), "Skills", renderSkills);
     }
     if (state.route === "runs") {
-      safeRender($("page-runs"), "Runs / History", renderRuns);
+      safeRender($("page-runs"), "Runs", renderRuns);
     }
     if (state.route === "diagnostics") {
       ensureDiagnostics()
@@ -185,8 +193,11 @@ function onState(state) {
     j: state.status?.jobs_recent?.length,
     r: state.runs?.length,
     sel: state.selectedRun,
+    tab: state.runsTab,
     llm: state.llm?.configured,
     rh: state.resumeHint?.present,
+    fl: state.fleet?.clients?.length,
+    ld: state.ledgers?.length,
   });
   const routeChanged = state.route !== lastRoute;
   if (routeChanged) {
@@ -226,14 +237,21 @@ function onState(state) {
     state.route === "runs" &&
     (sig !== lastCatalogSig || state.selectedRun !== lastSelectedRun)
   ) {
-    safeRender($("page-runs"), "Runs / History", renderRuns);
+    safeRender($("page-runs"), "Runs", renderRuns);
     lastSelectedRun = state.selectedRun;
     lastCatalogSig = sig;
     return;
   }
+  if (state.route === "fleet" && sig !== lastCatalogSig) {
+    safeRender($("page-fleet"), "Fleet", renderFleet);
+    lastCatalogSig = sig;
+    return;
+  }
   if (sig !== lastCatalogSig) {
-    if (state.route === "runs") safeRender($("page-runs"), "Runs / History", renderRuns);
+    if (state.route === "runs") safeRender($("page-runs"), "Runs", renderRuns);
     if (state.route === "profiles") safeRender($("page-profiles"), "Profiles", renderProfiles);
+    if (state.route === "skills") safeRender($("page-skills"), "Skills", renderSkills);
+    if (state.route === "fleet") safeRender($("page-fleet"), "Fleet", renderFleet);
     lastCatalogSig = sig;
   }
 }
@@ -320,7 +338,7 @@ export async function bootShell() {
       }
     }
     if (typingTarget(event.target)) return;
-    if (event.key >= "1" && event.key <= "5") {
+    if (event.key >= "1" && event.key <= "6") {
       event.preventDefault();
       setRoute(ROUTES[Number(event.key) - 1]);
     } else if (event.key === "[") {
@@ -407,12 +425,14 @@ export async function refreshCatalog() {
       return;
     }
     $("setup").classList.add("hidden");
-    const [profiles, skillList, runs, llm, hint] = await Promise.all([
+    const [profiles, skillList, runs, llm, hint, fleet, ledgers] = await Promise.all([
       listProfiles(),
       listSkills(),
       listRuns().catch(() => []),
       llmStatus().catch(() => null),
       teachResumeHint().catch(() => null),
+      fleetStatus().catch(() => null),
+      listLedgers().catch(() => []),
     ]);
     setCatalog({
       profiles,
@@ -421,6 +441,8 @@ export async function refreshCatalog() {
       runs: Array.isArray(runs) ? runs : [],
       llm,
       resumeHint: hint,
+      fleet,
+      ledgers: Array.isArray(ledgers) ? ledgers : [],
     });
     const selected = getState().selectedProfile;
     if (selected && !profiles.some((p) => p.name === selected) && profiles[0]) {

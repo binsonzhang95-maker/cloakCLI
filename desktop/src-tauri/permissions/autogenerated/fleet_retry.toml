@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fleet-retry"
+description = "Enables the fleet_retry command without any pre-configured scope."
+commands.allow = ["fleet_retry"]
+
+[[permission]]
+identifier = "deny-fleet-retry"
+description = "Denies the fleet_retry command without any pre-configured scope."
+commands.deny = ["fleet_retry"]

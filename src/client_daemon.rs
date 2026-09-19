@@ -72,6 +72,7 @@ async fn connect_session(cfg: &ClientDaemonConfig) -> Result<()> {
         revision: 0,
         concurrency: 2,
         headed: state::default_headed(),
+        interval_ms: 0,
         labels: vec![],
     }));
 
@@ -236,6 +237,7 @@ async fn handle_config_update<W: AsyncWriteExt + Unpin>(
         "revision": {"from": prev.revision, "to": desired.revision},
         "concurrency": {"from": prev.concurrency, "to": desired.concurrency},
         "headed": {"from": prev.headed, "to": desired.headed},
+        "interval_ms": {"from": prev.interval_ms, "to": desired.interval_ms},
         "labels": {"from": prev.labels, "to": desired.labels},
     });
 

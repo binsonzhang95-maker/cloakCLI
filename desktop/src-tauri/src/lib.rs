@@ -1,5 +1,6 @@
 mod catalog;
 mod env_inherit;
+mod fleet;
 mod paths;
 mod pty;
 mod redact;
@@ -8,6 +9,10 @@ mod teach;
 mod teach_event;
 
 use catalog::{OpsStatus, ProfileDto, SkillListDto};
+use fleet::{
+    FleetBatchSpec, FleetConfigSpec, FleetSnapshotDto, FleetSubmitResult, FleetSubmitSpec,
+    LedgerPartitionDto,
+};
 use pty::SharedPty;
 use runs::{LlmStatusDto, ResumeHintDto, RunDto};
 use serde::Serialize;
@@ -195,6 +200,72 @@ fn list_runs(state: tauri::State<AppState>) -> Result<Vec<RunDto>, String> {
 }
 
 #[tauri::command]
+fn fleet_status(state: tauri::State<AppState>) -> Result<FleetSnapshotDto, String> {
+    let home = resolved_home(&state)?;
+    Ok(fleet::fleet_status(&home))
+}
+
+#[tauri::command]
+fn fleet_submit(
+    state: tauri::State<AppState>,
+    spec: FleetSubmitSpec,
+) -> Result<FleetSubmitResult, String> {
+    let home = resolved_home(&state)?;
+    fleet::fleet_submit(&home, spec)
+}
+
+#[tauri::command]
+fn fleet_submit_batch(
+    state: tauri::State<AppState>,
+    spec: FleetBatchSpec,
+) -> Result<Vec<FleetSubmitResult>, String> {
+    let home = resolved_home(&state)?;
+    fleet::fleet_submit_batch(&home, spec)
+}
+
+#[tauri::command]
+fn fleet_sync(
+    state: tauri::State<AppState>,
+    client_id: String,
+    skill_id: String,
+    version: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let home = resolved_home(&state)?;
+    fleet::fleet_sync(&home, client_id, skill_id, version)
+}
+
+#[tauri::command]
+fn fleet_config(
+    state: tauri::State<AppState>,
+    spec: FleetConfigSpec,
+) -> Result<serde_json::Value, String> {
+    let home = resolved_home(&state)?;
+    fleet::fleet_config(&home, spec)
+}
+
+#[tauri::command]
+fn fleet_park(
+    state: tauri::State<AppState>,
+    job_id: String,
+    reason: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let home = resolved_home(&state)?;
+    fleet::fleet_park(&home, job_id, reason)
+}
+
+#[tauri::command]
+fn fleet_retry(state: tauri::State<AppState>, job_id: String) -> Result<FleetSubmitResult, String> {
+    let home = resolved_home(&state)?;
+    fleet::fleet_retry(&home, job_id)
+}
+
+#[tauri::command]
+fn list_ledgers(state: tauri::State<AppState>) -> Result<Vec<LedgerPartitionDto>, String> {
+    let home = resolved_home(&state)?;
+    Ok(fleet::list_ledgers(&home))
+}
+
+#[tauri::command]
 fn llm_status(state: tauri::State<AppState>) -> Result<LlmStatusDto, String> {
     let home = resolved_home(&state)?;
     Ok(runs::llm_status(&home))
@@ -281,7 +352,15 @@ pub fn run() {
             job_cancel,
             list_runs,
             llm_status,
-            teach_resume_hint
+            teach_resume_hint,
+            fleet_status,
+            fleet_submit,
+            fleet_submit_batch,
+            fleet_sync,
+            fleet_config,
+            fleet_park,
+            fleet_retry,
+            list_ledgers
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -322,5 +401,8 @@ mod capability_tests {
         assert!(joined.contains("allow-llm-status"), "{joined}");
         assert!(joined.contains("allow-teach-resume-hint"), "{joined}");
         assert!(joined.contains("allow-teach-chat-start"), "{joined}");
+        assert!(joined.contains("allow-fleet-submit"), "{joined}");
+        assert!(joined.contains("allow-fleet-status"), "{joined}");
+        assert!(joined.contains("allow-list-ledgers"), "{joined}");
     }
 }

@@ -33,6 +33,12 @@ pub struct LedgerEntry {
     #[serde(default)]
     pub retryable: bool,
     pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo: Option<String>,
 }
 
 fn ledgers_dir(root: &Path) -> PathBuf {
@@ -75,6 +81,9 @@ pub fn record(
     result: &JobBusinessResult,
     job_id: &str,
     _already_counted: bool,
+    profile: Option<&str>,
+    account_id: Option<&str>,
+    geo: Option<&str>,
 ) -> Result<u64> {
     let skill_id = result.skill_id.as_str();
     if skill_id.is_empty() {
@@ -99,6 +108,18 @@ pub fn record(
         optional: result.optional,
         retryable: result.retryable,
         updated_at: chrono::Utc::now().timestamp(),
+        profile: profile
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        account_id: account_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        geo: geo
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
     };
     if entry.success {
         part.success_count = part.success_count.saturating_add(1);

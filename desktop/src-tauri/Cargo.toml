@@ -1,7 +1,7 @@
 [package]
 name = "cloakcli-desktop"
 version = "0.3.0"
-description = "CloakCLI desktop — Tauri 2 geek ops console (M3); PTY TUI is Diagnostics only"
+description = "CloakCLI desktop — Tauri 2 geek ops console; Fleet is the default home; PTY TUI is Diagnostics only"
 authors = ["CloakCLI Contributors"]
 edition = "2021"
 rust-version = "1.85"
