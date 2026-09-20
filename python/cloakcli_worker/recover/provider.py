@@ -27,6 +27,17 @@ TINY_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
 
+_ALLOWED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
+
+
+def _normalize_image_mime(raw: str | None) -> str:
+    s = (raw or "image/png").strip().lower()
+    if s == "image/jpg":
+        s = "image/jpeg"
+    if s not in _ALLOWED_IMAGE_MIMES:
+        return "image/png"
+    return s
+
 
 class ProviderError(RuntimeError):
     pass
@@ -40,6 +51,7 @@ class OpenAICompatProvider:
         *,
         image_b64: str | None = None,
         timeout_sec: float = 60,
+        image_mime: str | None = None,
     ) -> tuple[str, int]:
         """Return (assistant_text, total_tokens). Never logs Authorization."""
         if not cfg.base_url or not cfg.model:
@@ -52,6 +64,7 @@ class OpenAICompatProvider:
         if not url:
             raise ProviderError("base_url must be http(s)")
 
+        mime = _normalize_image_mime(image_mime)
         body_messages = list(messages)
         if image_b64 and body_messages:
             last = dict(body_messages[-1])
@@ -61,7 +74,7 @@ class OpenAICompatProvider:
                     {"type": "text", "text": content},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                        "image_url": {"url": f"data:{mime};base64,{image_b64}"},
                     },
                 ]
                 body_messages[-1] = last

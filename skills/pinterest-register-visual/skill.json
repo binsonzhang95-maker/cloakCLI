@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "name": "pinterest-register-visual",
+  "description": "PRODUCT multimodal Pinterest register (0.2.0): CloakBrowser screenshot → OpenAI-compatible vision JSON actions → execute; same-session nurture BEFORE ctx.close. Bot must call scripts/run_pinterest_register_visual_mm.py. computerUse is not the product path. Never system Chrome. IMAP via scripts/outlook_imap_pinterest_code.py. Nurture 0.1.7+.",
+  "params": [
+    "EMAIL",
+    "PASSWORD",
+    "BIRTHDAY",
+    "DISPLAY_NAME",
+    "PROFILE",
+    "SECRETS_ENV"
+  ],
+  "steps": [
+    {
+      "action": "note",
+      "text": "PRODUCT PATH: python_runner scripts/run_pinterest_register_visual_mm.py (also repo scripts/). Bot must exec this runner. Free computerUse / visual_operator clicking is NOT the product path."
+    },
+    {
+      "action": "note",
+      "text": "PREFLIGHT: Require DISPLAY for headed CloakBrowser. Load profiles/<PROFILE>/profile.json for proxy + identity. Secrets only from SECRETS_ENV. LLM from config/llm.json + CLOAKCLI_LLM_API_KEY (Grok: https://api.x.ai/v1 + vision model). Never --api-key. NEVER launch system Chrome."
+    },
+    {
+      "action": "note",
+      "text": "LAUNCH: Runner opens headed CloakBrowser persistent context with profile proxy. Do not wipe user_data_dir unless --fresh-profile at attempt start (refuse if .cloak_session_ok). Do not change fingerprint knobs."
+    },
+    {
+      "action": "note",
+      "text": "MM LOOP: screenshot (viewport JPEG, never full-page) → vision chat/completions image_url → JSON action click|type|press|wait|scroll|imap_fetch_code|nurture|done|fail → CloakBrowser execute. Human pacing 800–2500ms fields; 2–5s before Continue; 3–8s settle after. Artifacts: artifacts/pinterest/visual/<profile>/"
+    },
+    {
+      "action": "note",
+      "text": "FILL: Model types {{EMAIL}} {{PASSWORD}} {{BIRTHDAY}} {{DISPLAY_NAME}} (age 25–35; realistic given name, never email local-part). Avoid Google OAuth. Continue = primary CTA."
+    },
+    {
+      "action": "note",
+      "text": "CODE / SETTINGS: imap_fetch_code uses scripts/outlook_imap_pinterest_code.py then type {{CODE}}. Settings Confirm Email path if no code challenge. Oops → oops_blocked park. IMAP/UI miss → verify_soft_fail."
+    },
+    {
+      "action": "note",
+      "text": "NURTURE CHAIN (mandatory default): On registered_ok, DO NOT ctx.close yet. Touch .cloak_session_ok; flush; session_keepalive_probe; run_nurture_session 0.1.7+. Login wall → nurture_status=session_lost_before_nurture. Skip only with --skip-nurture (warning)."
+    },
+    {
+      "action": "note",
+      "text": "REPORT: Final JSON version 0.2.0, status ∈ {registered_ok, browsed_ok, oops_blocked, verify_soft_fail, account_deactivated, not_logged_in, visual_stuck}, plus path, nurture_status, nurture_elapsed_s, elapsed_s, profile. Smoke: --dry-run mock vision."
+    }
+  ]
+}

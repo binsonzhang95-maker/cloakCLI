@@ -1,0 +1,59 @@
+{
+  "version": "0.2.0",
+  "entry": {
+    "kind": "python_runner",
+    "path": "scripts/run_pinterest_register_visual_mm.py"
+  },
+  "secrets": [
+    "PINTEREST_EMAIL",
+    "PINTEREST_PASSWORD",
+    "OUTLOOK_EMAIL",
+    "OUTLOOK_CLIENT_ID",
+    "OUTLOOK_REFRESH_TOKEN"
+  ],
+  "statuses": [
+    {
+      "id": "registered_ok",
+      "success": true,
+      "retryable": false,
+      "label": "Registered / logged in"
+    },
+    {
+      "id": "browsed_ok",
+      "success": true,
+      "retryable": false,
+      "label": "Nurture browse OK (optional chain)",
+      "optional": true
+    },
+    {
+      "id": "oops_blocked",
+      "success": false,
+      "retryable": false,
+      "label": "Pinterest Oops — park"
+    },
+    {
+      "id": "verify_soft_fail",
+      "success": false,
+      "retryable": true,
+      "label": "Verify soft fail (retryable)"
+    },
+    {
+      "id": "account_deactivated",
+      "success": false,
+      "retryable": false,
+      "label": "Account deactivated"
+    },
+    {
+      "id": "not_logged_in",
+      "success": false,
+      "retryable": true,
+      "label": "Not logged in"
+    },
+    {
+      "id": "visual_stuck",
+      "success": false,
+      "retryable": true,
+      "label": "Visual MM loop stuck"
+    }
+  ]
+}
