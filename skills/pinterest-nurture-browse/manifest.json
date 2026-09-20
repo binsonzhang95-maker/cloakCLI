@@ -1,0 +1,40 @@
+{
+  "version": "0.2.0",
+  "entry": {
+    "kind": "python_runner",
+    "path": "scripts/run_pinterest_nurture_browse.py"
+  },
+  "secrets": [],
+  "statuses": [
+    {
+      "id": "browsed_ok",
+      "success": true,
+      "retryable": false,
+      "label": "Nurture browse OK"
+    },
+    {
+      "id": "not_logged_in",
+      "success": false,
+      "retryable": true,
+      "label": "Not logged in"
+    },
+    {
+      "id": "like_failed",
+      "success": false,
+      "retryable": true,
+      "label": "Like failed"
+    },
+    {
+      "id": "account_deactivated",
+      "success": false,
+      "retryable": false,
+      "label": "Account deactivated"
+    },
+    {
+      "id": "session_lost_before_nurture",
+      "success": false,
+      "retryable": true,
+      "label": "Session lost before nurture (register chain probe)"
+    }
+  ]
+}

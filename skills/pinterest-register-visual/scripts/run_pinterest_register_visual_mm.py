@@ -2477,7 +2477,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not chain nurture before ctx.close (NOT recommended).",
     )
-    ap.add_argument("--nurture-pins", type=int, default=3)
+    ap.add_argument(
+        "--nurture-pins",
+        type=int,
+        default=0,
+        help="Nurture pins to open (0=persona chooses 1–12)",
+    )
     ap.add_argument("--nurture-min-sec", type=int, default=120)
     ap.add_argument("--nurture-max-sec", type=int, default=180)
     ap.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)

@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "name": "pinterest-nurture-browse",
+  "description": "Nurture browse 0.2.0: headed default, continuous randomized mouse trails, inertial scroll, personas (browse_only/light_like/deep_browse/bounce_early), pins 1–12, like 15–40% (0 likes OK), log-normal pauses, quiet window. Prefer python_runner. One account ↔ one geo/proxy. Pipeline: register → nurture same job.",
+  "params": [],
+  "steps": [
+    {
+      "action": "note",
+      "text": "Requires logged-in persistent profile (cookies). Do not wipe user_data_dir. Stop on unauth CTA / account deactivated. 0.2.0 behavior: default headed (--headless opt-in, Xvfb OK); continuous random mouse trails before pin/like/close; inertial scroll; personas; log-normal pauses; quiet window after load; no fill for human fields."
+    },
+    {
+      "action": "goto",
+      "url": "https://www.pinterest.com/",
+      "timeout": 90000
+    },
+    {
+      "action": "wait",
+      "ms": 4000
+    },
+    {
+      "action": "note",
+      "text": "If name/gender onboarding appears, complete each step (gender: Male/Female 50/50); if [data-test-id=desktop-use-case-picker], click 3+ [data-test-id^=use-case-tap-area-], then [data-test-id=skip-or-continue-button]. Do not Escape while onboarding is up."
+    },
+    {
+      "action": "screenshot",
+      "path": "artifacts/pinterest/nurture-browse/skill-01-home.png"
+    },
+    {
+      "action": "note",
+      "text": "Assert logged-in: no unauth-header/simple-login-button; prefer header-accounts-options-button / pin feed links."
+    },
+    {
+      "action": "wait",
+      "ms": 8000
+    },
+    {
+      "action": "note",
+      "text": "Feed: inertial scroll + ambient mouse (python_runner). skill_steps cannot pick random pins or trails well."
+    },
+    {
+      "action": "wait",
+      "ms": 8000
+    },
+    {
+      "action": "click",
+      "selector": "a[href*=\"/pin/\"]",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 6000
+    },
+    {
+      "action": "screenshot",
+      "path": "artifacts/pinterest/nurture-browse/skill-02-pin.png"
+    },
+    {
+      "action": "note",
+      "text": "Close: [data-test-id=back-icon-button] (verified) || Escape / history back"
+    },
+    {
+      "action": "click",
+      "selector": "[data-test-id=\"back-icon-button\"]",
+      "timeout": 10000
+    },
+    {
+      "action": "wait",
+      "ms": 4000
+    },
+    {
+      "action": "click",
+      "selector": "a[href*=\"/pin/\"]",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 6000
+    },
+    {
+      "action": "click",
+      "selector": "[data-test-id=\"back-icon-button\"]",
+      "timeout": 10000
+    },
+    {
+      "action": "wait",
+      "ms": 4000
+    },
+    {
+      "action": "click",
+      "selector": "a[href*=\"/pin/\"]",
+      "timeout": 30000
+    },
+    {
+      "action": "wait",
+      "ms": 5000
+    },
+    {
+      "action": "click",
+      "selector": "[data-test-id=\"react-button\"]",
+      "timeout": 15000
+    },
+    {
+      "action": "wait",
+      "ms": 2000
+    },
+    {
+      "action": "screenshot",
+      "path": "artifacts/pinterest/nurture-browse/skill-03-liked.png"
+    },
+    {
+      "action": "click",
+      "selector": "[data-test-id=\"back-icon-button\"]",
+      "timeout": 10000
+    },
+    {
+      "action": "wait",
+      "ms": 6000
+    },
+    {
+      "action": "screenshot",
+      "path": "artifacts/pinterest/nurture-browse/skill-04-final.png"
+    }
+  ]
+}
