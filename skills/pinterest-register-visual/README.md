@@ -1,4 +1,4 @@
-# pinterest-register-visual (0.2.2)
+# pinterest-register-visual (0.2.3)
 
 **PRODUCT path:** multimodal loop on **CloakBrowser** —
 
@@ -16,7 +16,7 @@ Skill package entry is `python_runner` → `scripts/run_pinterest_register_visua
 
 ## When to use vs `pinterest-register-outlook-verify`
 
-| | `pinterest-register-visual` 0.2.2 | `pinterest-register-outlook-verify` |
+| | `pinterest-register-visual` 0.2.3 | `pinterest-register-outlook-verify` |
 |--|-----------------------------------|-------------------------------------|
 | Execution | Product MM loop (`python_runner`) | Declarative `skill.json` steps + selector runner |
 | Targeting | Vision JSON actions (`click` css or x/y + `screenshot_id`) | CSS / Playwright selectors |
@@ -83,13 +83,14 @@ cloakcli llm models
 `click` | `type` | `press` | `wait` | `scroll` | `imap_fetch_code` | `nurture` | `done` | `fail`
 
 - `click`: CSS `selector`, **or** `x`/`y` **plus** `screenshot_id` equal to the current observation
-- `type`: `text` with `{{EMAIL}}` `{{PASSWORD}}` `{{BIRTHDAY}}` `{{DISPLAY_NAME}}` `{{CODE}}`, or `field: email|password|birthday|name|code` (runner substitutes; values never logged)
+- `type`: prefer `field: email|password|birthday|name|code` — runner **auto-binds** CSS (`#email`, `#password`, `#birthdate`, `#code`, onboarding name) then clicks the real input and types (date uses `fill` with **YYYY-MM-DD**). `text` with `{{EMAIL}}` `{{PASSWORD}}` `{{BIRTHDAY}}` `{{DISPLAY_NAME}}` `{{CODE}}` also works. Values never logged. After email+password+birthday, click `button:has-text('Continue')` (not Google); the runner skips re-types and may one-shot Continue if the model loops. Vision timeouts / transient HTTP retry 2–3× before `model_error`.
 - `imap_fetch_code`: existing Outlook IMAP helper
 - `nurture` / `done` with any **success** status (`registered_ok`, `browsed_ok`, … from `manifest.json`): **hints only**. Runner confirms login (account menu / pin feed / no unauth Log in+Sign up CTA) before writing `.cloak_session_ok`, chaining nurture, or returning success. `done: browsed_ok` on a register/login page is rejected (`not_logged_in` / `visual_stuck`). `nurture` alone never sets registered. Unknown model status → `visual_stuck` (never invent success).
 
 ## Behavior pacing
 
 - Fields: 800–2500ms · before Continue: 2–5s · after Continue settle: 3–8s · no click storms
+- Signup anti-loop: skip duplicate field types; after three fills bias Continue; one-shot Continue recovery after 3 redundant types
 - Soft verify: IMAP miss → `verify_soft_fail` (retryable) · Oops: park + 5–10 min cooldown on that exit
 - Concurrency ≤2–3; shared udeal → serial / 1 per exit
 

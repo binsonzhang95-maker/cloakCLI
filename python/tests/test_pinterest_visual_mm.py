@@ -1,4 +1,4 @@
-"""Product multimodal Pinterest register runner (0.2.2) — parse, LLM discover, dry-run."""
+"""Product multimodal Pinterest register runner (0.2.3) — parse, LLM discover, dry-run."""
 from __future__ import annotations
 
 import argparse
@@ -126,7 +126,9 @@ class ParseActionTests(unittest.TestCase):
         self.assertNotIn("user@example.com", blob)
         self.assertNotIn("super-secret-pass", blob)
         f = self.mm.parse_mm_action('{"action":"type","field":"code"}')
-        self.assertEqual(self.mm.substitute_secrets(f, secrets)["text"], "654321")
+        code_bound = self.mm.substitute_secrets(f, secrets)
+        self.assertEqual(code_bound["text"], "654321")
+        self.assertEqual(code_bound["selector"], "#code")
         leaked = self.mm.redact_result_strings(
             {"reason": "typed user@example.com / super-secret-pass"},
             extra_secrets=[secrets["PASSWORD"], secrets["EMAIL"]],
@@ -351,7 +353,7 @@ class DryRunSmokeTests(unittest.TestCase):
         self.assertTrue(lines)
         report = json.loads(lines[-1])
         self.assertEqual(report["skill_id"], "pinterest-register-visual")
-        self.assertEqual(report["version"], "0.2.2")
+        self.assertEqual(report["version"], "0.2.3")
         self.assertEqual(report["status"], "registered_ok")
         self.assertEqual(report["nurture_status"], "browsed_ok")
         self.assertTrue(report.get("dry_run"))
@@ -375,11 +377,11 @@ class DryRunSmokeTests(unittest.TestCase):
         report = json.loads([ln for ln in proc.stdout.splitlines() if ln.strip()][-1])
         self.assertEqual(report["status"], "visual_stuck")
 
-    def test_skill_manifest_python_runner_0_2_2(self) -> None:
+    def test_skill_manifest_python_runner_0_2_3(self) -> None:
         man = json.loads(
             (ROOT / "skills/pinterest-register-visual/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(man["version"], "0.2.2")
+        self.assertEqual(man["version"], "0.2.3")
         self.assertEqual(man["entry"]["kind"], "python_runner")
         self.assertEqual(man["entry"]["path"], "scripts/run_pinterest_register_visual_mm.py")
         ids = {s["id"] for s in man["statuses"]}
@@ -933,6 +935,291 @@ class LoginGateAndActionTests(unittest.TestCase):
         self.assertIsNone(hit)
         dumped = err.getvalue()
         self.assertNotIn(secret, dumped)
+
+
+class SignupDeadLoopTests(unittest.TestCase):
+    """0.2.3: field→selector bind, type focuses input, anti-loop, vision retry."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mm = load_mm()
+
+    def test_field_binds_selector(self) -> None:
+        secrets = _subst()
+        secrets["CODE"] = "654321"
+        expected = {
+            "email": "#email",
+            "password": "#password",
+            "birthday": "#birthdate",
+            "birthdate": "#birthdate",
+            "code": "#code",
+        }
+        for field, sel in expected.items():
+            a = self.mm.parse_mm_action(json.dumps({"action": "type", "field": field}))
+            bound = self.mm.bind_type_selector(a)
+            self.assertEqual(bound.get("selector"), sel, field)
+            sub = self.mm.substitute_secrets(a, secrets)
+            self.assertEqual(sub.get("selector"), sel, field)
+            self.assertTrue(sub.get("text"))
+            self.assertNotIn("field", sub)
+        name = self.mm.bind_type_selector(
+            self.mm.parse_mm_action('{"action":"type","field":"name"}')
+        )
+        self.assertIn("name", str(name.get("selector") or "").lower())
+        ph = self.mm.bind_type_selector(
+            {"action": "type", "text": "{{EMAIL}}"}
+        )
+        self.assertEqual(ph.get("selector"), "#email")
+        icon = self.mm.bind_type_selector(
+            {
+                "action": "type",
+                "field": "birthday",
+                "selector": "button.calendar-icon",
+                "text": "{{BIRTHDAY}}",
+            }
+        )
+        self.assertEqual(icon.get("selector"), "#birthdate")
+
+    def test_type_without_selector_focuses_email(self) -> None:
+        page = self.mm.DryRunPage()
+        self.assertIsNone(page.focused)
+        result = self.mm.execute_browser_action(
+            page,
+            {"action": "type", "field": "email", "text": "user@example.com"},
+            screenshot_id="obs-000",
+        )
+        self.assertTrue(result["ok"])
+        self.assertIn("#email", page.clicked)
+        self.assertEqual(page.focused, "#email")
+        self.assertEqual(page.fields.get("#email"), "user@example.com")
+        self.assertTrue(page.typed)
+        bday = self.mm.execute_browser_action(
+            page,
+            {"action": "type", "field": "birthday", "text": "1995-04-12"},
+            screenshot_id="obs-000",
+        )
+        self.assertTrue(bday["ok"])
+        self.assertIn("fill-date", str(bday.get("detail") or ""))
+        self.assertIn(("#birthdate", "1995-04-12"), page.filled)
+
+    def test_anti_loop_rejects_duplicate_field_type(self) -> None:
+        d = self.mm.signup_type_decision(
+            heuristic="signup_form",
+            action={"action": "type", "field": "email"},
+            filled={"email"},
+            redundant_streak=0,
+        )
+        self.assertTrue(d["skip"])
+        self.assertFalse(d["recover_continue"])
+        self.assertIn("already filled email", d["feedback"])
+        self.assertIn("password", d["feedback"])
+        self.assertEqual(d["streak"], 1)
+        fresh = self.mm.signup_type_decision(
+            heuristic="signup_form",
+            action={"action": "type", "field": "password"},
+            filled={"email"},
+            redundant_streak=0,
+        )
+        self.assertFalse(fresh["skip"])
+
+    def test_after_three_fills_continue_nudge_and_recovery(self) -> None:
+        filled = {"email", "password", "birthday"}
+        nudge = self.mm.signup_type_decision(
+            heuristic="signup_form",
+            action={"action": "type", "field": "email"},
+            filled=filled,
+            redundant_streak=0,
+        )
+        self.assertTrue(nudge["skip"])
+        self.assertIn("button:has-text('Continue')", nudge["feedback"])
+        self.assertIn("not Continue with Google", nudge["feedback"])
+        third = self.mm.signup_type_decision(
+            heuristic="signup_form",
+            action={"action": "type", "field": "password"},
+            filled=filled,
+            redundant_streak=2,
+        )
+        self.assertTrue(third["skip"])
+        self.assertTrue(third["recover_continue"])
+        self.assertEqual(third["streak"], 3)
+        self.assertIn("recovery", third["feedback"])
+
+        ud = Path(tempfile.mkdtemp(prefix="cloakcli_visual_ud_loop_"))
+        page = self.mm.DryRunPage()
+        vision = self.mm.MockVision(
+            [
+                {"schema_version": 1, "action": "type", "field": "email"},
+                {"schema_version": 1, "action": "type", "field": "password"},
+                {"schema_version": 1, "action": "type", "field": "birthday"},
+                {"schema_version": 1, "action": "type", "field": "email"},
+                {"schema_version": 1, "action": "type", "field": "password"},
+                {"schema_version": 1, "action": "type", "field": "email"},
+                {"schema_version": 1, "action": "imap_fetch_code"},
+                {"schema_version": 1, "action": "type", "field": "code"},
+                {
+                    "schema_version": 1,
+                    "action": "click",
+                    "selector": "button:has-text('Continue')",
+                },
+                {"schema_version": 1, "action": "nurture"},
+                {
+                    "schema_version": 1,
+                    "action": "done",
+                    "status": "registered_ok",
+                    "path": "code_ui",
+                },
+            ]
+        )
+        logs: list[dict] = []
+        orig_log = self.mm.log
+
+        def _cap(obj: dict) -> None:
+            logs.append(obj)
+            orig_log(obj)
+
+        with mock.patch.object(self.mm, "log", side_effect=_cap):
+            report = self.mm.run_loop(
+                page=page,
+                ctx=None,
+                ud=ud,
+                args=_loop_args(max_steps=16),
+                secrets=_subst(),
+                secrets_path=str(ROOT / "data/secrets/pinterest-outlook-01.env"),
+                disc={"base_url": "https://api.x.ai/v1", "model": "grok-4.6"},
+                extra_secrets=["super-secret-pass", "user@example.com"],
+                dry_run=True,
+                vision=vision,
+                api_key="",
+                root=ROOT,
+            )
+        skipped = [e for e in logs if e.get("status") == "signup_type_skipped"]
+        recovered = [e for e in logs if e.get("status") == "signup_continue_recovery"]
+        self.assertTrue(skipped, "duplicate field types must be skipped")
+        self.assertTrue(recovered and recovered[0].get("ok"), "one-shot Continue recovery")
+        self.assertEqual(report["status"], "registered_ok")
+        self.assertTrue((ud / ".cloak_session_ok").exists())
+        blob = json.dumps(report)
+        self.assertNotIn("user@example.com", blob)
+        self.assertNotIn("super-secret-pass", blob)
+
+    def test_vision_timeout_retries_then_succeeds(self) -> None:
+        mm = self.mm
+
+        class Flaky:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def complete(self, *_a: object, **_k: object) -> tuple[str, int]:
+                self.n += 1
+                if self.n < 3:
+                    raise TimeoutError("model request timed out")
+                return '{"schema_version":1,"action":"wait","ms":50}', 4
+
+        sleeps: list[float] = []
+        flaky = Flaky()
+        text, tokens = mm.complete_vision_resilient(
+            flaky,
+            {},
+            [],
+            image_b64="",
+            image_mime="image/jpeg",
+            timeout_sec=8,
+            sleep_fn=lambda s: sleeps.append(s),
+            dry_run=False,
+        )
+        self.assertEqual(flaky.n, 3)
+        self.assertEqual(len(sleeps), 2)
+        self.assertIn("wait", text)
+        self.assertEqual(tokens, 4)
+
+        class AlwaysTimeout:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def complete(self, *_a: object, **_k: object) -> tuple[str, int]:
+                self.n += 1
+                raise TimeoutError("model request timed out")
+
+        boom = AlwaysTimeout()
+        with self.assertRaises(TimeoutError):
+            mm.complete_vision_resilient(
+                boom,
+                {},
+                [],
+                image_b64="",
+                image_mime="image/jpeg",
+                timeout_sec=8,
+                sleep_fn=lambda _s: None,
+                dry_run=False,
+            )
+        self.assertEqual(boom.n, mm.VISION_RETRY_ATTEMPTS)
+
+        class AuthFail:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def complete(self, *_a: object, **_k: object) -> tuple[str, int]:
+                self.n += 1
+                raise RuntimeError("HTTP 401 unauthorized")
+
+        auth = AuthFail()
+        with self.assertRaises(RuntimeError):
+            mm.complete_vision_resilient(
+                auth,
+                {},
+                [],
+                image_b64="",
+                image_mime="image/jpeg",
+                timeout_sec=8,
+                sleep_fn=lambda _s: None,
+                dry_run=False,
+            )
+        self.assertEqual(auth.n, 1)
+        self.assertTrue(mm.is_transient_model_error(TimeoutError("timed out")))
+        self.assertTrue(mm.is_transient_model_error(RuntimeError("HTTP 503 bad gateway")))
+        self.assertFalse(mm.is_transient_model_error(RuntimeError("HTTP 401 unauthorized")))
+
+        ud = Path(tempfile.mkdtemp(prefix="cloakcli_visual_ud_to_"))
+        page = self.mm.DryRunPage(persist_logged_in=True)
+
+        class FlakyThenDone:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *_a: object, **_k: object) -> tuple[str, int]:
+                self.calls += 1
+                if self.calls < 3:
+                    raise TimeoutError("model request timed out")
+                return (
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "action": "done",
+                            "status": "registered_ok",
+                            "path": "already_logged_in",
+                        }
+                    ),
+                    4,
+                )
+
+        vision = FlakyThenDone()
+        report = self.mm.run_loop(
+            page=page,
+            ctx=None,
+            ud=ud,
+            args=_loop_args(max_steps=6),
+            secrets=_subst(),
+            secrets_path=str(ROOT / "data/secrets/pinterest-outlook-01.env"),
+            disc={"base_url": "https://api.x.ai/v1", "model": "grok-4.6"},
+            extra_secrets=["super-secret-pass", "user@example.com"],
+            dry_run=True,
+            vision=vision,
+            api_key="",
+            root=ROOT,
+        )
+        self.assertEqual(report["status"], "registered_ok")
+        self.assertEqual(vision.calls, 3)
+        self.assertEqual(report["steps"], 0)
 
 
 if __name__ == "__main__":

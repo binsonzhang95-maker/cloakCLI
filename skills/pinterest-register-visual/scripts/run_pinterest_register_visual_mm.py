@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinterest visual register — PRODUCT multimodal loop (0.2.2).
+"""Pinterest visual register — PRODUCT multimodal loop (0.2.3).
 
 screenshot → OpenAI-compatible vision (chat/completions + image_url) → JSON
 action → CloakBrowser execute → same-session nurture BEFORE ctx.close.
@@ -14,6 +14,10 @@ Terminal statuses, success flags, and process-exit mapping come from the skill
 package manifest (skills/pinterest-register-visual/manifest.json, or the
 manifest next to this runner). Success terminals require an independent login
 gate; the model cannot mint registered_ok / browsed_ok on a signup page.
+
+0.2.3: field → CSS selector bind so type focuses the real input (not a silent
+keyboard no-op); signup_form anti-loop + one-shot Continue recovery; vision
+timeout/transient HTTP retries.
 """
 from __future__ import annotations
 
@@ -34,7 +38,7 @@ from typing import Any
 
 SKILL_ID = "pinterest-register-visual"
 # Fallback until the skill-package manifest is loaded below.
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 SESSION_OK_NAME = ".cloak_session_ok"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
@@ -131,6 +135,47 @@ FIELD_PLACEHOLDERS = {
     "display_name": "DISPLAY_NAME",
     "code": "CODE",
 }
+# Same onboarding name inputs as nurture / declarative register.
+NAME_INPUT_SELS = (
+    'input[id="name"]',
+    'input[name="name"]',
+    'input[aria-label="Name"]',
+    '[data-test-id="name-input"] input',
+    'label:has-text("Name") ~ input',
+    'label:has-text("Name") + input',
+)
+_NAME_SELECTOR = ", ".join(NAME_INPUT_SELS)
+FIELD_SELECTORS = {
+    "email": "#email",
+    "password": "#password",
+    "birthday": "#birthdate",
+    "birthdate": "#birthdate",
+    "code": "#code",
+    "name": _NAME_SELECTOR,
+    "display_name": _NAME_SELECTOR,
+}
+PLACEHOLDER_SELECTORS = {
+    "EMAIL": "#email",
+    "PASSWORD": "#password",
+    "BIRTHDAY": "#birthdate",
+    "CODE": "#code",
+    "DISPLAY_NAME": _NAME_SELECTOR,
+}
+SIGNUP_CORE_FIELDS = ("email", "password", "birthday")
+REDUNDANT_TYPE_CONTINUE_AFTER = 3
+SIGNUP_CONTINUE_SELECTOR = "button:has-text('Continue')"
+VISION_RETRY_ATTEMPTS = 3
+VISION_RETRY_BACKOFF_SEC = (0.8, 1.6, 3.2)
+_TYPE_ICON_RE = re.compile(
+    r"calendar|datepicker|date-picker|show-password|hide-password|"
+    r"toggle-password|visibility|eye-icon|password-toggle",
+    re.I,
+)
+_TRANSIENT_HTTP_RE = re.compile(r"\b(?:http\s*)?(?:408|429|500|502|503|504)\b", re.I)
+_TRANSIENT_WORD_RE = re.compile(
+    r"timed?\s*out|timeout|temporar|unavailable|connection (?:reset|refused|aborted)|network",
+    re.I,
+)
 REQUIRED_SECRET_KEYS = (
     "PINTEREST_EMAIL",
     "PINTEREST_PASSWORD",
@@ -352,8 +397,14 @@ Return JSON only, schema_version 1, ONE action per turn:
 
 click: {"selector":"css"} OR {"x":int,"y":int,"screenshot_id":"<current screenshot_id>"}
   Coordinate clicks REQUIRE screenshot_id equal to this observation. Coords are CSS pixels.
-type: {"selector":"css","text":"{{EMAIL}}|{{PASSWORD}}|{{BIRTHDAY}}|{{DISPLAY_NAME}}|{{CODE}}"}
-  Or {"field":"email|password|birthday|name|code"} (runner substitutes secrets). Never invent credentials.
+type: {"field":"email|password|birthday|name|code"} preferred.
+  Runner AUTO-BINDS CSS: email→#email, password→#password, birthday/birthdate→#birthdate,
+  code→#code, name→onboarding name input. Then click the real input and type (date uses fill).
+  Birthday text MUST be YYYY-MM-DD for #birthdate (type=date). Never invent credentials.
+  {"selector":"css","text":"{{EMAIL}}|{{PASSWORD}}|{{BIRTHDAY}}|{{DISPLAY_NAME}}|{{CODE}}"} also works.
+  Do not type into calendar / show-password eye icons — the runner remaps those to the input.
+  After email + password + birthday are filled you MUST click button:has-text('Continue')
+  (NOT Continue with Google). Do not retype a field that is already filled.
 press: {"key":"Enter|Tab|Escape|ArrowDown|..."}
 scroll: {"delta_y":int} small only (|delta|<=800) or {"selector":"css"}
 wait: {"ms":int}  (runner also applies human pacing; do not spam)
@@ -599,8 +650,78 @@ def redact_result_strings(value: Any, extra_secrets: list[str] | None = None) ->
     return value
 
 
-def substitute_secrets(action: dict[str, Any], secrets: dict[str, str]) -> dict[str, Any]:
+def _is_icon_selector(sel: str) -> bool:
+    return bool(sel) and bool(_TYPE_ICON_RE.search(sel))
+
+
+def infer_type_field(action: dict[str, Any]) -> str | None:
+    """Map a type action to a canonical field id (email|password|birthday|name|code)."""
+    field = action.get("field")
+    if isinstance(field, str):
+        f = field.strip().lower()
+        if f in ("birthdate", "birthday"):
+            return "birthday"
+        if f in ("display_name", "name"):
+            return "name"
+        if f in FIELD_PLACEHOLDERS:
+            return f
+    sel = str(action.get("selector") or "").lower()
+    if "#email" in sel:
+        return "email"
+    if "#password" in sel:
+        return "password"
+    if "#birthdate" in sel or "birthday" in sel:
+        return "birthday"
+    if "#code" in sel:
+        return "code"
+    if re.search(r"(?:#name|\[id=[\"']name[\"']\]|\[name=[\"']name[\"']\]|name-input|aria-label=[\"']name[\"'])", sel):
+        return "name"
+    text = action.get("text")
+    if isinstance(text, str):
+        m = _PLACEHOLDER_RE.fullmatch(text.strip())
+        if m:
+            return {
+                "EMAIL": "email",
+                "PASSWORD": "password",
+                "BIRTHDAY": "birthday",
+                "CODE": "code",
+                "DISPLAY_NAME": "name",
+            }.get(m.group(1).upper())
+    return None
+
+
+def bind_type_selector(action: dict[str, Any]) -> dict[str, Any]:
+    """When field is set (or a secret placeholder) and selector is missing, bind CSS.
+
+    Calendar / show-password eye icons are remapped to the real input.
+    """
     out = dict(action)
+    if out.get("action") != "type":
+        return out
+    field = infer_type_field(out)
+    mapped = FIELD_SELECTORS.get(field) if field else None
+    if field in ("birthday", "birthdate"):
+        mapped = "#birthdate"
+    sel = out.get("selector")
+    if isinstance(sel, str) and sel.strip():
+        if mapped and _is_icon_selector(sel):
+            out["selector"] = mapped
+        return out
+    if mapped:
+        out["selector"] = mapped
+        return out
+    text = out.get("text")
+    if isinstance(text, str):
+        m = _PLACEHOLDER_RE.fullmatch(text.strip())
+        if m:
+            ph = PLACEHOLDER_SELECTORS.get(m.group(1).upper())
+            if ph:
+                out["selector"] = ph
+    return out
+
+
+def substitute_secrets(action: dict[str, Any], secrets: dict[str, str]) -> dict[str, Any]:
+    out = bind_type_selector(action)
     field = out.get("field")
     if field:
         key = FIELD_PLACEHOLDERS[field]
@@ -618,7 +739,121 @@ def substitute_secrets(action: dict[str, Any], secrets: dict[str, str]) -> dict[
             return secrets[name]
 
         out["text"] = _PLACEHOLDER_RE.sub(_repl, text)
+    if action.get("action") == "type" and not out.get("selector"):
+        # Placeholders already substituted; bind from the original action.
+        rebound = bind_type_selector(action)
+        if rebound.get("selector"):
+            out["selector"] = rebound["selector"]
     return out
+
+
+def signup_type_decision(
+    *,
+    heuristic: str,
+    action: dict[str, Any],
+    filled: set[str] | frozenset[str],
+    redundant_streak: int,
+) -> dict[str, Any]:
+    """Anti-loop for signup_form: skip re-types; nudge Continue; recover after N."""
+    field = infer_type_field(action)
+    remaining = [f for f in SIGNUP_CORE_FIELDS if f not in filled]
+    out: dict[str, Any] = {
+        "field": field,
+        "skip": False,
+        "recover_continue": False,
+        "feedback": "",
+        "remaining": remaining,
+        "streak": redundant_streak,
+    }
+    if action.get("action") != "type" or heuristic != "signup_form":
+        return out
+    all_core = not remaining
+    if field and field in SIGNUP_CORE_FIELDS and field in filled:
+        out["skip"] = True
+        streak = int(redundant_streak) + 1
+        out["streak"] = streak
+        if remaining:
+            out["feedback"] = (
+                f"already filled {field} — next fill remaining "
+                f"({', '.join(remaining)}) or click Continue (not Google)."
+            )
+        else:
+            out["feedback"] = (
+                "already filled email, password, birthday — click "
+                "button:has-text('Continue') (not Continue with Google)."
+            )
+            if streak >= REDUNDANT_TYPE_CONTINUE_AFTER:
+                out["recover_continue"] = True
+                out["feedback"] += " runner clicking Continue (not Google) as recovery."
+        return out
+    if all_core:
+        out["feedback"] = (
+            "email, password, birthday are filled — click "
+            "button:has-text('Continue') (not Continue with Google)."
+        )
+    return out
+
+
+def is_transient_model_error(exc: BaseException) -> bool:
+    """Timeouts and transient HTTP/network — retryable. Auth / 4xx (not 429) are not."""
+    if isinstance(exc, (TimeoutError, ConnectionError, BrokenPipeError)):
+        return True
+    if isinstance(exc, urllib.error.HTTPError):
+        return int(getattr(exc, "code", 0) or 0) in {408, 409, 425, 429, 500, 502, 503, 504}
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    blob = f"{type(exc).__name__}: {exc}"
+    if _TRANSIENT_HTTP_RE.search(blob) or _TRANSIENT_WORD_RE.search(blob):
+        # HTTP 401/403 must not look like 408 via a loose digit match — regex is code-bounded.
+        if re.search(r"\b(?:http\s*)?(?:401|403|404)\b", blob, re.I):
+            return False
+        return True
+    return False
+
+
+def complete_vision_resilient(
+    vision: Any,
+    cfg: Any,
+    messages: list[dict[str, Any]],
+    *,
+    image_b64: str,
+    image_mime: str,
+    timeout_sec: float,
+    extra_secrets: list[str] | None = None,
+    sleep_fn: Any = time.sleep,
+    dry_run: bool = False,
+    attempts: int | None = None,
+) -> tuple[str, int]:
+    """Call vision.complete; retry 2–3× with backoff on timeout / transient HTTP."""
+    n = int(attempts if attempts is not None else VISION_RETRY_ATTEMPTS)
+    n = max(1, n)
+    last_exc: BaseException | None = None
+    for i in range(n):
+        try:
+            return vision.complete(
+                cfg,
+                messages,
+                image_b64=image_b64,
+                timeout_sec=timeout_sec,
+                image_mime=image_mime,
+            )
+        except Exception as e:
+            last_exc = e
+            if (not is_transient_model_error(e)) or i + 1 >= n:
+                raise
+            delay = VISION_RETRY_BACKOFF_SEC[min(i, len(VISION_RETRY_BACKOFF_SEC) - 1)]
+            log(
+                {
+                    "status": "model_retry",
+                    "attempt": i + 1,
+                    "max_attempts": n,
+                    "error": redact_text(f"{type(e).__name__}: {e}", extra=extra_secrets)[:240],
+                }
+            )
+            if not dry_run and delay > 0 and sleep_fn is not None:
+                sleep_fn(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def is_success_status(status: str | None) -> bool:
@@ -983,6 +1218,8 @@ class DryRunPage:
         if self.selector_counts is not None and sel in self.selector_counts:
             return int(self.selector_counts[sel])
         s = sel.strip()
+        if s == "__none__":
+            return 0
         low = s.lower()
         if self.logged_in:
             if "header-accounts" in low or "header-profile" in low:
@@ -1007,6 +1244,8 @@ class DryRunPage:
         if "unauth-header" in low or "simple-login" in low or "simple-signup" in low:
             return 1
         if s == "#code":
+            return 0
+        if s == "__none__":
             return 0
         return 1
 
@@ -1048,6 +1287,18 @@ class _DryLoc:
 
     def click(self, timeout: int = 0, force: bool = False) -> None:
         self.page.click(self.sel, timeout=timeout)
+
+    def filter(self, has_not_text: str = "", **kwargs: Any) -> "_DryLoc":
+        blob = f"{has_not_text} {' '.join(str(v) for v in kwargs.values())}".lower()
+        if "google" in blob and "google" in self.sel.lower():
+            return _DryLoc(self.page, "__none__")
+        return self
+
+    def blur(self) -> None:
+        return
+
+    def input_value(self, timeout: int = 0) -> str:
+        return str(self.page.fields.get(self.sel) or "")
 
 
 class MockVision:
@@ -1565,6 +1816,71 @@ def chain_nurture(
     return fields
 
 
+def _focus_type_target(page: Any, sel: str, *, field: str | None = None) -> str:
+    """Click the real input (not calendar / eye icons). Returns the selector used."""
+    fid = (field or "").strip().lower()
+    if sel and _is_icon_selector(sel):
+        mapped = FIELD_SELECTORS.get("birthday" if fid in ("birthday", "birthdate") else fid)
+        if mapped:
+            sel = mapped
+    candidates: list[str] = []
+    if fid in ("name", "display_name"):
+        candidates.extend(NAME_INPUT_SELS)
+    if sel and sel not in candidates:
+        candidates.insert(0, sel)
+    if not candidates and fid in FIELD_SELECTORS:
+        candidates.append(FIELD_SELECTORS[fid])
+    for cand in candidates:
+        try:
+            page.click(cand, timeout=8000)
+            return cand
+        except Exception:
+            try:
+                loc = page.locator(cand)
+                target = loc.first if hasattr(loc, "first") else loc
+                target.click(timeout=8000)
+                return cand
+            except Exception:
+                continue
+    if sel:
+        try:
+            page.click(sel, timeout=8000)
+        except Exception:
+            pass
+    return sel
+
+
+def execute_signup_continue_recovery(page: Any, *, screenshot_id: str) -> dict[str, Any]:
+    """One-shot scripted Continue (not Google). Still the product MM path, not computerUse."""
+
+    def _filtered(sel: str) -> Any:
+        loc = page.locator(sel)
+        if hasattr(loc, "filter"):
+            try:
+                return loc.filter(has_not_text="Google")
+            except TypeError:
+                return loc
+        return loc
+
+    try:
+        loc = _filtered("form:has(#email) button:has-text('Continue')")
+        try:
+            empty = hasattr(loc, "count") and int(loc.count() or 0) == 0
+        except Exception:
+            empty = False
+        if empty:
+            loc = _filtered(SIGNUP_CONTINUE_SELECTOR)
+        target = loc.first if hasattr(loc, "first") else loc
+        target.click(timeout=15000)
+        return {"ok": True, "detail": "signup continue recovery"}
+    except Exception:
+        return execute_browser_action(
+            page,
+            {"action": "click", "selector": SIGNUP_CONTINUE_SELECTOR},
+            screenshot_id=screenshot_id,
+        )
+
+
 def execute_browser_action(page: Any, action: dict[str, Any], *, screenshot_id: str) -> dict[str, Any]:
     atype = action["action"]
     if atype == "click":
@@ -1577,28 +1893,40 @@ def execute_browser_action(page: Any, action: dict[str, Any], *, screenshot_id: 
         page.mouse.click(int(action["x"]), int(action["y"]))
         return {"ok": True, "detail": "click xy"}
     if atype == "type":
-        text = action.get("text") or ""
-        sel = action.get("selector")
+        bound = bind_type_selector(action)
+        text = bound.get("text") or ""
+        sel = bound.get("selector")
+        field = infer_type_field(bound) or infer_type_field(action)
         delay = random.randint(35, 70)
-        if sel:
+        if not sel:
+            page.keyboard.type(text, delay=delay)
+            return {"ok": True, "detail": "type unfocused"}
+        used = _focus_type_target(page, str(sel), field=field)
+        used_l = (used or sel or "").lower()
+        # date inputs prefer fill (YYYY-MM-DD); React text fields prefer key events
+        if "birth" in used_l:
             try:
-                page.click(sel, timeout=8000)
+                page.fill(used or sel, text, timeout=8000)
+                try:
+                    loc = page.locator(used or sel)
+                    target = loc.first if hasattr(loc, "first") else loc
+                    if hasattr(target, "blur"):
+                        target.blur()
+                    else:
+                        page.keyboard.press("Tab")
+                except Exception:
+                    try:
+                        page.keyboard.press("Tab")
+                    except Exception:
+                        pass
+                return {"ok": True, "detail": "type fill-date", "selector": used or sel}
             except Exception:
                 pass
-            # date inputs prefer fill; React text fields prefer key events
-            if "birth" in sel.lower():
-                try:
-                    page.fill(sel, text, timeout=8000)
-                    return {"ok": True, "detail": "type fill-date"}
-                except Exception:
-                    pass
-            try:
-                page.keyboard.type(text, delay=delay)
-            except Exception:
-                page.fill(sel, text, timeout=8000)
-        else:
+        try:
             page.keyboard.type(text, delay=delay)
-        return {"ok": True, "detail": "type"}
+        except Exception:
+            page.fill(used or sel, text, timeout=8000)
+        return {"ok": True, "detail": "type", "selector": used or sel}
     if atype == "press":
         page.keyboard.press(action.get("key") or "Enter")
         return {"ok": True, "detail": "press"}
@@ -1670,6 +1998,9 @@ def run_loop(
     steps_done = 0
     tokens = 0
     named_shots: set[str] = set()
+    filled_signup: set[str] = set()
+    redundant_type_streak = 0
+    continue_recovery_used = False
     after_uid = 0
     if not dry_run:
         try:
@@ -1806,6 +2137,16 @@ def run_loop(
             "step": steps_done,
             "seconds_left": int(max(0, deadline - time.time())),
         }
+        if heuristic == "signup_form":
+            remaining = [f for f in SIGNUP_CORE_FIELDS if f not in filled_signup]
+            obs["signup_filled"] = sorted(filled_signup)
+            obs["signup_remaining"] = remaining
+            if not remaining and not last_feedback:
+                last_feedback = (
+                    "email, password, birthday are filled — click "
+                    "button:has-text('Continue') (not Continue with Google)."
+                )
+                obs["previous_feedback"] = last_feedback
         log(
             {
                 "status": "observe",
@@ -1821,16 +2162,21 @@ def run_loop(
             {"role": "user", "content": json.dumps(obs, ensure_ascii=False)},
         ]
         try:
-            raw, used = vision.complete(
+            raw, used = complete_vision_resilient(
+                vision,
                 make_llm_cfg(disc) if not dry_run else disc,
                 messages,
                 image_b64=shot["b64"],
                 timeout_sec=min(60.0, max(8.0, deadline - time.time())),
                 image_mime=shot["mime"],
+                extra_secrets=extra_secrets,
+                dry_run=dry_run,
             )
         except Exception as e:
             last_feedback = redact_text(f"model error: {type(e).__name__}: {e}", extra=extra_secrets)
             log({"status": "model_error", "error": last_feedback})
+            # Timeouts retry inside complete_vision_resilient; this observe does
+            # not consume a max_steps slot (no steps_done++).
             consecutive_rejects += 1
             if consecutive_rejects >= 5:
                 return finish(FAIL_FALLBACK_STATUS, reason=last_feedback)
@@ -1959,6 +2305,57 @@ def run_loop(
             log({"status": "action_reject", "error": str(e)})
             continue
 
+        if atype == "type":
+            decision = signup_type_decision(
+                heuristic=heuristic,
+                action=action,
+                filled=filled_signup,
+                redundant_streak=redundant_type_streak,
+            )
+            if decision.get("feedback"):
+                last_feedback = str(decision["feedback"])
+            if decision.get("skip"):
+                redundant_type_streak = int(decision.get("streak") or 0)
+                log(
+                    {
+                        "status": "signup_type_skipped",
+                        "field": decision.get("field"),
+                        "filled": sorted(filled_signup),
+                        "remaining": decision.get("remaining"),
+                        "streak": redundant_type_streak,
+                    }
+                )
+                if decision.get("recover_continue") and not continue_recovery_used:
+                    continue_recovery_used = True
+                    human_pause(page, 2000, 5000, "before_continue_recovery", dry_run=dry_run)
+                    rec = execute_signup_continue_recovery(page, screenshot_id=screenshot_id)
+                    log(
+                        {
+                            "status": "signup_continue_recovery",
+                            "ok": bool(rec.get("ok")),
+                            "detail": rec.get("detail"),
+                        }
+                    )
+                    steps_done += 1
+                    if rec.get("ok"):
+                        consecutive_rejects = 0
+                        redundant_type_streak = 0
+                        last_feedback = "ok click Continue recovery (not Google)"
+                        human_pause(page, 3000, 8000, "after_continue_settle", dry_run=dry_run)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8000)
+                        except Exception:
+                            pass
+                    else:
+                        consecutive_rejects += 1
+                        last_feedback = f"rejected execute: {rec.get('detail')}"
+                        if consecutive_rejects >= 6:
+                            return finish(FAIL_FALLBACK_STATUS, reason=last_feedback)
+                    continue
+                consecutive_rejects = 0
+                steps_done += 1
+                continue
+
         if atype == "click" and looks_like_continue(bound):
             human_pause(page, 2000, 5000, "before_continue", dry_run=dry_run)
         elif atype in ("click", "type", "press"):
@@ -1980,6 +2377,16 @@ def run_loop(
         consecutive_rejects = 0
         steps_done += 1
         last_feedback = f"ok {atype}"
+        if atype == "type":
+            fid = infer_type_field(action) or infer_type_field(bound)
+            if fid in SIGNUP_CORE_FIELDS:
+                filled_signup.add(fid)
+                redundant_type_streak = 0
+            if heuristic == "signup_form" and all(f in filled_signup for f in SIGNUP_CORE_FIELDS):
+                last_feedback = (
+                    "email, password, birthday are filled — click "
+                    "button:has-text('Continue') (not Continue with Google)."
+                )
         if atype == "click" and looks_like_continue(bound):
             human_pause(page, 3000, 8000, "after_continue_settle", dry_run=dry_run)
             try:

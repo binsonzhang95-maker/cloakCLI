@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "name": "pinterest-register-visual",
-  "description": "PRODUCT multimodal Pinterest register (0.2.2): CloakBrowser screenshot → OpenAI-compatible vision JSON actions → execute; same-session nurture BEFORE ctx.close. Bot must call scripts/run_pinterest_register_visual_mm.py. computerUse is not the product path. Never system Chrome. IMAP via scripts/outlook_imap_pinterest_code.py. Nurture 0.1.7+.",
+  "description": "PRODUCT multimodal Pinterest register (0.2.3): CloakBrowser screenshot → OpenAI-compatible vision JSON actions → execute; same-session nurture BEFORE ctx.close. Bot must call scripts/run_pinterest_register_visual_mm.py. computerUse is not the product path. Never system Chrome. IMAP via scripts/outlook_imap_pinterest_code.py. Nurture 0.1.7+.",
   "params": [
     "EMAIL",
     "PASSWORD",
@@ -29,7 +29,7 @@
     },
     {
       "action": "note",
-      "text": "FILL: Model types {{EMAIL}} {{PASSWORD}} {{BIRTHDAY}} {{DISPLAY_NAME}} (age 25–35; realistic given name, never email local-part). Avoid Google OAuth. Continue = primary CTA."
+      "text": "FILL: Prefer {\"field\":\"email|password|birthday|name|code\"} — runner auto-binds #email #password #birthdate #code (birthday YYYY-MM-DD). Do not retype filled fields. After all three signup fields, click button:has-text('Continue') (not Google). Vision timeouts retry 2–3×."
     },
     {
       "action": "note",
@@ -41,7 +41,7 @@
     },
     {
       "action": "note",
-      "text": "REPORT: Final JSON version 0.2.2, status from this package manifest.json (success flags + exit codes); unknown model status → visual_stuck. Plus path, nurture_status, nurture_elapsed_s, elapsed_s, profile. Model reason/path run through redact_text. Smoke: --dry-run mock vision."
+      "text": "REPORT: Final JSON version 0.2.3, status from this package manifest.json (success flags + exit codes); unknown model status → visual_stuck. Plus path, nurture_status, nurture_elapsed_s, elapsed_s, profile. Model reason/path run through redact_text. Smoke: --dry-run mock vision."
     }
   ]
 }
