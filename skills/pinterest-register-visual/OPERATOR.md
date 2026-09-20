@@ -1,4 +1,4 @@
-# OPERATOR — pinterest-register-visual (product MM loop) 0.2.1
+# OPERATOR — pinterest-register-visual (product MM loop) 0.2.2
 
 Short playbook. Execution kind: **`python_runner`**.
 
@@ -80,7 +80,7 @@ Last stdout / job result must include:
 ```json
 {
   "skill_id": "pinterest-register-visual",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "status": "registered_ok",
   "path": "code_ui|settings_confirm|already_logged_in|…",
   "nurture_status": "browsed_ok|skipped|session_lost_before_nurture|like_failed|error:…",
@@ -90,7 +90,7 @@ Last stdout / job result must include:
 }
 ```
 
-Allowed `status`: loaded from this package `manifest.json` (`registered_ok` | `browsed_ok` | `oops_blocked` | `verify_soft_fail` | `account_deactivated` | `not_logged_in` | `visual_stuck`). Success flags and process-exit codes come from that file; unknown model status → `visual_stuck`.
+Allowed `status`: loaded from this package `manifest.json` (`registered_ok` | `browsed_ok` | `oops_blocked` | `verify_soft_fail` | `account_deactivated` | `not_logged_in` | `visual_stuck`). Success flags and process-exit codes come from that file; unknown model status → `visual_stuck`. Model `reason` / `path` (and other extra result strings) are run through `redact_text` before emit — email/password must not appear in the result JSON.
 
 - Prefer primary register outcome `registered_ok`; set `nurture_status=browsed_ok` when nurture succeeds (optional success). Top-level `browsed_ok` still requires the login gate.
 - `oops_blocked` → park (not retryable).

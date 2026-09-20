@@ -1,4 +1,4 @@
-"""Product multimodal Pinterest register runner (0.2.1) — parse, LLM discover, dry-run."""
+"""Product multimodal Pinterest register runner (0.2.2) — parse, LLM discover, dry-run."""
 from __future__ import annotations
 
 import argparse
@@ -127,6 +127,13 @@ class ParseActionTests(unittest.TestCase):
         self.assertNotIn("super-secret-pass", blob)
         f = self.mm.parse_mm_action('{"action":"type","field":"code"}')
         self.assertEqual(self.mm.substitute_secrets(f, secrets)["text"], "654321")
+        leaked = self.mm.redact_result_strings(
+            {"reason": "typed user@example.com / super-secret-pass"},
+            extra_secrets=[secrets["PASSWORD"], secrets["EMAIL"]],
+        )
+        leaked_blob = json.dumps(leaked)
+        self.assertNotIn("user@example.com", leaked_blob)
+        self.assertNotIn("super-secret-pass", leaked_blob)
 
     def test_fail_status_heuristic(self) -> None:
         self.assertEqual(
@@ -344,7 +351,7 @@ class DryRunSmokeTests(unittest.TestCase):
         self.assertTrue(lines)
         report = json.loads(lines[-1])
         self.assertEqual(report["skill_id"], "pinterest-register-visual")
-        self.assertEqual(report["version"], "0.2.1")
+        self.assertEqual(report["version"], "0.2.2")
         self.assertEqual(report["status"], "registered_ok")
         self.assertEqual(report["nurture_status"], "browsed_ok")
         self.assertTrue(report.get("dry_run"))
@@ -368,11 +375,11 @@ class DryRunSmokeTests(unittest.TestCase):
         report = json.loads([ln for ln in proc.stdout.splitlines() if ln.strip()][-1])
         self.assertEqual(report["status"], "visual_stuck")
 
-    def test_skill_manifest_python_runner_0_2_1(self) -> None:
+    def test_skill_manifest_python_runner_0_2_2(self) -> None:
         man = json.loads(
             (ROOT / "skills/pinterest-register-visual/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(man["version"], "0.2.1")
+        self.assertEqual(man["version"], "0.2.2")
         self.assertEqual(man["entry"]["kind"], "python_runner")
         self.assertEqual(man["entry"]["path"], "scripts/run_pinterest_register_visual_mm.py")
         ids = {s["id"] for s in man["statuses"]}
@@ -686,6 +693,61 @@ class LoginGateAndActionTests(unittest.TestCase):
         self.assertIn(report["status"], ("not_logged_in", "visual_stuck"))
         self.assertFalse((ud / ".cloak_session_ok").exists())
         self.assertEqual(report.get("nurture_status"), "skipped")
+
+    def test_finish_result_json_redacts_model_reason_secrets(self) -> None:
+        """Model done/fail reason with email/password must not appear in result JSON."""
+        mm = self.mm
+        email = "user@example.com"
+        password = "super-secret-pass"
+        leak = f"could not type {email} password={password}"
+
+        ud_fail = Path(tempfile.mkdtemp(prefix="cloakcli_visual_ud_reason_fail_"))
+        fail_report = self._run_loop(
+            mm.DryRunPage(),
+            mm.MockVision(
+                [
+                    {
+                        "schema_version": 1,
+                        "action": "fail",
+                        "status": "visual_stuck",
+                        "reason": leak,
+                        "path": f"form {email}",
+                    }
+                ]
+            ),
+            ud_fail,
+            dry_run=True,
+        )
+        fail_blob = json.dumps(fail_report)
+        self.assertNotIn(email, fail_blob)
+        self.assertNotIn(password, fail_blob)
+        self.assertIn("reason", fail_report)
+        self.assertIn("***", str(fail_report.get("reason")))
+        self.assertNotIn(email, str(fail_report.get("path", "")))
+
+        ud_done = Path(tempfile.mkdtemp(prefix="cloakcli_visual_ud_reason_done_"))
+        done_report = self._run_loop(
+            mm.DryRunPage(persist_logged_in=True),
+            mm.MockVision(
+                [
+                    {
+                        "schema_version": 1,
+                        "action": "done",
+                        "status": "registered_ok",
+                        "reason": leak,
+                        "path": f"signed in {email}",
+                    }
+                ]
+            ),
+            ud_done,
+            dry_run=True,
+        )
+        done_blob = json.dumps(done_report)
+        self.assertNotIn(email, done_blob)
+        self.assertNotIn(password, done_blob)
+        self.assertEqual(done_report["status"], "registered_ok")
+        self.assertIn("***", str(done_report.get("reason")))
+        self.assertNotIn(email, str(done_report.get("path", "")))
 
     def test_model_browsed_ok_on_register_page_is_rejected(self) -> None:
         """done:browsed_ok on signup/login must not fake success or write .cloak_session_ok."""

@@ -1,4 +1,4 @@
-# pinterest-register-visual (0.2.1)
+# pinterest-register-visual (0.2.2)
 
 **PRODUCT path:** multimodal loop on **CloakBrowser** —
 
@@ -16,7 +16,7 @@ Skill package entry is `python_runner` → `scripts/run_pinterest_register_visua
 
 ## When to use vs `pinterest-register-outlook-verify`
 
-| | `pinterest-register-visual` 0.2.1 | `pinterest-register-outlook-verify` |
+| | `pinterest-register-visual` 0.2.2 | `pinterest-register-outlook-verify` |
 |--|-----------------------------------|-------------------------------------|
 | Execution | Product MM loop (`python_runner`) | Declarative `skill.json` steps + selector runner |
 | Targeting | Vision JSON actions (`click` css or x/y + `screenshot_id`) | CSS / Playwright selectors |

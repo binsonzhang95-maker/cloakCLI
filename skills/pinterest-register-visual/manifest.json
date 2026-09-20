@@ -1,5 +1,5 @@
 {
-  "version": "0.2.1",
+  "version": "0.2.2",
   "entry": {
     "kind": "python_runner",
     "path": "scripts/run_pinterest_register_visual_mm.py"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinterest visual register — PRODUCT multimodal loop (0.2.1).
+"""Pinterest visual register — PRODUCT multimodal loop (0.2.2).
 
 screenshot → OpenAI-compatible vision (chat/completions + image_url) → JSON
 action → CloakBrowser execute → same-session nurture BEFORE ctx.close.
@@ -34,7 +34,7 @@ from typing import Any
 
 SKILL_ID = "pinterest-register-visual"
 # Fallback until the skill-package manifest is loaded below.
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 SESSION_OK_NAME = ".cloak_session_ok"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
@@ -586,6 +586,17 @@ def public_action(action: dict[str, Any], *, extra_secrets: list[str] | None = N
     if action.get("reason"):
         d["reason"] = redact_text(str(action["reason"])[:MAX_REASON_LEN], extra=extra_secrets)
     return d
+
+
+def redact_result_strings(value: Any, extra_secrets: list[str] | None = None) -> Any:
+    """Redact secrets in model/user-sourced values before they enter result JSON."""
+    if isinstance(value, str):
+        return redact_text(value, extra=extra_secrets)
+    if isinstance(value, dict):
+        return {k: redact_result_strings(v, extra_secrets) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_result_strings(v, extra_secrets) for v in value]
+    return value
 
 
 def substitute_secrets(action: dict[str, Any], secrets: dict[str, str]) -> dict[str, Any]:
@@ -1694,11 +1705,15 @@ def run_loop(
                 )
         if status not in ALLOWED_STATUSES:
             status = FAIL_FALLBACK_STATUS
+        secret_bag = [*(extra_secrets or [])]
+        secret_bag.extend(v for v in secrets.values() if isinstance(v, str) and len(v) >= 4)
+        raw_reason = extra.pop("reason", None)
+        raw_path = extra.pop("path", path_hint) or path_hint or ""
         report = {
             "skill_id": SKILL_ID,
             "version": VERSION,
             "status": status,
-            "path": extra.pop("path", path_hint) or path_hint or "",
+            "path": redact_text(str(raw_path), extra=secret_bag),
             "nurture_status": nurture_fields.get("nurture_status", "skipped"),
             "nurture_elapsed_s": nurture_fields.get("nurture_elapsed_s", 0),
             "elapsed_s": round(time.time() - t0, 2),
@@ -1706,13 +1721,16 @@ def run_loop(
             "steps": steps_done,
             "tokens": tokens,
             "dry_run": dry_run,
-            **{k: v for k, v in extra.items() if k != "path"},
         }
+        if raw_reason is not None:
+            report["reason"] = redact_text(str(raw_reason)[:MAX_REASON_LEN], extra=secret_bag)
+        for k, v in extra.items():
+            report[k] = redact_result_strings(v, secret_bag)
         if args.digest:
             report["digest"] = args.digest
         for k in ("nurture_liked", "session_keepalive_probe", "nurture_skip_warning"):
             if k in nurture_fields:
-                report[k] = nurture_fields[k]
+                report[k] = redact_result_strings(nurture_fields[k], secret_bag)
         return report
 
     def do_nurture() -> bool:
