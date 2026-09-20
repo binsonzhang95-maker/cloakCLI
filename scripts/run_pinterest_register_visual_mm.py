@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinterest visual register — PRODUCT multimodal loop (0.2.3).
+"""Pinterest visual register — PRODUCT multimodal loop (0.2.4).
 
 screenshot → OpenAI-compatible vision (chat/completions + image_url) → JSON
 action → CloakBrowser execute → same-session nurture BEFORE ctx.close.
@@ -15,9 +15,9 @@ package manifest (skills/pinterest-register-visual/manifest.json, or the
 manifest next to this runner). Success terminals require an independent login
 gate; the model cannot mint registered_ok / browsed_ok on a signup page.
 
-0.2.3: field → CSS selector bind so type focuses the real input (not a silent
-keyboard no-op); signup_form anti-loop + one-shot Continue recovery; vision
-timeout/transient HTTP retries.
+0.2.4: type with missing selector or failed input focus is rejected (ok=False);
+never silent keyboard.type. 0.2.3: field → CSS selector bind; signup_form
+anti-loop + one-shot Continue recovery; vision timeout/transient HTTP retries.
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ from typing import Any
 
 SKILL_ID = "pinterest-register-visual"
 # Fallback until the skill-package manifest is loaded below.
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 SESSION_OK_NAME = ".cloak_session_ok"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
@@ -1817,7 +1817,11 @@ def chain_nurture(
 
 
 def _focus_type_target(page: Any, sel: str, *, field: str | None = None) -> str:
-    """Click the real input (not calendar / eye icons). Returns the selector used."""
+    """Click the real input (not calendar / eye icons). Returns the selector used.
+
+    Raises ActionError if no candidate can be focused — callers must not
+    fall back to unfocused keyboard.type.
+    """
     fid = (field or "").strip().lower()
     if sel and _is_icon_selector(sel):
         mapped = FIELD_SELECTORS.get("birthday" if fid in ("birthday", "birthdate") else fid)
@@ -1830,24 +1834,23 @@ def _focus_type_target(page: Any, sel: str, *, field: str | None = None) -> str:
         candidates.insert(0, sel)
     if not candidates and fid in FIELD_SELECTORS:
         candidates.append(FIELD_SELECTORS[fid])
+    last_err: BaseException | None = None
     for cand in candidates:
         try:
             page.click(cand, timeout=8000)
             return cand
-        except Exception:
+        except Exception as e:
+            last_err = e
             try:
                 loc = page.locator(cand)
                 target = loc.first if hasattr(loc, "first") else loc
                 target.click(timeout=8000)
                 return cand
-            except Exception:
+            except Exception as e2:
+                last_err = e2
                 continue
-    if sel:
-        try:
-            page.click(sel, timeout=8000)
-        except Exception:
-            pass
-    return sel
+    hint = f": {type(last_err).__name__}: {last_err}" if last_err else ""
+    raise ActionError(f"could not focus type target {sel!r}{hint}")
 
 
 def execute_signup_continue_recovery(page: Any, *, screenshot_id: str) -> dict[str, Any]:
@@ -1898,10 +1901,19 @@ def execute_browser_action(page: Any, action: dict[str, Any], *, screenshot_id: 
         sel = bound.get("selector")
         field = infer_type_field(bound) or infer_type_field(action)
         delay = random.randint(35, 70)
-        if not sel:
-            page.keyboard.type(text, delay=delay)
-            return {"ok": True, "detail": "type unfocused"}
-        used = _focus_type_target(page, str(sel), field=field)
+        if not (isinstance(sel, str) and sel.strip()):
+            return {
+                "ok": False,
+                "detail": "type missing selector after bind — refuse unfocused keyboard.type",
+            }
+        try:
+            used = _focus_type_target(page, str(sel), field=field)
+        except Exception as e:
+            return {
+                "ok": False,
+                "detail": f"type focus failed: {e}"[:240],
+                "selector": str(sel),
+            }
         used_l = (used or sel or "").lower()
         # date inputs prefer fill (YYYY-MM-DD); React text fields prefer key events
         if "birth" in used_l:

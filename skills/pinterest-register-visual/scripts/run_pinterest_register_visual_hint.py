@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preflight for pinterest-register-visual (0.2.3).
+"""Preflight for pinterest-register-visual (0.2.4).
 
 Prints the product MM-loop checklist and validates that profile.json + secrets
 env exist. Does NOT launch a browser. No secrets values are printed.
@@ -20,7 +20,7 @@ if _HERE.parent.name == "scripts" and _HERE.parents[1].name == "pinterest-regist
 else:
     ROOT = _HERE.parents[1]
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 SKILL_ID = "pinterest-register-visual"
 
 REQUIRED_SECRET_KEYS = (
@@ -42,7 +42,7 @@ CHECKLIST = [
     "IMAP 6-digit via scripts/outlook_imap_pinterest_code.py + secrets env",
     "On logged-in: same-session nurture BEFORE close; probe+flush; nurture 0.1.7+",
     "Never fresh-profile after success; touch .cloak_session_ok; concurrency ≤2–3",
-    "Report status/path/nurture_status/elapsed version 0.2.3 from skill manifest (see OPERATOR.md)",
+    "Report status/path/nurture_status/elapsed version 0.2.4 from skill manifest (see OPERATOR.md)",
     "Smoke: --dry-run mock vision (no CloakBrowser)",
 ]
 

@@ -1,4 +1,4 @@
-"""Product multimodal Pinterest register runner (0.2.3) — parse, LLM discover, dry-run."""
+"""Product multimodal Pinterest register runner (0.2.4) — parse, LLM discover, dry-run."""
 from __future__ import annotations
 
 import argparse
@@ -353,7 +353,7 @@ class DryRunSmokeTests(unittest.TestCase):
         self.assertTrue(lines)
         report = json.loads(lines[-1])
         self.assertEqual(report["skill_id"], "pinterest-register-visual")
-        self.assertEqual(report["version"], "0.2.3")
+        self.assertEqual(report["version"], "0.2.4")
         self.assertEqual(report["status"], "registered_ok")
         self.assertEqual(report["nurture_status"], "browsed_ok")
         self.assertTrue(report.get("dry_run"))
@@ -377,11 +377,11 @@ class DryRunSmokeTests(unittest.TestCase):
         report = json.loads([ln for ln in proc.stdout.splitlines() if ln.strip()][-1])
         self.assertEqual(report["status"], "visual_stuck")
 
-    def test_skill_manifest_python_runner_0_2_3(self) -> None:
+    def test_skill_manifest_python_runner_0_2_4(self) -> None:
         man = json.loads(
             (ROOT / "skills/pinterest-register-visual/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(man["version"], "0.2.3")
+        self.assertEqual(man["version"], "0.2.4")
         self.assertEqual(man["entry"]["kind"], "python_runner")
         self.assertEqual(man["entry"]["path"], "scripts/run_pinterest_register_visual_mm.py")
         ids = {s["id"] for s in man["statuses"]}
@@ -938,7 +938,7 @@ class LoginGateAndActionTests(unittest.TestCase):
 
 
 class SignupDeadLoopTests(unittest.TestCase):
-    """0.2.3: field→selector bind, type focuses input, anti-loop, vision retry."""
+    """0.2.3+: field→selector bind, type focuses input, anti-loop, vision retry."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -1001,6 +1001,64 @@ class SignupDeadLoopTests(unittest.TestCase):
         self.assertTrue(bday["ok"])
         self.assertIn("fill-date", str(bday.get("detail") or ""))
         self.assertIn(("#birthdate", "1995-04-12"), page.filled)
+
+    def test_type_without_selector_or_focus_is_not_silent_keyboard_ok(self) -> None:
+        page = self.mm.DryRunPage()
+        missing = self.mm.execute_browser_action(
+            page,
+            {"action": "type", "text": "hello-unfocused"},
+            screenshot_id="obs-000",
+        )
+        self.assertFalse(missing["ok"])
+        self.assertIn("selector", str(missing.get("detail") or "").lower())
+        self.assertNotIn("hello-unfocused", page.typed)
+        self.assertFalse(page.filled)
+
+        class _DeadFocus:
+            def __init__(self) -> None:
+                self.typed: list[str] = []
+                self.filled: list[tuple[str, str]] = []
+                self.keyboard = self
+
+            def click(self, *_a: object, **_k: object) -> None:
+                raise RuntimeError("no such element")
+
+            def locator(self, _sel: str) -> object:
+                class _Loc:
+                    @property
+                    def first(self) -> "_Loc":
+                        return self
+
+                    def click(self, *_a: object, **_k: object) -> None:
+                        raise RuntimeError("no such element")
+
+                return _Loc()
+
+            def type(self, text: str, delay: int = 0) -> None:
+                self.typed.append(text)
+
+            def fill(self, sel: str, text: str, timeout: int = 0) -> None:
+                self.filled.append((sel, text))
+
+        dead = _DeadFocus()
+        failed = self.mm.execute_browser_action(
+            dead,
+            {"action": "type", "selector": "#email", "text": "user@example.com"},
+            screenshot_id="obs-000",
+        )
+        self.assertFalse(failed["ok"])
+        self.assertIn("focus", str(failed.get("detail") or "").lower())
+        self.assertNotIn("user@example.com", dead.typed)
+        self.assertFalse(dead.filled)
+
+        bday_dead = self.mm.execute_browser_action(
+            dead,
+            {"action": "type", "field": "birthday", "text": "1995-04-12"},
+            screenshot_id="obs-000",
+        )
+        self.assertFalse(bday_dead["ok"])
+        self.assertNotIn("1995-04-12", dead.typed)
+        self.assertFalse(dead.filled)
 
     def test_anti_loop_rejects_duplicate_field_type(self) -> None:
         d = self.mm.signup_type_decision(
