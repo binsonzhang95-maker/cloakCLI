@@ -1,4 +1,4 @@
-# pinterest-register-visual (0.2.0)
+# pinterest-register-visual (0.2.1)
 
 **PRODUCT path:** multimodal loop on **CloakBrowser** —
 
@@ -16,7 +16,7 @@ Skill package entry is `python_runner` → `scripts/run_pinterest_register_visua
 
 ## When to use vs `pinterest-register-outlook-verify`
 
-| | `pinterest-register-visual` 0.2.0 | `pinterest-register-outlook-verify` |
+| | `pinterest-register-visual` 0.2.1 | `pinterest-register-outlook-verify` |
 |--|-----------------------------------|-------------------------------------|
 | Execution | Product MM loop (`python_runner`) | Declarative `skill.json` steps + selector runner |
 | Targeting | Vision JSON actions (`click` css or x/y + `screenshot_id`) | CSS / Playwright selectors |
@@ -85,7 +85,7 @@ cloakcli llm models
 - `click`: CSS `selector`, **or** `x`/`y` **plus** `screenshot_id` equal to the current observation
 - `type`: `text` with `{{EMAIL}}` `{{PASSWORD}}` `{{BIRTHDAY}}` `{{DISPLAY_NAME}}` `{{CODE}}`, or `field: email|password|birthday|name|code` (runner substitutes; values never logged)
 - `imap_fetch_code`: existing Outlook IMAP helper
-- `nurture` / `done` with `registered_ok`: **hints only**. Runner confirms login (account menu / pin feed / no unauth Log in+Sign up CTA) before `registered_ok`, `.cloak_session_ok`, or chaining nurture. `nurture` alone never sets registered.
+- `nurture` / `done` with any **success** status (`registered_ok`, `browsed_ok`, … from `manifest.json`): **hints only**. Runner confirms login (account menu / pin feed / no unauth Log in+Sign up CTA) before writing `.cloak_session_ok`, chaining nurture, or returning success. `done: browsed_ok` on a register/login page is rejected (`not_logged_in` / `visual_stuck`). `nurture` alone never sets registered. Unknown model status → `visual_stuck` (never invent success).
 
 ## Behavior pacing
 
@@ -97,21 +97,21 @@ cloakcli llm models
 
 - Default: same-context nurture **before** `ctx.close()`; probe with `session_keepalive_probe`; flush cookies (wait + home).
 - `session_lost_before_nurture` if login wall before browse (not `browsed_ok`).
-- Touch `.cloak_session_ok` only after **independent login confirmation** (account menu / pin feed / absence of unauth Log in+Sign up CTA). Model `done: registered_ok` is a hint, never enough on its own.
+- Touch `.cloak_session_ok` only after **independent login confirmation** (account menu / pin feed / absence of unauth Log in+Sign up CTA). Model `done: registered_ok` or `done: browsed_ok` is a hint, never enough on its own.
 
 ## Statuses
 
 | id | success | retryable | notes |
 |----|---------|-----------|-------|
 | `registered_ok` | yes | no | Logged-in after signup / verify (page heuristic, not model-only) |
-| `browsed_ok` | yes (optional) | no | Nurture chained successfully (`nurture_status`) |
+| `browsed_ok` | yes (optional) | no | Nurture chained successfully (`nurture_status`). Still requires login gate; not a fake success on signup. |
 | `oops_blocked` | no | no | Park — do not hammer |
 | `verify_soft_fail` | no | yes | IMAP/UI soft miss |
 | `account_deactivated` | no | no | Dead |
 | `not_logged_in` | no | yes | Still unauth CTA |
 | `visual_stuck` | no | yes | Unrecognized UI / invalid model loop |
 
-Primary register outcome is `registered_ok`; set `nurture_status=browsed_ok` when nurture succeeds.
+Primary register outcome is `registered_ok`; set `nurture_status=browsed_ok` when nurture succeeds. Status ids, `success` flags, and process-exit mapping are loaded from this package `manifest.json` — the runner does not keep a parallel hardcoded enum.
 
 ## Dry-run smoke (mock vision, no browser)
 

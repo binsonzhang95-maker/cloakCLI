@@ -1,4 +1,4 @@
-# OPERATOR — pinterest-register-visual (product MM loop) 0.2.0
+# OPERATOR — pinterest-register-visual (product MM loop) 0.2.1
 
 Short playbook. Execution kind: **`python_runner`**.
 
@@ -60,7 +60,7 @@ Artifacts: `artifacts/pinterest/visual/<profile>/`
 Allowed actions: `click|type|press|wait|scroll|imap_fetch_code|nurture|done|fail`.  
 IMAP: `scripts/outlook_imap_pinterest_code.py --secrets <env>` (runner action `imap_fetch_code`).
 
-On **independently confirmed** logged-in (account menu / pin feed / no unauth Log in+Sign up CTA) → **same-session nurture BEFORE `ctx.close()`** (mandatory unless `--skip-nurture`). Model `done: registered_ok` and `nurture` are hints; they do **not** write `.cloak_session_ok` or count as register success by themselves. Flush cookies; `session_keepalive_probe` — login wall → `session_lost_before_nurture` (not `browsed_ok`). Nurture **0.1.7+**. Nurture failure does not negate a confirmed `registered_ok`.
+On **independently confirmed** logged-in (account menu / pin feed / no unauth Log in+Sign up CTA) → **same-session nurture BEFORE `ctx.close()`** (mandatory unless `--skip-nurture`). Model `done: registered_ok` / `done: browsed_ok` / `nurture` are hints; they do **not** write `.cloak_session_ok` or count as success by themselves. A success claim on the register/login page is rejected (`not_logged_in` / `visual_stuck`). Flush cookies; `session_keepalive_probe` — login wall → `nurture_status=session_lost_before_nurture` (not a fake top-level `browsed_ok`). Nurture **0.1.7+**. Nurture failure does not negate a confirmed `registered_ok`.
 
 If **Oops** → stop, `oops_blocked`, park (cooldown 5–10 min on that exit).
 
@@ -80,7 +80,7 @@ Last stdout / job result must include:
 ```json
 {
   "skill_id": "pinterest-register-visual",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "status": "registered_ok",
   "path": "code_ui|settings_confirm|already_logged_in|…",
   "nurture_status": "browsed_ok|skipped|session_lost_before_nurture|like_failed|error:…",
@@ -90,9 +90,9 @@ Last stdout / job result must include:
 }
 ```
 
-Allowed `status`: `registered_ok` | `browsed_ok` | `oops_blocked` | `verify_soft_fail` | `account_deactivated` | `not_logged_in` | `visual_stuck`.
+Allowed `status`: loaded from this package `manifest.json` (`registered_ok` | `browsed_ok` | `oops_blocked` | `verify_soft_fail` | `account_deactivated` | `not_logged_in` | `visual_stuck`). Success flags and process-exit codes come from that file; unknown model status → `visual_stuck`.
 
-- Prefer primary register outcome `registered_ok`; set `nurture_status=browsed_ok` when nurture succeeds (optional success).
+- Prefer primary register outcome `registered_ok`; set `nurture_status=browsed_ok` when nurture succeeds (optional success). Top-level `browsed_ok` still requires the login gate.
 - `oops_blocked` → park (not retryable).
 - Soft IMAP / transient UI → `verify_soft_fail` (retryable).
 - Unrecognized screen after reasonable retries → `visual_stuck` (retryable).

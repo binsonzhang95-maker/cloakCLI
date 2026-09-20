@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinterest visual register — PRODUCT multimodal loop (0.2.0).
+"""Pinterest visual register — PRODUCT multimodal loop (0.2.1).
 
 screenshot → OpenAI-compatible vision (chat/completions + image_url) → JSON
 action → CloakBrowser execute → same-session nurture BEFORE ctx.close.
@@ -9,6 +9,11 @@ Free-form computerUse is not the product path.
 
 Never launches system Chrome. Never changes CloakBrowser fingerprint knobs.
 API keys are never accepted as --api-key (shell history) and never printed.
+
+Terminal statuses, success flags, and process-exit mapping come from the skill
+package manifest (skills/pinterest-register-visual/manifest.json, or the
+manifest next to this runner). Success terminals require an independent login
+gate; the model cannot mint registered_ok / browsed_ok on a signup page.
 """
 from __future__ import annotations
 
@@ -27,8 +32,9 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.0"
 SKILL_ID = "pinterest-register-visual"
+# Fallback until the skill-package manifest is loaded below.
+VERSION = "0.2.1"
 SESSION_OK_NAME = ".cloak_session_ok"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
@@ -84,17 +90,6 @@ FORBIDDEN_ACTIONS = frozenset(
         "subprocess",
         "goto",
         "screenshot",
-    }
-)
-ALLOWED_STATUSES = frozenset(
-    {
-        "registered_ok",
-        "browsed_ok",
-        "oops_blocked",
-        "verify_soft_fail",
-        "account_deactivated",
-        "not_logged_in",
-        "visual_stuck",
     }
 )
 ALLOWED_PRESS_KEYS = frozenset(
@@ -201,6 +196,121 @@ _PY = str(ROOT / "python")
 if _PY not in sys.path:
     sys.path.insert(0, _PY)
 
+# Fail-safe if a status is missing from the package: never invent a success id.
+_FAIL_FALLBACK_ID = "visual_stuck"
+_DEFAULT_FAIL_EXIT = 4
+_DEFAULT_SUCCESS_EXIT = 0
+# Used only when the manifest omits `exit` for a declared id.
+_HISTORICAL_FAIL_EXITS = {
+    "oops_blocked": 2,
+    "verify_soft_fail": 5,
+    "account_deactivated": 7,
+    "not_logged_in": 8,
+    "visual_stuck": 4,
+}
+
+
+def skill_manifest_path() -> Path | None:
+    """Prefer the skill package next to this runner, then repo skills/<id>."""
+    here = Path(__file__).resolve()
+    cands: list[Path] = []
+    if here.parent.name == "scripts":
+        cands.append(here.parent.parent / "manifest.json")
+    cands.append(ROOT / "skills" / SKILL_ID / "manifest.json")
+    cands.append(here.parent / "manifest.json")
+    seen: set[Path] = set()
+    for p in cands:
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        if rp in seen:
+            continue
+        seen.add(rp)
+        if rp.is_file():
+            return rp
+    return None
+
+
+def load_skill_status_catalog(manifest: Path | None = None) -> dict[str, Any]:
+    """Allowed statuses / success flags / process exits from the skill package.
+
+    Unknown or missing declarations fail safe: no success ids, only visual_stuck.
+    """
+    path = manifest if manifest is not None else skill_manifest_path()
+    fail_safe = {
+        "version": VERSION,
+        "path": str(path) if path else "",
+        "allowed": frozenset({_FAIL_FALLBACK_ID}),
+        "success": frozenset(),
+        "retryable": frozenset({_FAIL_FALLBACK_ID}),
+        "fail_fallback": _FAIL_FALLBACK_ID,
+        "exits": {_FAIL_FALLBACK_ID: _DEFAULT_FAIL_EXIT},
+        "labels": {_FAIL_FALLBACK_ID: "Visual MM loop stuck"},
+    }
+    if path is None or not path.is_file():
+        return fail_safe
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fail_safe
+    raw = data.get("statuses")
+    if not isinstance(raw, list) or not raw:
+        return fail_safe
+    allowed: set[str] = set()
+    success: set[str] = set()
+    retryable: set[str] = set()
+    exits: dict[str, int] = {}
+    labels: dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("id") or "").strip()
+        if not sid or sid in allowed:
+            continue
+        allowed.add(sid)
+        if bool(item.get("success")):
+            success.add(sid)
+        if bool(item.get("retryable")):
+            retryable.add(sid)
+        labels[sid] = str(item.get("label") or sid)
+        if "exit" in item:
+            try:
+                exits[sid] = int(item["exit"])
+            except (TypeError, ValueError):
+                exits[sid] = (
+                    _DEFAULT_SUCCESS_EXIT if sid in success else _HISTORICAL_FAIL_EXITS.get(sid, _DEFAULT_FAIL_EXIT)
+                )
+        elif sid in success:
+            exits[sid] = _DEFAULT_SUCCESS_EXIT
+        else:
+            exits[sid] = _HISTORICAL_FAIL_EXITS.get(sid, _DEFAULT_FAIL_EXIT)
+    if not allowed:
+        return fail_safe
+    fail_fallback = _FAIL_FALLBACK_ID if _FAIL_FALLBACK_ID in allowed else next(
+        (s for s in sorted(allowed) if s not in success), next(iter(sorted(allowed)))
+    )
+    ver = str(data.get("version") or VERSION).strip() or VERSION
+    return {
+        "version": ver,
+        "path": str(path),
+        "allowed": frozenset(allowed),
+        "success": frozenset(success),
+        "retryable": frozenset(retryable),
+        "fail_fallback": fail_fallback,
+        "exits": exits,
+        "labels": labels,
+    }
+
+
+STATUS_CATALOG = load_skill_status_catalog()
+VERSION = str(STATUS_CATALOG.get("version") or VERSION)
+ALLOWED_STATUSES: frozenset[str] = STATUS_CATALOG["allowed"]
+SUCCESS_STATUSES: frozenset[str] = STATUS_CATALOG["success"]
+RETRYABLE_STATUSES: frozenset[str] = STATUS_CATALOG["retryable"]
+FAIL_FALLBACK_STATUS: str = str(STATUS_CATALOG["fail_fallback"])
+STATUS_EXITS: dict[str, int] = dict(STATUS_CATALOG["exits"])
+
 try:
     from cloakcli_worker.llm_config import (
         COMPAT_API_KEY_ENV,
@@ -249,17 +359,18 @@ scroll: {"delta_y":int} small only (|delta|<=800) or {"selector":"css"}
 wait: {"ms":int}  (runner also applies human pacing; do not spam)
 imap_fetch_code: {}  fetch Outlook IMAP 6-digit; then type {{CODE}}
 nurture: {}  same-session feed browse; runner runs this BEFORE close ONLY after independent login check
-done: {"status":"registered_ok","path":"code_ui|settings_confirm|already_logged_in","reason":"..."}
-  registered_ok is a HINT. The runner confirms account menu / pin feed / no unauth Log in+Sign up CTA
-  before writing .cloak_session_ok or chaining nurture. Do not claim success on the signup form.
-fail: {"status":"oops_blocked|verify_soft_fail|account_deactivated|not_logged_in|visual_stuck","reason":"..."}
+done: {"status":"<skill manifest success id>","path":"code_ui|settings_confirm|already_logged_in","reason":"..."}
+  registered_ok / browsed_ok (and any other success status) are HINTS. The runner confirms
+  account menu / pin feed / no unauth Log in+Sign up CTA before writing .cloak_session_ok,
+  chaining nurture, or returning success. Do not claim success on the signup / login form.
+fail: {"status":"<skill manifest fail id>","reason":"..."}
 
 Goal: sign up with email/password/birthday (age 25–35) / name, verify 6-digit code if shown,
 or finish onboarding + settings Confirm Email. Avoid Google OAuth. Prefer the primary Continue,
 not "Continue with Google".
 If full-page Oops (no code UI) → fail oops_blocked (park, do not re-Continue).
 If logged-in (account menu / pin feed, no unauth Log in+Sign up CTA) → nurture or done registered_ok.
-The runner always chains nurture before ctx.close on confirmed registered_ok unless the operator skipped it.
+The runner always chains nurture before ctx.close on a confirmed success unless the operator skipped it.
 Do not request another screenshot. Do not output markdown. JSON object only.
 """
 
@@ -499,26 +610,72 @@ def substitute_secrets(action: dict[str, Any], secrets: dict[str, str]) -> dict[
     return out
 
 
-def map_fail_status(action: dict[str, Any], heuristic: str = "") -> str:
-    if action.get("status") in ALLOWED_STATUSES:
-        return str(action["status"])
-    blob = f"{action.get('reason') or ''} {heuristic}".lower()
+def is_success_status(status: str | None) -> bool:
+    return bool(status) and str(status) in SUCCESS_STATUSES
+
+
+def _status_if_allowed(status: Any, *, allow_success: bool) -> str | None:
+    st = str(status).strip() if status is not None else ""
+    if not st or st not in ALLOWED_STATUSES:
+        return None
+    if not allow_success and st in SUCCESS_STATUSES:
+        return None
+    return st
+
+
+def _heuristic_fail_status(blob: str) -> str:
+    """Map text to a declared fail status. Never invent ids missing from the package."""
+    def pick(*ids: str) -> str | None:
+        for sid in ids:
+            if sid in ALLOWED_STATUSES and sid not in SUCCESS_STATUSES:
+                return sid
+        return None
+
     if "oops" in blob:
-        return "oops_blocked"
+        hit = pick("oops_blocked")
+        if hit:
+            return hit
     if "deactivat" in blob:
-        return "account_deactivated"
+        hit = pick("account_deactivated")
+        if hit:
+            return hit
     if "not_logged" in blob or "login wall" in blob or "unauth" in blob:
-        return "not_logged_in"
-    if "verify" in blob or "imap" in blob or "code" in blob and "fail" in blob:
-        return "verify_soft_fail"
-    return "visual_stuck"
+        hit = pick("not_logged_in")
+        if hit:
+            return hit
+    if "verify" in blob or ("imap" in blob) or ("code" in blob and "fail" in blob):
+        hit = pick("verify_soft_fail")
+        if hit:
+            return hit
+    return FAIL_FALLBACK_STATUS if FAIL_FALLBACK_STATUS in ALLOWED_STATUSES else next(
+        iter(sorted(ALLOWED_STATUSES - SUCCESS_STATUSES) or ALLOWED_STATUSES or {_FAIL_FALLBACK_ID})
+    )
+
+
+def map_fail_status(action: dict[str, Any], heuristic: str = "") -> str:
+    known = _status_if_allowed(action.get("status"), allow_success=False)
+    if known:
+        return known
+    blob = f"{action.get('reason') or ''} {heuristic}".lower()
+    return _heuristic_fail_status(blob)
 
 
 def map_done_status(action: dict[str, Any]) -> str:
-    st = action.get("status")
-    if st in ALLOWED_STATUSES:
-        return str(st)
-    return "registered_ok"
+    """Model done.status must be a declared package id. Unknown → fail-safe, never invent success."""
+    known = _status_if_allowed(action.get("status"), allow_success=True)
+    if known:
+        return known
+    return FAIL_FALLBACK_STATUS if FAIL_FALLBACK_STATUS in ALLOWED_STATUSES else _FAIL_FALLBACK_ID
+
+
+def process_exit_code(status: str | None) -> int:
+    """Process exit from the skill-package catalog (success → 0)."""
+    st = str(status or "")
+    if st in STATUS_EXITS:
+        return int(STATUS_EXITS[st])
+    if st in SUCCESS_STATUSES:
+        return _DEFAULT_SUCCESS_EXIT
+    return _DEFAULT_FAIL_EXIT
 
 
 def sniff_image_mime(data: bytes) -> str:
@@ -1036,13 +1193,16 @@ def confirm_logged_in(page: Any) -> bool:
 
 def status_when_login_unconfirmed(gate: dict[str, Any]) -> str:
     g = str(gate.get("gate") or "not_logged_in")
-    if g == "account_deactivated":
-        return "account_deactivated"
-    if g == "oops":
-        return "oops_blocked"
-    if g == "not_logged_in":
-        return "not_logged_in"
-    return "visual_stuck"
+    mapped = {
+        "account_deactivated": "account_deactivated",
+        "oops": "oops_blocked",
+        "not_logged_in": "not_logged_in",
+    }.get(g)
+    if mapped and mapped in ALLOWED_STATUSES and mapped not in SUCCESS_STATUSES:
+        return mapped
+    if FAIL_FALLBACK_STATUS in ALLOWED_STATUSES:
+        return FAIL_FALLBACK_STATUS
+    return _FAIL_FALLBACK_ID
 
 
 def page_heuristic(page: Any) -> str:
@@ -1170,7 +1330,7 @@ def vision_complete(
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "cloakcli-pinterest-visual-mm/0.2.0",
+            "User-Agent": f"cloakcli-pinterest-visual-mm/{VERSION}",
         },
     )
     try:
@@ -1513,6 +1673,27 @@ def run_loop(
         human_pause(page, 2500, 4500, "signup_land", dry_run=False)
 
     def finish(status: str, **extra: Any) -> dict[str, Any]:
+        login_confirmed = bool(extra.pop("login_confirmed", False) or registered)
+        if is_success_status(status) and not login_confirmed:
+            gate = page_login_gate(page)
+            if gate.get("ok"):
+                login_confirmed = True
+            else:
+                log(
+                    {
+                        "status": "login_gate_rejected_finish",
+                        "model_status": status,
+                        "gate": gate.get("gate"),
+                        "reason": gate.get("reason"),
+                    }
+                )
+                status = status_when_login_unconfirmed(gate)
+                extra.setdefault(
+                    "reason",
+                    extra.get("reason") or "success status refused: page not logged-in",
+                )
+        if status not in ALLOWED_STATUSES:
+            status = FAIL_FALLBACK_STATUS
         report = {
             "skill_id": SKILL_ID,
             "version": VERSION,
@@ -1634,7 +1815,7 @@ def run_loop(
             log({"status": "model_error", "error": last_feedback})
             consecutive_rejects += 1
             if consecutive_rejects >= 5:
-                return finish("visual_stuck", reason=last_feedback)
+                return finish(FAIL_FALLBACK_STATUS, reason=last_feedback)
             continue
         tokens += int(used or 0)
         try:
@@ -1644,7 +1825,7 @@ def run_loop(
             log({"status": "action_reject", "error": str(e)})
             consecutive_rejects += 1
             if consecutive_rejects >= 6:
-                return finish("visual_stuck", reason=last_feedback)
+                return finish(FAIL_FALLBACK_STATUS, reason=last_feedback)
             continue
 
         pub = public_action(action, extra_secrets=extra_secrets)
@@ -1660,26 +1841,31 @@ def run_loop(
         if atype == "done":
             st = map_done_status(action)
             path_hint = action.get("path") or path_hint
-            if st == "registered_ok":
+            if is_success_status(st):
                 gate = page_login_gate(page)
                 if not gate.get("ok"):
                     fail_st = status_when_login_unconfirmed(gate)
                     log(
                         {
                             "status": "login_gate_rejected_done",
-                            "model_status": "registered_ok",
+                            "model_status": st,
                             "gate": gate.get("gate"),
                             "reason": gate.get("reason"),
                         }
                     )
                     return finish(
                         fail_st,
-                        reason="model registered_ok but page not logged-in",
+                        reason=f"model {st} but page not logged-in",
                         path=path_hint,
                     )
                 registered = True
                 do_nurture()
-                return finish("registered_ok", reason=action.get("reason") or st, path=path_hint)
+                return finish(
+                    st,
+                    reason=action.get("reason") or st,
+                    path=path_hint,
+                    login_confirmed=True,
+                )
             return finish(st, reason=action.get("reason") or st, path=path_hint)
 
         if atype == "nurture":
@@ -1770,7 +1956,7 @@ def run_loop(
             log({"status": "action_reject", "error": last_feedback, "action": pub})
             consecutive_rejects += 1
             if consecutive_rejects >= 6:
-                return finish("visual_stuck", reason=last_feedback)
+                return finish(FAIL_FALLBACK_STATUS, reason=last_feedback)
             continue
 
         consecutive_rejects = 0
@@ -1802,10 +1988,17 @@ def run_loop(
                 path=path_hint,
             )
         do_nurture()
-        return finish("registered_ok", path=path_hint or "timeout_after_register")
+        primary = "registered_ok" if "registered_ok" in SUCCESS_STATUSES else next(
+            iter(sorted(SUCCESS_STATUSES)), FAIL_FALLBACK_STATUS
+        )
+        return finish(
+            primary,
+            path=path_hint or "timeout_after_register",
+            login_confirmed=True,
+        )
     if time.time() >= deadline:
-        return finish("visual_stuck", reason="wall-clock budget exhausted")
-    return finish("visual_stuck", reason="max steps exceeded")
+        return finish(FAIL_FALLBACK_STATUS, reason="wall-clock budget exhausted")
+    return finish(FAIL_FALLBACK_STATUS, reason="max steps exceeded")
 
 
 def launch_cloakbrowser(ud: Path, headed: bool, proxy: str | None) -> Any:
@@ -2111,18 +2304,7 @@ def main(argv: list[str] | None = None, stdin_payload: dict[str, Any] | None = N
                 os.environ[env_name] = prev_key
 
     print(json.dumps(report, ensure_ascii=False), flush=True)
-    st = report.get("status")
-    if st in ("registered_ok", "browsed_ok"):
-        return 0
-    if st == "oops_blocked":
-        return 2
-    if st == "verify_soft_fail":
-        return 5
-    if st == "account_deactivated":
-        return 7
-    if st == "not_logged_in":
-        return 8
-    return 4
+    return process_exit_code(report.get("status"))
 
 
 class _LiveVision:

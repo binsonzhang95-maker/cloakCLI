@@ -1,4 +1,4 @@
-"""Product multimodal Pinterest register runner (0.2.0) — parse, LLM discover, dry-run."""
+"""Product multimodal Pinterest register runner (0.2.1) — parse, LLM discover, dry-run."""
 from __future__ import annotations
 
 import argparse
@@ -137,7 +137,49 @@ class ParseActionTests(unittest.TestCase):
             self.mm.map_fail_status({"reason": "stuck"}, "unknown"),
             "visual_stuck",
         )
-        self.assertEqual(self.mm.map_done_status({}), "registered_ok")
+        self.assertEqual(self.mm.map_done_status({}), "visual_stuck")
+        self.assertEqual(self.mm.map_done_status({"status": "invented"}), "visual_stuck")
+        self.assertEqual(self.mm.map_done_status({"status": "browsed_ok"}), "browsed_ok")
+        self.assertEqual(self.mm.map_fail_status({"status": "registered_ok"}), "visual_stuck")
+
+    def test_status_catalog_loaded_from_manifest_file(self) -> None:
+        mm = self.mm
+        tmp = Path(tempfile.mkdtemp(prefix="cloakcli_visual_man_")) / "manifest.json"
+        tmp.write_text(
+            json.dumps(
+                {
+                    "version": "9.9.9",
+                    "statuses": [
+                        {
+                            "id": "alpha_ok",
+                            "success": True,
+                            "retryable": False,
+                            "label": "Alpha",
+                            "exit": 0,
+                        },
+                        {
+                            "id": "visual_stuck",
+                            "success": False,
+                            "retryable": True,
+                            "label": "Stuck",
+                            "exit": 4,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        cat = mm.load_skill_status_catalog(tmp)
+        self.assertEqual(cat["version"], "9.9.9")
+        self.assertEqual(cat["success"], frozenset({"alpha_ok"}))
+        self.assertEqual(cat["allowed"], frozenset({"alpha_ok", "visual_stuck"}))
+        self.assertNotIn("registered_ok", cat["success"])
+        self.assertNotIn("browsed_ok", cat["allowed"])
+        self.assertEqual(cat["exits"]["alpha_ok"], 0)
+        missing = Path(tempfile.mkdtemp(prefix="cloakcli_visual_noman_")) / "nope.json"
+        safe = mm.load_skill_status_catalog(missing)
+        self.assertEqual(safe["success"], frozenset())
+        self.assertIn("visual_stuck", safe["allowed"])
 
 
 class LlmDiscoverTests(IsolatedLlmEnv, unittest.TestCase):
@@ -302,7 +344,7 @@ class DryRunSmokeTests(unittest.TestCase):
         self.assertTrue(lines)
         report = json.loads(lines[-1])
         self.assertEqual(report["skill_id"], "pinterest-register-visual")
-        self.assertEqual(report["version"], "0.2.0")
+        self.assertEqual(report["version"], "0.2.1")
         self.assertEqual(report["status"], "registered_ok")
         self.assertEqual(report["nurture_status"], "browsed_ok")
         self.assertTrue(report.get("dry_run"))
@@ -326,11 +368,11 @@ class DryRunSmokeTests(unittest.TestCase):
         report = json.loads([ln for ln in proc.stdout.splitlines() if ln.strip()][-1])
         self.assertEqual(report["status"], "visual_stuck")
 
-    def test_skill_manifest_python_runner_0_2_0(self) -> None:
+    def test_skill_manifest_python_runner_0_2_1(self) -> None:
         man = json.loads(
             (ROOT / "skills/pinterest-register-visual/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(man["version"], "0.2.0")
+        self.assertEqual(man["version"], "0.2.1")
         self.assertEqual(man["entry"]["kind"], "python_runner")
         self.assertEqual(man["entry"]["path"], "scripts/run_pinterest_register_visual_mm.py")
         ids = {s["id"] for s in man["statuses"]}
@@ -349,6 +391,21 @@ class DryRunSmokeTests(unittest.TestCase):
         pkg_runner = ROOT / "skills/pinterest-register-visual/scripts/run_pinterest_register_visual_mm.py"
         self.assertTrue(pkg_runner.is_file())
         self.assertTrue((ROOT / "scripts/run_pinterest_register_visual_mm.py").is_file())
+        mm = load_mm()
+        success = {s["id"] for s in man["statuses"] if s.get("success")}
+        self.assertEqual(mm.ALLOWED_STATUSES, ids)
+        self.assertEqual(mm.SUCCESS_STATUSES, success)
+        self.assertEqual(mm.VERSION, man["version"])
+        self.assertIn("registered_ok", mm.SUCCESS_STATUSES)
+        self.assertIn("browsed_ok", mm.SUCCESS_STATUSES)
+        self.assertEqual(mm.process_exit_code("registered_ok"), 0)
+        self.assertEqual(mm.process_exit_code("browsed_ok"), 0)
+        self.assertEqual(mm.process_exit_code("oops_blocked"), 2)
+        self.assertEqual(mm.process_exit_code("verify_soft_fail"), 5)
+        self.assertEqual(mm.process_exit_code("account_deactivated"), 7)
+        self.assertEqual(mm.process_exit_code("not_logged_in"), 8)
+        self.assertEqual(mm.process_exit_code("visual_stuck"), 4)
+        self.assertEqual(mm.process_exit_code("invented"), 4)
 
 
 class ProviderMimeTests(unittest.TestCase):
@@ -629,6 +686,48 @@ class LoginGateAndActionTests(unittest.TestCase):
         self.assertIn(report["status"], ("not_logged_in", "visual_stuck"))
         self.assertFalse((ud / ".cloak_session_ok").exists())
         self.assertEqual(report.get("nurture_status"), "skipped")
+
+    def test_model_browsed_ok_on_register_page_is_rejected(self) -> None:
+        """done:browsed_ok on signup/login must not fake success or write .cloak_session_ok."""
+        mm = self.mm
+        ud = Path(tempfile.mkdtemp(prefix="cloakcli_visual_ud_browse_"))
+        page = mm.DryRunPage()
+        vision = mm.MockVision(
+            [
+                {
+                    "schema_version": 1,
+                    "action": "done",
+                    "status": "browsed_ok",
+                    "reason": "model guess on register form",
+                }
+            ]
+        )
+        report = self._run_loop(page, vision, ud, dry_run=True)
+        self.assertNotEqual(report["status"], "browsed_ok")
+        self.assertNotEqual(report["status"], "registered_ok")
+        self.assertFalse(mm.is_success_status(report["status"]))
+        self.assertIn(report["status"], ("not_logged_in", "visual_stuck"))
+        self.assertFalse((ud / ".cloak_session_ok").exists())
+        self.assertEqual(report.get("nurture_status"), "skipped")
+
+    def test_model_browsed_ok_with_login_is_success(self) -> None:
+        mm = self.mm
+        ud = Path(tempfile.mkdtemp(prefix="cloakcli_visual_ud_browse_ok_"))
+        page = mm.DryRunPage(persist_logged_in=True)
+        vision = mm.MockVision(
+            [
+                {
+                    "schema_version": 1,
+                    "action": "done",
+                    "status": "browsed_ok",
+                    "path": "already_logged_in",
+                }
+            ]
+        )
+        report = self._run_loop(page, vision, ud, dry_run=True)
+        self.assertTrue(mm.is_success_status(report["status"]))
+        self.assertIn(report["status"], ("browsed_ok", "registered_ok"))
+        self.assertTrue((ud / ".cloak_session_ok").exists())
 
     def test_nurture_action_does_not_set_registered_without_login(self) -> None:
         mm = self.mm
