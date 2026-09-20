@@ -1,4 +1,4 @@
-"""Nurture 0.2.0 behavior helpers: mouse path, pauses, personas, inertial scroll."""
+"""Nurture 0.2.1 behavior helpers: mouse path, pauses, personas, inertial scroll."""
 from __future__ import annotations
 
 import importlib.util
@@ -222,6 +222,42 @@ class MousePathTests(unittest.TestCase):
         self.assertEqual(loc.clicks, 0)
         self.assertGreater(result["hover_ms"], 0)
 
+    def test_human_click_never_falls_back_to_locator_click(self) -> None:
+        class CountingLocator(FakeLocator):
+            def click(self, **k: object) -> None:
+                self.clicks += 1
+
+        page_missing = FakePage()
+        loc_missing = CountingLocator(None)
+        missing = bh.human_click_locator(
+            page_missing, loc_missing, {"x": 4.0, "y": 6.0}, rng=random.Random(1)
+        )
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["method"], "no_box")
+        self.assertEqual(loc_missing.clicks, 0)
+        self.assertNotIn("click", [e[0] for e in page_missing.mouse.events])
+        self.assertEqual([e[0] for e in page_missing.mouse.events].count("down"), 0)
+
+        class BoomMouse(FakeMouse):
+            def down(self) -> None:
+                self.events.append(("down",))
+                raise RuntimeError("pointer down failed")
+
+        page_boom = FakePage()
+        page_boom.mouse = BoomMouse()
+        loc_boom = CountingLocator({"x": 120.0, "y": 80.0, "width": 48.0, "height": 22.0})
+        boom = bh.human_click_locator(
+            page_boom, loc_boom, {"x": 8.0, "y": 10.0}, rng=random.Random(2)
+        )
+        self.assertFalse(boom["ok"])
+        self.assertEqual(boom["method"], "mouse_down_up_failed")
+        self.assertEqual(loc_boom.clicks, 0)
+        kinds = [e[0] for e in page_boom.mouse.events]
+        self.assertNotIn("click", kinds)
+        self.assertGreaterEqual(kinds.count("move"), 1)
+        self.assertEqual(kinds.count("down"), 1)
+        self.assertEqual(kinds.count("up"), 0)
+
     def test_human_type_never_fills(self) -> None:
         page = FakePage()
         loc = FakeLocator({"x": 10.0, "y": 10.0, "width": 120.0, "height": 24.0})
@@ -272,7 +308,7 @@ class RunnerCliTests(unittest.TestCase):
         cls.runner = load_mod(RUNNER, "run_pinterest_nurture_browse")
 
     def test_default_headed_and_persona_pins(self) -> None:
-        self.assertEqual(self.runner.VERSION, "0.2.0")
+        self.assertEqual(self.runner.VERSION, "0.2.1")
         ns = self.runner.build_arg_parser().parse_args(["--profile", "geo46"])
         self.assertFalse(ns.headless)
         self.assertEqual(ns.pins, 0)
@@ -299,8 +335,14 @@ class RunnerCliTests(unittest.TestCase):
         manifest = json.loads(
             (ROOT / "skills/pinterest-nurture-browse/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["version"], "0.2.0")
+        self.assertEqual(manifest["version"], "0.2.1")
         self.assertEqual(manifest["entry"]["path"], "scripts/run_pinterest_nurture_browse.py")
+        behavior_src = (ROOT / "scripts/pinterest_nurture_behavior.py").read_text(encoding="utf-8")
+        click_fn = behavior_src.split("def human_click_locator", 1)[1].split("\ndef ", 1)[0]
+        self.assertNotIn("loc.click", click_fn)
+        runner_src = (ROOT / "scripts/run_pinterest_nurture_browse.py").read_text(encoding="utf-8")
+        self.assertNotIn("force=True", runner_src)
+        self.assertNotIn(".click(timeout=5000, force=True)", runner_src)
 
 
 if __name__ == "__main__":

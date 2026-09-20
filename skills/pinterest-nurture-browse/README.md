@@ -1,4 +1,4 @@
-# pinterest-nurture-browse (0.2.0)
+# pinterest-nurture-browse (0.2.1)
 
 Logged-in **nurture browse** for a single Pinterest account. Behavior hardening
 (Gemini JS strategy 2026-09-21): default **headed**, continuous **randomized
@@ -13,7 +13,7 @@ pauses, quiet window after load. 0 likes is a valid success.
 - Do **not** change CloakBrowser fingerprint / launch knobs.
 - Use the account’s **bound proxy** from `profile.json`.
 
-## Behavior hardening (0.2.0)
+## Behavior hardening (0.2.1)
 
 | Surface | What the runner does |
 |---------|----------------------|
@@ -105,3 +105,4 @@ python3 -m unittest python/tests/test_pinterest_nurture_behavior.py -v
 - Do not nurture dead/deactivated accounts; only known-alive sessions.
 - Exposes `run_nurture_session(page, …)` for in-process keep-open chaining and `run_nurture_reopen(…)` for persistent reopen.
 - Source of truth for this pass: `artifacts/pinterest/js-strategy-20260921/gemini-analysis.md` + `SUMMARY.md`.
+- 0.2.1: no `locator.click` / `force=True` teleport fallback — trail then mousedown/mouseup, or fail.

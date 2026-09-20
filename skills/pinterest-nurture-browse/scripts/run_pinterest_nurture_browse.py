@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinterest nurture browse (0.2.0).
+"""Pinterest nurture browse (0.2.1).
 
 Logged-in feed browse with behavior hardening (Gemini 2026-09-21): default
 headed, continuous randomized mouse trails, inertial scroll, session personas
@@ -51,7 +51,7 @@ from pinterest_nurture_behavior import (  # noqa: E402
 )
 
 ART = ROOT / "artifacts/pinterest/nurture-browse"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # Draft selectors — refine after a healthy logged-in probe
 PIN_LINK = 'a[href*="/pin/"]'
@@ -711,16 +711,15 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
                     if out["continued"]:
                         pause(page, 2500, 4500, "use_case_after_continue")
                     break
-                # force click after enough picks even if still says pick
+                # Trail-only retry after enough picks even if the label still says pick.
                 if out["picked"] >= 3 and _ >= 4:
                     try:
                         clk = _hclick(page, btn.first)
-                        if not clk.get("ok"):
-                            btn.first.click(timeout=5000, force=True)
-                        out["continued"] = True
-                        out["continue_forced"] = True
-                        pause(page, 2500, 4500, "use_case_continue_forced")
-                        break
+                        if clk.get("ok"):
+                            out["continued"] = True
+                            out["continue_forced"] = True
+                            pause(page, 2500, 4500, "use_case_continue_forced")
+                            break
                     except Exception:
                         pass
             except Exception:

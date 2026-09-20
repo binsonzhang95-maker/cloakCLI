@@ -474,7 +474,7 @@ def human_click_locator(
     *,
     rng: Any = None,
 ) -> dict[str, Any]:
-    """Trail → hover → mousedown/mouseup. Never instant click when a box exists."""
+    """Trail → hover → mousedown/mouseup. Never locator.click / teleport."""
     rng = _as_rng(rng)
     if mouse is None:
         mouse = session_mouse()
@@ -486,40 +486,32 @@ def human_click_locator(
             box = _locator_box(loc)
         except Exception:
             box = None
-    if box is not None:
-        tx = box["x"] + box["width"] * rng.uniform(0.22, 0.78)
-        ty = box["y"] + box["height"] * rng.uniform(0.22, 0.78)
-        n_moves = human_move_to(page, tx, ty, mouse, rng=rng)
-        hover_ms = sample_lognormal_ms(450, 1300, mu=-0.15, sigma=0.4, rng=rng)
-        page.wait_for_timeout(hover_ms)
-        try:
-            page.mouse.down()
-            page.wait_for_timeout(sample_gamma_ms(35, 140, alpha=3.0, beta=18.0, rng=rng))
-            page.mouse.up()
-            return {
-                "ok": True,
-                "method": "mouse_trail_down_up",
-                "hover_ms": hover_ms,
-                "n_moves": n_moves,
-                "target": (tx, ty),
-            }
-        except Exception as e:
-            try:
-                loc.click(timeout=5000)
-                return {
-                    "ok": True,
-                    "method": "locator_click_after_trail",
-                    "hover_ms": hover_ms,
-                    "n_moves": n_moves,
-                    "error": type(e).__name__,
-                }
-            except Exception as e2:
-                return {"ok": False, "method": "click_failed", "error": type(e2).__name__}
+    if box is None:
+        return {"ok": False, "method": "no_box"}
+    tx = box["x"] + box["width"] * rng.uniform(0.22, 0.78)
+    ty = box["y"] + box["height"] * rng.uniform(0.22, 0.78)
+    n_moves = human_move_to(page, tx, ty, mouse, rng=rng)
+    hover_ms = sample_lognormal_ms(450, 1300, mu=-0.15, sigma=0.4, rng=rng)
+    page.wait_for_timeout(hover_ms)
     try:
-        loc.click(timeout=5000)
-        return {"ok": True, "method": "locator_click_no_box"}
+        page.mouse.down()
+        page.wait_for_timeout(sample_gamma_ms(35, 140, alpha=3.0, beta=18.0, rng=rng))
+        page.mouse.up()
+        return {
+            "ok": True,
+            "method": "mouse_trail_down_up",
+            "hover_ms": hover_ms,
+            "n_moves": n_moves,
+            "target": (tx, ty),
+        }
     except Exception as e:
-        return {"ok": False, "method": "click_failed", "error": type(e).__name__}
+        return {
+            "ok": False,
+            "method": "mouse_down_up_failed",
+            "hover_ms": hover_ms,
+            "n_moves": n_moves,
+            "error": type(e).__name__,
+        }
 
 
 def human_type_text(
