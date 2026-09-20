@@ -1,4 +1,4 @@
-"""Product multimodal Pinterest register runner (0.2.4) — parse, LLM discover, dry-run."""
+"""Product multimodal Pinterest register runner (0.2.5) — parse, LLM discover, dry-run."""
 from __future__ import annotations
 
 import argparse
@@ -353,7 +353,7 @@ class DryRunSmokeTests(unittest.TestCase):
         self.assertTrue(lines)
         report = json.loads(lines[-1])
         self.assertEqual(report["skill_id"], "pinterest-register-visual")
-        self.assertEqual(report["version"], "0.2.4")
+        self.assertEqual(report["version"], "0.2.5")
         self.assertEqual(report["status"], "registered_ok")
         self.assertEqual(report["nurture_status"], "browsed_ok")
         self.assertTrue(report.get("dry_run"))
@@ -377,11 +377,11 @@ class DryRunSmokeTests(unittest.TestCase):
         report = json.loads([ln for ln in proc.stdout.splitlines() if ln.strip()][-1])
         self.assertEqual(report["status"], "visual_stuck")
 
-    def test_skill_manifest_python_runner_0_2_4(self) -> None:
+    def test_skill_manifest_python_runner_0_2_5(self) -> None:
         man = json.loads(
             (ROOT / "skills/pinterest-register-visual/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(man["version"], "0.2.4")
+        self.assertEqual(man["version"], "0.2.5")
         self.assertEqual(man["entry"]["kind"], "python_runner")
         self.assertEqual(man["entry"]["path"], "scripts/run_pinterest_register_visual_mm.py")
         ids = {s["id"] for s in man["statuses"]}
@@ -400,6 +400,16 @@ class DryRunSmokeTests(unittest.TestCase):
         pkg_runner = ROOT / "skills/pinterest-register-visual/scripts/run_pinterest_register_visual_mm.py"
         self.assertTrue(pkg_runner.is_file())
         self.assertTrue((ROOT / "scripts/run_pinterest_register_visual_mm.py").is_file())
+        self.assertEqual(
+            (ROOT / "scripts/run_pinterest_register_visual_mm.py").read_bytes(),
+            pkg_runner.read_bytes(),
+        )
+        pkg_bh = ROOT / "skills/pinterest-register-visual/scripts/pinterest_nurture_behavior.py"
+        self.assertTrue(pkg_bh.is_file())
+        self.assertEqual(
+            (ROOT / "scripts/pinterest_nurture_behavior.py").read_bytes(),
+            pkg_bh.read_bytes(),
+        )
         mm = load_mm()
         success = {s["id"] for s in man["statuses"] if s.get("success")}
         self.assertEqual(mm.ALLOWED_STATUSES, ids)
@@ -566,6 +576,11 @@ class LoginGateAndActionTests(unittest.TestCase):
         )
         self.assertTrue(click["ok"])
         self.assertEqual(page.clicked, ["#email"])
+        kinds = [e[0] for e in page.mouse_events]
+        self.assertGreaterEqual(kinds.count("move"), 8)
+        self.assertGreaterEqual(kinds.count("down"), 1)
+        self.assertGreaterEqual(kinds.count("up"), 1)
+        self.assertNotIn("click", kinds)
         xy = self.mm.execute_browser_action(
             page,
             {"action": "click", "x": 40, "y": 80, "screenshot_id": "obs-000"},
@@ -586,11 +601,13 @@ class LoginGateAndActionTests(unittest.TestCase):
         )
         self.assertTrue(typed["ok"])
         self.assertTrue(page.typed or page.filled)
+        self.assertEqual(page.fields.get("#email"), "user@example.com")
+        self.assertFalse(any(sel == "#email" for sel, _txt in page.filled))
         press = self.mm.execute_browser_action(
             page, {"action": "press", "key": "Tab"}, screenshot_id="obs-000"
         )
         self.assertTrue(press["ok"])
-        self.assertEqual(page.pressed, ["Tab"])
+        self.assertEqual(page.pressed[-1], "Tab")
         scroll = self.mm.execute_browser_action(
             page, {"action": "scroll", "delta_x": 0, "delta_y": 200}, screenshot_id="obs-000"
         )
@@ -600,6 +617,34 @@ class LoginGateAndActionTests(unittest.TestCase):
             page, {"action": "wait", "ms": 50}, screenshot_id="obs-000"
         )
         self.assertTrue(wait["ok"])
+
+    def test_execute_click_never_teleports(self) -> None:
+        import inspect
+
+        click_src = inspect.getsource(self.mm.execute_browser_action)
+        self.assertIn("human_click_with_retry", click_src)
+        self.assertIn("human_type_text", click_src)
+        self.assertNotIn("page.click(", click_src)
+        self.assertNotIn("force=True", click_src)
+        self.assertNotIn("mouse.click", click_src)
+        focus_src = inspect.getsource(self.mm._focus_type_target)
+        self.assertIn("human_click_with_retry", focus_src)
+        self.assertNotIn("page.click(", focus_src)
+        self.assertNotIn(".click(timeout", focus_src)
+        rec_src = inspect.getsource(self.mm.execute_signup_continue_recovery)
+        self.assertNotIn(".click(timeout", rec_src)
+        self.assertNotIn("force=True", rec_src)
+
+        page = self.mm.DryRunPage()
+        result = self.mm.execute_browser_action(
+            page, {"action": "click", "selector": "button:has-text('Continue')"}, screenshot_id="obs-000"
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result.get("method"), "mouse_trail_down_up")
+        kinds = [e[0] for e in page.mouse_events]
+        self.assertNotIn("click", kinds)
+        self.assertGreaterEqual(kinds.count("down"), 1)
+        self.assertIn("button:has-text('Continue')", page.clicked)
 
     def test_provider_complete_mocked_http(self) -> None:
         from cloakcli_worker.llm_config import parse_llm_config

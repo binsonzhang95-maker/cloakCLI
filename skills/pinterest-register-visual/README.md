@@ -1,4 +1,4 @@
-# pinterest-register-visual (0.2.4)
+# pinterest-register-visual (0.2.5)
 
 **PRODUCT path:** multimodal loop on **CloakBrowser** —
 
@@ -16,13 +16,13 @@ Skill package entry is `python_runner` → `scripts/run_pinterest_register_visua
 
 ## When to use vs `pinterest-register-outlook-verify`
 
-| | `pinterest-register-visual` 0.2.4 | `pinterest-register-outlook-verify` |
+| | `pinterest-register-visual` 0.2.5 | `pinterest-register-outlook-verify` |
 |--|-----------------------------------|-------------------------------------|
 | Execution | Product MM loop (`python_runner`) | Declarative `skill.json` steps + selector runner |
 | Targeting | Vision JSON actions (`click` css or x/y + `screenshot_id`) | CSS / Playwright selectors |
 | Best for | Geo/UI drift, Oops-prone selector arm, A/B visual arm | Stable automated fleet when selectors hold |
 | IMAP | Same: `scripts/outlook_imap_pinterest_code.py` + secrets env | Same |
-| Nurture | Same-session **before** `ctx.close` (nurture 0.1.7+) | Same (register runner chains by default) |
+| Nurture | Same-session **before** `ctx.close` (nurture 0.2.1+) | Same (register runner chains by default) |
 
 ## Hard constraints
 
@@ -83,11 +83,13 @@ cloakcli llm models
 `click` | `type` | `press` | `wait` | `scroll` | `imap_fetch_code` | `nurture` | `done` | `fail`
 
 - `click`: CSS `selector`, **or** `x`/`y` **plus** `screenshot_id` equal to the current observation
-- `type`: prefer `field: email|password|birthday|name|code` — runner **auto-binds** CSS (`#email`, `#password`, `#birthdate`, `#code`, onboarding name) then clicks the real input and types (date uses `fill` with **YYYY-MM-DD**). `text` with `{{EMAIL}}` `{{PASSWORD}}` `{{BIRTHDAY}}` `{{DISPLAY_NAME}}` `{{CODE}}` also works. Values never logged. After email+password+birthday, click `button:has-text('Continue')` (not Google); the runner skips re-types and may one-shot Continue if the model loops. Vision timeouts / transient HTTP retry 2–3× before `model_error`.
+- `type`: prefer `field: email|password|birthday|name|code` — runner **auto-binds** CSS (`#email`, `#password`, `#birthdate`, `#code`, onboarding name) then **trail-clicks** the real input and types with nurture `human_type_text` (date uses `fill` with **YYYY-MM-DD** after trail focus). `text` with `{{EMAIL}}` `{{PASSWORD}}` `{{BIRTHDAY}}` `{{DISPLAY_NAME}}` `{{CODE}}` also works. Values never logged. After email+password+birthday, click `button:has-text('Continue')` (not Google); the runner skips re-types and may one-shot Continue if the model loops. Vision timeouts / transient HTTP retry 2–3× before `model_error`.
 - `imap_fetch_code`: existing Outlook IMAP helper
 - `nurture` / `done` with any **success** status (`registered_ok`, `browsed_ok`, … from `manifest.json`): **hints only**. Runner confirms login (account menu / pin feed / no unauth Log in+Sign up CTA) before writing `.cloak_session_ok`, chaining nurture, or returning success. `done: browsed_ok` on a register/login page is rejected (`not_logged_in` / `visual_stuck`). `nurture` alone never sets registered. Unknown model status → `visual_stuck` (never invent success).
 
 ## Behavior pacing
+
+Register now shares nurture 0.2.1 human behavior (trail click + key stream). Clicks use `human_click_locator` (mouse trail then mousedown/mouseup — never `locator.click` / `force=True` teleport). Email/password/code/name use `human_type_text`. Quiet window after signup land; log-normal pauses (ambient drift on longer waits).
 
 - Fields: 800–2500ms · before Continue: 2–5s · after Continue settle: 3–8s · no click storms
 - Signup anti-loop: skip duplicate field types; after three fills bias Continue; one-shot Continue recovery after 3 redundant types
@@ -130,8 +132,8 @@ Mock vision + stub page. Does **not** launch CloakBrowser or call a live model. 
 ## Related
 
 - Product runner: `scripts/run_pinterest_register_visual_mm.py`
-- Declarative register: `skills/pinterest-register-outlook-verify/` (runner 0.1.1)
-- Nurture: `skills/pinterest-nurture-browse/` (0.1.7+)
+- Declarative register: `skills/pinterest-register-outlook-verify/` (runner 0.1.2, same human helpers)
+- Nurture: `skills/pinterest-nurture-browse/` (0.2.1+)
 - IMAP helper: `scripts/outlook_imap_pinterest_code.py`
 - Operator playbook: `OPERATOR.md`
 - Preflight (no browser): `scripts/run_pinterest_register_visual_hint.py`

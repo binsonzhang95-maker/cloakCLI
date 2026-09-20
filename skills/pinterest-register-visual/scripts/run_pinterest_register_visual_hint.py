@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preflight for pinterest-register-visual (0.2.4).
+"""Preflight for pinterest-register-visual (0.2.5).
 
 Prints the product MM-loop checklist and validates that profile.json + secrets
 env exist. Does NOT launch a browser. No secrets values are printed.
@@ -20,7 +20,7 @@ if _HERE.parent.name == "scripts" and _HERE.parents[1].name == "pinterest-regist
 else:
     ROOT = _HERE.parents[1]
 
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 SKILL_ID = "pinterest-register-visual"
 
 REQUIRED_SECRET_KEYS = (
@@ -37,12 +37,12 @@ CHECKLIST = [
     "Load proxy from profiles/<id>/profile.json (udeal/geo as bound)",
     "Persistent user_data_dir: data/profiles/<id>-pinterest-run",
     "LLM: config/llm.json + CLOAKCLI_LLM_API_KEY (default grok-4.6; vision: CLOAKCLI_LLM_VISION_MODEL / llm.json vision_model); never --api-key",
-    "Pacing: 800–2500ms fields; 2–5s before Continue; 3–8s settle after (no click storms)",
+    "Pacing: nurture 0.2.1 helpers (trail click + key stream); quiet window after land; log-normal pauses (no click storms / no teleport click)",
     "MM loop: screenshot → vision JSON click|type|press|wait|scroll|imap_fetch_code|nurture|done|fail",
     "IMAP 6-digit via scripts/outlook_imap_pinterest_code.py + secrets env",
-    "On logged-in: same-session nurture BEFORE close; probe+flush; nurture 0.1.7+",
+    "On logged-in: same-session nurture BEFORE close; probe+flush; nurture 0.2.1+",
     "Never fresh-profile after success; touch .cloak_session_ok; concurrency ≤2–3",
-    "Report status/path/nurture_status/elapsed version 0.2.4 from skill manifest (see OPERATOR.md)",
+    "Report status/path/nurture_status/elapsed version 0.2.5 from skill manifest (see OPERATOR.md)",
     "Smoke: --dry-run mock vision (no CloakBrowser)",
 ]
 

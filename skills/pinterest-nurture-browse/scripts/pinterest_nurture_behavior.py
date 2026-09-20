@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Pure Pinterest nurture behavior helpers (no CloakBrowser fingerprint knobs).
+"""Pure Pinterest human-behavior helpers (no CloakBrowser fingerprint knobs).
 
 Continuous randomized mouse trails, inertial scroll, log-normal/gamma pauses,
-and session personas. Used by run_pinterest_nurture_browse.py. Stdlib only.
+and session personas. Used by nurture browse and register runners. Stdlib only.
 """
 from __future__ import annotations
 
@@ -521,28 +521,33 @@ def human_type_text(
     *,
     mouse: dict[str, float] | None = None,
     rng: Any = None,
+    skip_focus: bool = False,
 ) -> dict[str, Any]:
-    """Focus via trail+click, then per-key delays. Never element.fill() for human fields."""
+    """Focus via trail+click, then per-key delays. Never element.fill() for human fields.
+
+    skip_focus=True when the caller already trail-clicked. If a trail focus is
+    attempted and fails, return without typing (never unfocused keyboard.type).
+    """
     rng = _as_rng(rng)
     out: dict[str, Any] = {"typed": 0, "typos": 0, "used_fill": False}
-    if mouse is not None:
+    if skip_focus:
+        out["focus"] = "already_focused"
+        out["focus_ok"] = True
+    elif mouse is not None:
         click = human_click_locator(page, loc, mouse, rng=rng)
         out["focus"] = click.get("method")
         out["focus_ok"] = bool(click.get("ok"))
+        if not out["focus_ok"]:
+            return out
     else:
         try:
-            loc.click(timeout=4000)
-            out["focus"] = "locator_click"
+            loc.focus()
+            out["focus"] = "focus"
             out["focus_ok"] = True
-        except Exception:
-            try:
-                loc.focus()
-                out["focus"] = "focus"
-                out["focus_ok"] = True
-            except Exception as e:
-                out["focus_ok"] = False
-                out["error"] = type(e).__name__
-                return out
+        except Exception as e:
+            out["focus_ok"] = False
+            out["error"] = type(e).__name__
+            return out
     try:
         loc.press("Control+A")
         page.wait_for_timeout(sample_gamma_ms(40, 120, alpha=2.0, beta=20.0, rng=rng))

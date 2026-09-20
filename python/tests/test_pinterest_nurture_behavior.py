@@ -268,6 +268,21 @@ class MousePathTests(unittest.TestCase):
         self.assertEqual("".join(ch for ch in typed if len(ch) == 1)[-4:], "Nora")
         self.assertGreaterEqual(out["typed"], 4)
 
+    def test_human_type_skips_keys_when_focus_fails(self) -> None:
+        class CountingLocator(FakeLocator):
+            def click(self, **k: object) -> None:
+                self.clicks += 1
+
+        page = FakePage()
+        loc = CountingLocator(None)
+        out = bh.human_type_text(
+            page, loc, "Nora", mouse={"x": 1.0, "y": 1.0}, rng=random.Random(1)
+        )
+        self.assertFalse(out.get("focus_ok"))
+        self.assertEqual(out["typed"], 0)
+        self.assertEqual(loc.clicks, 0)
+        self.assertFalse(page.keyboard.events)
+
 
 class ScrollTests(unittest.TestCase):
     def test_inertial_decay_pause_reverse(self) -> None:
@@ -340,6 +355,8 @@ class RunnerCliTests(unittest.TestCase):
         behavior_src = (ROOT / "scripts/pinterest_nurture_behavior.py").read_text(encoding="utf-8")
         click_fn = behavior_src.split("def human_click_locator", 1)[1].split("\ndef ", 1)[0]
         self.assertNotIn("loc.click", click_fn)
+        type_fn = behavior_src.split("def human_type_text", 1)[1].split("\ndef ", 1)[0]
+        self.assertNotIn("loc.click", type_fn)
         runner_src = (ROOT / "scripts/run_pinterest_nurture_browse.py").read_text(encoding="utf-8")
         self.assertNotIn("force=True", runner_src)
         self.assertNotIn(".click(timeout=5000, force=True)", runner_src)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinterest visual register — PRODUCT multimodal loop (0.2.4).
+"""Pinterest visual register — PRODUCT multimodal loop (0.2.5).
 
 screenshot → OpenAI-compatible vision (chat/completions + image_url) → JSON
 action → CloakBrowser execute → same-session nurture BEFORE ctx.close.
@@ -15,6 +15,9 @@ package manifest (skills/pinterest-register-visual/manifest.json, or the
 manifest next to this runner). Success terminals require an independent login
 gate; the model cannot mint registered_ok / browsed_ok on a signup page.
 
+0.2.5: click/type go through nurture human_click_locator (trail-only) and
+human_type_text (log-normal key delays); quiet window after signup land;
+log-normal pauses. Never locator.click / force teleport.
 0.2.4: type with missing selector or failed input focus is rejected (ok=False);
 never silent keyboard.type. 0.2.3: field → CSS selector bind; signup_form
 anti-loop + one-shot Continue recovery; vision timeout/transient HTTP retries.
@@ -38,7 +41,7 @@ from typing import Any
 
 SKILL_ID = "pinterest-register-visual"
 # Fallback until the skill-package manifest is loaded below.
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 SESSION_OK_NAME = ".cloak_session_ok"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
@@ -240,6 +243,25 @@ ROOT = resolve_root()
 _PY = str(ROOT / "python")
 if _PY not in sys.path:
     sys.path.insert(0, _PY)
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+_REPO_SCRIPTS = str(ROOT / "scripts")
+if _REPO_SCRIPTS not in sys.path:
+    sys.path.insert(0, _REPO_SCRIPTS)
+
+from pinterest_nurture_behavior import (  # noqa: E402
+    human_click_locator,
+    human_move_to,
+    human_type_text,
+    play_ambient_drift,
+    reset_session_mouse,
+    sample_gamma_ms,
+    sample_lognormal_ms,
+    sample_pause_ms,
+    sample_quiet_window_ms,
+    session_mouse,
+)
 
 # Fail-safe if a status is missing from the package: never invent a success id.
 _FAIL_FALLBACK_ID = "visual_stuck"
@@ -1127,6 +1149,10 @@ class DryRunPage:
         self.focused: str | None = None
         self.keyboard = self
         self.mouse = self
+        self.mouse_events: list[tuple] = []
+        self._mx: float = 0.0
+        self._my: float = 0.0
+        self._armed_sel: str | None = None
         self._stage = "signup"
         self.logged_in = False
         self._persist_logged_in = persist_logged_in
@@ -1134,6 +1160,26 @@ class DryRunPage:
         self._body = "Sign up  Log in  Email  Password  Birthday  Continue"
         if persist_logged_in:
             self.enter_logged_in(persist=True)
+
+    def move(self, x: float, y: float, steps: int = 1) -> None:
+        self._mx, self._my = float(x), float(y)
+        self.mouse_events.append(("move", float(x), float(y), int(steps)))
+
+    def down(self) -> None:
+        self.mouse_events.append(("down",))
+
+    def up(self) -> None:
+        self.mouse_events.append(("up",))
+        armed = self._armed_sel
+        self._armed_sel = None
+        if armed:
+            s = str(armed)
+            self.clicked.append(s)
+            self.focused = s
+            if "continue" in s.lower() and "google" not in s.lower():
+                self._advance_after_continue()
+            return
+        self.coord_clicks.append((int(self._mx), int(self._my)))
 
     def enter_logged_in(self, *, persist: bool = False) -> None:
         self._stage = "logged_in"
@@ -1198,6 +1244,10 @@ class DryRunPage:
 
     def press(self, key: str) -> None:
         self.pressed.append(key)
+        if self.focused and key == "Backspace":
+            self.fields[self.focused] = str(self.fields.get(self.focused) or "")[:-1]
+        elif self.focused and key in ("Control+A", "Meta+A"):
+            self.fields[self.focused] = ""
 
     def wheel(self, dx: int, dy: int) -> None:
         self.scrolls.append((dx, dy))
@@ -1288,6 +1338,31 @@ class _DryLoc:
     def click(self, timeout: int = 0, force: bool = False) -> None:
         self.page.click(self.sel, timeout=timeout)
 
+    def hover(self, timeout: int = 0) -> None:
+        return
+
+    def bounding_box(self) -> dict[str, float] | None:
+        if self.count() == 0:
+            return None
+        known = {
+            "#email": {"x": 40.0, "y": 120.0, "width": 280.0, "height": 36.0},
+            "#password": {"x": 40.0, "y": 170.0, "width": 280.0, "height": 36.0},
+            "#birthdate": {"x": 40.0, "y": 220.0, "width": 280.0, "height": 36.0},
+            "#code": {"x": 40.0, "y": 160.0, "width": 200.0, "height": 36.0},
+            "button:has-text('Continue')": {"x": 40.0, "y": 280.0, "width": 200.0, "height": 40.0},
+        }
+        box = known.get(self.sel) or {"x": 48.0, "y": 90.0, "width": 160.0, "height": 36.0}
+        self.page._armed_sel = self.sel
+        return dict(box)
+
+    def press(self, key: str) -> None:
+        self.page.pressed.append(key)
+        focused = self.page.focused
+        if focused and key == "Control+A":
+            self.page.fields[focused] = ""
+        elif focused and key == "Backspace":
+            self.page.fields[focused] = str(self.page.fields.get(focused) or "")[:-1]
+
     def filter(self, has_not_text: str = "", **kwargs: Any) -> "_DryLoc":
         blob = f"{has_not_text} {' '.join(str(v) for v in kwargs.values())}".lower()
         if "google" in blob and "google" in self.sel.lower():
@@ -1348,20 +1423,68 @@ def default_dry_run_script() -> list[dict[str, Any]]:
 
 # --- pacing / observe / execute --------------------------------------------
 
-def human_pause(page: Any, lo_ms: int, hi_ms: int, label: str = "", *, dry_run: bool = False) -> int:
+def human_pause(
+    page: Any,
+    lo_ms: int,
+    hi_ms: int,
+    label: str = "",
+    *,
+    dry_run: bool = False,
+    ambient: bool | None = None,
+) -> int:
     if dry_run:
         return 0
     if hi_ms < lo_ms:
         lo_ms, hi_ms = hi_ms, lo_ms
     lo_ms = max(0, int(lo_ms))
     hi_ms = max(lo_ms, int(hi_ms))
-    ms = random.randint(lo_ms, hi_ms)
+    ms = sample_pause_ms(lo_ms, hi_ms)
     log({"pause_ms": ms, "label": label})
+    use_ambient = bool(ambient) if ambient is not None else hi_ms >= 2000
+    if use_ambient and ms >= 500 and random.random() < 0.6:
+        budget = min(ms // 3, 900)
+        try:
+            play_ambient_drift(page, session_mouse(), budget_ms=budget)
+        except Exception:
+            pass
+        remain = ms - budget
+        if remain > 0:
+            try:
+                page.wait_for_timeout(remain)
+            except Exception:
+                time.sleep(remain / 1000.0)
+        return ms
     try:
         page.wait_for_timeout(ms)
     except Exception:
         time.sleep(ms / 1000.0)
     return ms
+
+
+def quiet_window(page: Any, *, dry_run: bool = False) -> int:
+    """No pointer/key events until TTI quiet window elapses (after goto)."""
+    if dry_run:
+        return 0
+    ms = sample_quiet_window_ms()
+    log({"pause_ms": ms, "label": "quiet_window"})
+    try:
+        page.wait_for_timeout(ms)
+    except Exception:
+        time.sleep(ms / 1000.0)
+    return ms
+
+
+def _locator_first(page: Any, sel: str) -> Any:
+    loc = page.locator(sel)
+    return loc.first if hasattr(loc, "first") else loc
+
+
+def human_click_with_retry(page: Any, loc: Any) -> dict[str, Any]:
+    """Trail click; one soft retry with a new trail. Never force/teleport."""
+    result = human_click_locator(page, loc, session_mouse())
+    if result.get("ok"):
+        return result
+    return human_click_locator(page, loc, session_mouse())
 
 
 def looks_like_continue(action: dict[str, Any]) -> bool:
@@ -1817,10 +1940,10 @@ def chain_nurture(
 
 
 def _focus_type_target(page: Any, sel: str, *, field: str | None = None) -> str:
-    """Click the real input (not calendar / eye icons). Returns the selector used.
+    """Trail-click the real input (not calendar / eye icons). Returns the selector used.
 
     Raises ActionError if no candidate can be focused — callers must not
-    fall back to unfocused keyboard.type.
+    fall back to unfocused keyboard.type or locator.click teleport.
     """
     fid = (field or "").strip().lower()
     if sel and _is_icon_selector(sel):
@@ -1835,21 +1958,20 @@ def _focus_type_target(page: Any, sel: str, *, field: str | None = None) -> str:
     if not candidates and fid in FIELD_SELECTORS:
         candidates.append(FIELD_SELECTORS[fid])
     last_err: BaseException | None = None
+    last_method = ""
     for cand in candidates:
         try:
-            page.click(cand, timeout=8000)
-            return cand
+            target = _locator_first(page, cand)
+            clk = human_click_with_retry(page, target)
+            if clk.get("ok"):
+                return cand
+            last_method = str(clk.get("method") or "human_click_failed")
         except Exception as e:
             last_err = e
-            try:
-                loc = page.locator(cand)
-                target = loc.first if hasattr(loc, "first") else loc
-                target.click(timeout=8000)
-                return cand
-            except Exception as e2:
-                last_err = e2
-                continue
+            continue
     hint = f": {type(last_err).__name__}: {last_err}" if last_err else ""
+    if last_method:
+        hint = f": {last_method}{hint}"
     raise ActionError(f"could not focus type target {sel!r}{hint}")
 
 
@@ -1874,14 +1996,16 @@ def execute_signup_continue_recovery(page: Any, *, screenshot_id: str) -> dict[s
         if empty:
             loc = _filtered(SIGNUP_CONTINUE_SELECTOR)
         target = loc.first if hasattr(loc, "first") else loc
-        target.click(timeout=15000)
-        return {"ok": True, "detail": "signup continue recovery"}
+        clk = human_click_with_retry(page, target)
+        if clk.get("ok"):
+            return {"ok": True, "detail": "signup continue recovery", "method": clk.get("method")}
     except Exception:
-        return execute_browser_action(
-            page,
-            {"action": "click", "selector": SIGNUP_CONTINUE_SELECTOR},
-            screenshot_id=screenshot_id,
-        )
+        pass
+    return execute_browser_action(
+        page,
+        {"action": "click", "selector": SIGNUP_CONTINUE_SELECTOR},
+        screenshot_id=screenshot_id,
+    )
 
 
 def execute_browser_action(page: Any, action: dict[str, Any], *, screenshot_id: str) -> dict[str, Any]:
@@ -1889,18 +2013,36 @@ def execute_browser_action(page: Any, action: dict[str, Any], *, screenshot_id: 
     if atype == "click":
         sel = action.get("selector")
         if sel:
-            page.click(sel, timeout=15000)
-            return {"ok": True, "detail": "click selector"}
+            try:
+                target = _locator_first(page, str(sel))
+            except Exception as e:
+                return {"ok": False, "detail": f"click locator failed: {type(e).__name__}"}
+            clk = human_click_with_retry(page, target)
+            if not clk.get("ok"):
+                return {
+                    "ok": False,
+                    "detail": f"human_click failed: {clk.get('method')}",
+                    "method": clk.get("method"),
+                }
+            return {"ok": True, "detail": "click selector", "method": clk.get("method")}
         if action.get("screenshot_id") != screenshot_id:
             return {"ok": False, "detail": "stale screenshot_id"}
-        page.mouse.click(int(action["x"]), int(action["y"]))
-        return {"ok": True, "detail": "click xy"}
+        try:
+            x = float(action["x"])
+            y = float(action["y"])
+            human_move_to(page, x, y, session_mouse())
+            page.wait_for_timeout(sample_lognormal_ms(450, 1300, mu=-0.15, sigma=0.4))
+            page.mouse.down()
+            page.wait_for_timeout(sample_gamma_ms(35, 140, alpha=3.0, beta=18.0))
+            page.mouse.up()
+            return {"ok": True, "detail": "click xy"}
+        except Exception as e:
+            return {"ok": False, "detail": f"click xy failed: {type(e).__name__}"}
     if atype == "type":
         bound = bind_type_selector(action)
         text = bound.get("text") or ""
         sel = bound.get("selector")
         field = infer_type_field(bound) or infer_type_field(action)
-        delay = random.randint(35, 70)
         if not (isinstance(sel, str) and sel.strip()):
             return {
                 "ok": False,
@@ -1915,15 +2057,21 @@ def execute_browser_action(page: Any, action: dict[str, Any], *, screenshot_id: 
                 "selector": str(sel),
             }
         used_l = (used or sel or "").lower()
-        # date inputs prefer fill (YYYY-MM-DD); React text fields prefer key events
+        try:
+            loc = _locator_first(page, used or sel)
+        except Exception as e:
+            return {
+                "ok": False,
+                "detail": f"type locator failed: {type(e).__name__}: {e}"[:240],
+                "selector": str(sel),
+            }
+        # date inputs prefer fill (YYYY-MM-DD) after trail focus; never fill text fields
         if "birth" in used_l:
             try:
                 page.fill(used or sel, text, timeout=8000)
                 try:
-                    loc = page.locator(used or sel)
-                    target = loc.first if hasattr(loc, "first") else loc
-                    if hasattr(target, "blur"):
-                        target.blur()
+                    if hasattr(loc, "blur"):
+                        loc.blur()
                     else:
                         page.keyboard.press("Tab")
                 except Exception:
@@ -1932,12 +2080,21 @@ def execute_browser_action(page: Any, action: dict[str, Any], *, screenshot_id: 
                     except Exception:
                         pass
                 return {"ok": True, "detail": "type fill-date", "selector": used or sel}
-            except Exception:
-                pass
-        try:
-            page.keyboard.type(text, delay=delay)
-        except Exception:
-            page.fill(used or sel, text, timeout=8000)
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "detail": f"type fill-date failed: {type(e).__name__}"[:240],
+                    "selector": used or sel,
+                }
+        typed = human_type_text(
+            page, loc, text, mouse=session_mouse(), skip_focus=True
+        )
+        if int(typed.get("typed") or 0) < 1 and text:
+            return {
+                "ok": False,
+                "detail": "human_type_text typed nothing",
+                "selector": used or sel,
+            }
         return {"ok": True, "detail": "type", "selector": used or sel}
     if atype == "press":
         page.keyboard.press(action.get("key") or "Enter")
@@ -2020,11 +2177,13 @@ def run_loop(
         except Exception as e:
             log({"status": "imap_max_uid_skip", "err": type(e).__name__})
 
+    reset_session_mouse()
     if dry_run:
         page.goto(SIGNUP_URL)
+        quiet_window(page, dry_run=True)
     else:
         page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
-        human_pause(page, 2500, 4500, "signup_land", dry_run=False)
+        quiet_window(page, dry_run=False)
 
     def finish(status: str, **extra: Any) -> dict[str, Any]:
         login_confirmed = bool(extra.pop("login_confirmed", False) or registered)
