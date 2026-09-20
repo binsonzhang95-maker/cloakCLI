@@ -305,7 +305,7 @@ cloakcli llm show    # never prints key values
 cloakcli llm test    # connectivity; redacts secrets
 ```
 
-`config/llm.json` is mode `0600` and stores the **env var name** only (`api_key_env`, default `CLOAKCLI_LLM_API_KEY`), never a raw key. `OPENAI_API_KEY` is a documented fallback when the default env is unset. `--api-key` as argv is rejected (shell history). `base_url` is http(s) only, trailing slash stripped, single `/v1` — CloakCLI calls `{base}/models` and `{base}/chat/completions` without duplicating `/v1`.
+`config/llm.json` is mode `0600` and stores the **env var name** only (`api_key_env`, default `CLOAKCLI_LLM_API_KEY`), never a raw key. `OPENAI_API_KEY` is a documented fallback when the default env is unset. `--api-key` as argv is rejected (shell history). `base_url` is http(s) only, trailing slash stripped, single `/v1` — CloakCLI calls `{base}/models` and `{base}/chat/completions` without duplicating `/v1`. When **model is unset**, product runners default to **`grok-4.6`** (not `llm_incomplete` solely for a missing model if `base_url` + key exist). Screenshot vision prefers `CLOAKCLI_LLM_VISION_MODEL`, then `llm.json` `vision_model`, then the text model / `CLOAKCLI_LLM_MODEL`.
 
 TUI Config: `b` base_url, `K` masked session key (sets process env / `api_key_env`, **not** saved to disk), `f` fetch models, `jk`/`↑↓` select, Enter save model, `l` toggle enabled, `t` recover timeout. A failed fetch does not change the saved model. Example skill: `skills/examples/recover-demo/`.
 

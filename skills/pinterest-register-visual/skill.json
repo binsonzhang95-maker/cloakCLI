@@ -17,7 +17,7 @@
     },
     {
       "action": "note",
-      "text": "PREFLIGHT: Require DISPLAY for headed CloakBrowser. Load profiles/<PROFILE>/profile.json for proxy + identity. Secrets only from SECRETS_ENV. LLM from config/llm.json + CLOAKCLI_LLM_API_KEY (Grok: https://api.x.ai/v1 + vision model). Never --api-key. NEVER launch system Chrome."
+      "text": "PREFLIGHT: Require DISPLAY for headed CloakBrowser. Load profiles/<PROFILE>/profile.json for proxy + identity. Secrets only from SECRETS_ENV. LLM from config/llm.json + CLOAKCLI_LLM_API_KEY (default model grok-4.6; vision: CLOAKCLI_LLM_VISION_MODEL then llm.json vision_model then text model). Never --api-key. NEVER launch system Chrome."
     },
     {
       "action": "note",
@@ -37,7 +37,7 @@
     },
     {
       "action": "note",
-      "text": "NURTURE CHAIN (mandatory default): On registered_ok, DO NOT ctx.close yet. Touch .cloak_session_ok; flush; session_keepalive_probe; run_nurture_session 0.1.7+. Login wall → nurture_status=session_lost_before_nurture. Skip only with --skip-nurture (warning)."
+      "text": "NURTURE CHAIN (mandatory default): registered_ok only after independent login heuristic (account menu / pin feed / no unauth Log in+Sign up CTA). Model done/nurture are hints. Then DO NOT ctx.close yet. Touch .cloak_session_ok; flush; session_keepalive_probe; run_nurture_session 0.1.7+. Login wall → nurture_status=session_lost_before_nurture. Nurture fail does not negate register. Skip only with --skip-nurture (warning)."
     },
     {
       "action": "note",

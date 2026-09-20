@@ -11,7 +11,7 @@ Free-form **computerUse** is **not** the product path. Do not click the UI yours
 - Args: `--profile <id>` (e.g. `geo02`), `--secrets data/secrets/<file>.env`.
 - Read proxy + label from `profiles/<id>/profile.json`. Persistent dir: `data/profiles/<id>-pinterest-run`.
 - Load secrets from env file only. Never print token/password/API key values.
-- LLM: product `config/llm.json` + `CLOAKCLI_LLM_API_KEY` (see README). Grok: `base_url=https://api.x.ai/v1`, vision model from `cloakcli llm models` (hint: `grok-2-vision-1212`). Never `--api-key`.
+- LLM: product `config/llm.json` + `CLOAKCLI_LLM_API_KEY` (see README). Default model **`grok-4.6`** when unset. Vision override: `CLOAKCLI_LLM_VISION_MODEL` then `llm.json` `vision_model` then text model. Grok: `base_url=https://api.x.ai/v1`. Never `--api-key`.
 
 ```bash
 python3 scripts/run_pinterest_register_visual_mm.py \
@@ -60,11 +60,11 @@ Artifacts: `artifacts/pinterest/visual/<profile>/`
 Allowed actions: `click|type|press|wait|scroll|imap_fetch_code|nurture|done|fail`.  
 IMAP: `scripts/outlook_imap_pinterest_code.py --secrets <env>` (runner action `imap_fetch_code`).
 
-On logged-in → **same-session nurture BEFORE `ctx.close()`** (mandatory unless `--skip-nurture`). Flush cookies; `session_keepalive_probe` — login wall → `session_lost_before_nurture` (not `browsed_ok`). Nurture **0.1.7+**.
+On **independently confirmed** logged-in (account menu / pin feed / no unauth Log in+Sign up CTA) → **same-session nurture BEFORE `ctx.close()`** (mandatory unless `--skip-nurture`). Model `done: registered_ok` and `nurture` are hints; they do **not** write `.cloak_session_ok` or count as register success by themselves. Flush cookies; `session_keepalive_probe` — login wall → `session_lost_before_nurture` (not `browsed_ok`). Nurture **0.1.7+**. Nurture failure does not negate a confirmed `registered_ok`.
 
 If **Oops** → stop, `oops_blocked`, park (cooldown 5–10 min on that exit).
 
-Touch `data/profiles/<id>-pinterest-run/.cloak_session_ok` after register success. Never `--fresh-profile` after success.
+Touch `data/profiles/<id>-pinterest-run/.cloak_session_ok` only after the login heuristic confirms success. Never `--fresh-profile` after success.
 
 ## 3. Session keep-alive (critical)
 

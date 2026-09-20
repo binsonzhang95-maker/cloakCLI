@@ -41,10 +41,19 @@ Skill package entry is `python_runner` → `scripts/run_pinterest_register_visua
 
 The runner discovers the same product LLM config as recover (`config/llm.json` + `CLOAKCLI_LLM_*`).
 
+When **model is unset**, it defaults to **`grok-4.6`**. Missing model alone is **not** `llm_incomplete` if `base_url` and an API key are present.
+
+Screenshot `chat/completions` uses the **vision** model, first match:
+
+1. CLI `--model`
+2. `CLOAKCLI_LLM_VISION_MODEL`
+3. `config/llm.json` `vision_model`
+4. text model (`CLOAKCLI_LLM_MODEL` / `llm.json` `model` / default `grok-4.6`)
+
 | Source | Fields |
 |--------|--------|
-| `config/llm.json` (mode 0600) | `base_url`, `model`, `api_key_env` (name only, default `CLOAKCLI_LLM_API_KEY`), `enabled` |
-| Env | `CLOAKCLI_LLM_API_KEY` (or `OPENAI_API_KEY` fallback). Optional overlays: `CLOAKCLI_LLM_BASE_URL`, `CLOAKCLI_LLM_MODEL` |
+| `config/llm.json` (mode 0600) | `base_url`, `model`, optional `vision_model`, `api_key_env` (name only, default `CLOAKCLI_LLM_API_KEY`), `enabled` |
+| Env | `CLOAKCLI_LLM_API_KEY` (or `OPENAI_API_KEY` fallback). Overlays: `CLOAKCLI_LLM_BASE_URL`, `CLOAKCLI_LLM_MODEL`, `CLOAKCLI_LLM_VISION_MODEL` |
 | Grok / xAI extra fallback | `XAI_API_KEY` if the default env is unset |
 | Secrets file | same key **names** if fleet `python_runner` stripped process env |
 | CLI | `--base-url` `--model` only — **never** `--api-key` |
@@ -55,14 +64,16 @@ Vision call: `POST {base}/chat/completions` with `image_url` (`data:image/jpeg;b
 
 ```bash
 export CLOAKCLI_LLM_API_KEY=...          # xAI key; never --api-key
+# optional if grok-4.6 is text-only on this gateway:
+export CLOAKCLI_LLM_VISION_MODEL=grok-2-vision-1212
 # config/llm.json:
 #   "base_url": "https://api.x.ai/v1"
-#   "model": "grok-2-vision-1212"   # or another vision-capable id from `cloakcli llm models`
+#   "model": "grok-4.6"            # default when unset
+#   "vision_model": "grok-2-vision-1212"   # optional; else text model
 #   "api_key_env": "CLOAKCLI_LLM_API_KEY"
 #   "enabled": true
 cloakcli llm configure --base-url https://api.x.ai/v1
 cloakcli llm models
-cloakcli llm set --model grok-2-vision-1212
 ```
 
 **OpenAI-compatible example:** `base_url=https://api.openai.com/v1`, vision model e.g. `gpt-4o`.
@@ -74,7 +85,7 @@ cloakcli llm set --model grok-2-vision-1212
 - `click`: CSS `selector`, **or** `x`/`y` **plus** `screenshot_id` equal to the current observation
 - `type`: `text` with `{{EMAIL}}` `{{PASSWORD}}` `{{BIRTHDAY}}` `{{DISPLAY_NAME}}` `{{CODE}}`, or `field: email|password|birthday|name|code` (runner substitutes; values never logged)
 - `imap_fetch_code`: existing Outlook IMAP helper
-- `nurture` / `done` with `registered_ok`: runner chains nurture **before** `ctx.close`
+- `nurture` / `done` with `registered_ok`: **hints only**. Runner confirms login (account menu / pin feed / no unauth Log in+Sign up CTA) before `registered_ok`, `.cloak_session_ok`, or chaining nurture. `nurture` alone never sets registered.
 
 ## Behavior pacing
 
@@ -86,13 +97,13 @@ cloakcli llm set --model grok-2-vision-1212
 
 - Default: same-context nurture **before** `ctx.close()`; probe with `session_keepalive_probe`; flush cookies (wait + home).
 - `session_lost_before_nurture` if login wall before browse (not `browsed_ok`).
-- Touch `.cloak_session_ok` after register success.
+- Touch `.cloak_session_ok` only after **independent login confirmation** (account menu / pin feed / absence of unauth Log in+Sign up CTA). Model `done: registered_ok` is a hint, never enough on its own.
 
 ## Statuses
 
 | id | success | retryable | notes |
 |----|---------|-----------|-------|
-| `registered_ok` | yes | no | Logged-in after signup / verify |
+| `registered_ok` | yes | no | Logged-in after signup / verify (page heuristic, not model-only) |
 | `browsed_ok` | yes (optional) | no | Nurture chained successfully (`nurture_status`) |
 | `oops_blocked` | no | no | Park — do not hammer |
 | `verify_soft_fail` | no | yes | IMAP/UI soft miss |

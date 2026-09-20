@@ -36,7 +36,7 @@ CHECKLIST = [
     "DISPLAY / headed CloakBrowser only (NEVER system Chrome; no fingerprint knobs)",
     "Load proxy from profiles/<id>/profile.json (udeal/geo as bound)",
     "Persistent user_data_dir: data/profiles/<id>-pinterest-run",
-    "LLM: config/llm.json + CLOAKCLI_LLM_API_KEY (Grok: https://api.x.ai/v1 + vision model); never --api-key",
+    "LLM: config/llm.json + CLOAKCLI_LLM_API_KEY (default grok-4.6; vision: CLOAKCLI_LLM_VISION_MODEL / llm.json vision_model); never --api-key",
     "Pacing: 800–2500ms fields; 2–5s before Continue; 3–8s settle after (no click storms)",
     "MM loop: screenshot → vision JSON click|type|press|wait|scroll|imap_fetch_code|nurture|done|fail",
     "IMAP 6-digit via scripts/outlook_imap_pinterest_code.py + secrets env",

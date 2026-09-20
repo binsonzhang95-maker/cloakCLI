@@ -32,6 +32,18 @@ SKILL_ID = "pinterest-register-visual"
 SESSION_OK_NAME = ".cloak_session_ok"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
+DEFAULT_LLM_MODEL = "grok-4.6"
+# Independent login-state selectors (same family as nurture 0.1.7+).
+UNAUTH_SELS = (
+    '[data-test-id="unauth-header"], '
+    '[data-test-id="simple-login-button"], '
+    '[data-test-id="simple-signup-button"]'
+)
+ACCT_SELS = (
+    '[data-test-id="header-accounts-options-button"], '
+    '[data-test-id="header-profile"]'
+)
+PIN_LINK = 'a[href*="/pin/"]'
 
 ALLOWED_ACTIONS = frozenset(
     {
@@ -236,8 +248,10 @@ press: {"key":"Enter|Tab|Escape|ArrowDown|..."}
 scroll: {"delta_y":int} small only (|delta|<=800) or {"selector":"css"}
 wait: {"ms":int}  (runner also applies human pacing; do not spam)
 imap_fetch_code: {}  fetch Outlook IMAP 6-digit; then type {{CODE}}
-nurture: {}  same-session feed browse; runner runs this BEFORE close after register success
+nurture: {}  same-session feed browse; runner runs this BEFORE close ONLY after independent login check
 done: {"status":"registered_ok","path":"code_ui|settings_confirm|already_logged_in","reason":"..."}
+  registered_ok is a HINT. The runner confirms account menu / pin feed / no unauth Log in+Sign up CTA
+  before writing .cloak_session_ok or chaining nurture. Do not claim success on the signup form.
 fail: {"status":"oops_blocked|verify_soft_fail|account_deactivated|not_logged_in|visual_stuck","reason":"..."}
 
 Goal: sign up with email/password/birthday (age 25–35) / name, verify 6-digit code if shown,
@@ -245,7 +259,7 @@ or finish onboarding + settings Confirm Email. Avoid Google OAuth. Prefer the pr
 not "Continue with Google".
 If full-page Oops (no code UI) → fail oops_blocked (park, do not re-Continue).
 If logged-in (account menu / pin feed, no unauth Log in+Sign up CTA) → nurture or done registered_ok.
-The runner always chains nurture before ctx.close on registered_ok unless the operator skipped it.
+The runner always chains nurture before ctx.close on confirmed registered_ok unless the operator skipped it.
 Do not request another screenshot. Do not output markdown. JSON object only.
 """
 
@@ -517,6 +531,17 @@ def sniff_image_mime(data: bytes) -> str:
     return "image/jpeg"
 
 
+def _llm_file_dict(root: Path) -> dict[str, Any]:
+    path = root / "config" / "llm.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def discover_llm(
     root: Path,
     *,
@@ -524,47 +549,87 @@ def discover_llm(
     model_cli: str = "",
     secrets: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Public LLM discovery. Never includes key values."""
+    """Public LLM discovery. Never includes key values.
+
+    Screenshot chat/completions uses the resolved vision model:
+    CLI --model, then CLOAKCLI_LLM_VISION_MODEL, then llm.json vision_model,
+    then text model (CLOAKCLI_LLM_MODEL / llm.json model / default grok-4.6).
+    Missing model does not by itself make the config incomplete.
+    """
     cfg_obj: Any = None
     source = "defaults"
+    file_data = _llm_file_dict(root)
     if load_llm_config is not None:
         cfg_obj = load_llm_config(root)
         if cfg_obj is not None:
             source = "config/llm.json"
+    elif file_data:
+        source = "config/llm.json"
     env_base = (os.environ.get("CLOAKCLI_LLM_BASE_URL") or "").strip()
     env_model = (os.environ.get("CLOAKCLI_LLM_MODEL") or "").strip()
+    env_vision = (os.environ.get("CLOAKCLI_LLM_VISION_MODEL") or "").strip()
+    file_vision = str(file_data.get("vision_model") or "").strip()
     base = ""
-    model = ""
+    text_model = ""
     api_key_env = DEFAULT_API_KEY_ENV
     enabled = False
     if cfg_obj is not None:
         base = str(getattr(cfg_obj, "base_url", "") or "")
-        model = str(getattr(cfg_obj, "model", "") or "")
+        text_model = str(getattr(cfg_obj, "model", "") or "")
         api_key_env = str(getattr(cfg_obj, "api_key_env", "") or DEFAULT_API_KEY_ENV)
         enabled = bool(getattr(cfg_obj, "enabled", False))
+    elif file_data:
+        raw_base = str(file_data.get("base_url") or "")
+        base = normalize_base_url(raw_base) if normalize_base_url else raw_base.rstrip("/")
+        text_model = str(file_data.get("model") or "").strip()
+        api_key_env = str(file_data.get("api_key_env") or DEFAULT_API_KEY_ENV).strip() or DEFAULT_API_KEY_ENV
+        enabled = bool(file_data.get("enabled", False))
     if env_base:
         base = normalize_base_url(env_base) if normalize_base_url else env_base.rstrip("/")
         source = "env:CLOAKCLI_LLM_BASE_URL" if source == "defaults" else source + "+env"
     if env_model:
-        model = env_model
+        text_model = env_model
         source = "env:CLOAKCLI_LLM_MODEL" if source == "defaults" else source + "+env"
     if base_url_cli:
         base = normalize_base_url(base_url_cli) if normalize_base_url else base_url_cli.rstrip("/")
         source = "cli"
-    if model_cli:
-        model = model_cli.strip()
+    if not text_model:
+        text_model = DEFAULT_LLM_MODEL
+        if source == "defaults":
+            source = "default_model"
+
+    vision = ""
+    vision_source = "text_model"
+    if model_cli.strip():
+        vision = model_cli.strip()
+        vision_source = "cli"
         source = "cli" if source == "defaults" else source + "+cli"
+    elif env_vision:
+        vision = env_vision
+        vision_source = "env:CLOAKCLI_LLM_VISION_MODEL"
+        source = vision_source if source in ("defaults", "default_model") else source + "+vision_env"
+    elif file_vision:
+        vision = file_vision
+        vision_source = "config/llm.json:vision_model"
+        source = source + "+vision_model" if "vision" not in source else source
+    else:
+        vision = text_model
+        vision_source = "text_model"
 
     key_present, key_source = _key_present(api_key_env, secrets or {})
     grok_hint = "api.x.ai" in (base or "").lower()
     return {
         "base_url": base,
-        "model": model,
+        "model": vision,
+        "text_model": text_model,
+        "vision_model": vision,
+        "vision_source": vision_source,
         "api_key_env": api_key_env,
         "key_present": key_present,
         "key_source": key_source if key_present else "",
         "enabled": enabled,
         "source": source,
+        "default_model": DEFAULT_LLM_MODEL,
         "chat_completions": (
             chat_completions_url(base) if chat_completions_url and base else ""
         ),
@@ -574,7 +639,8 @@ def discover_llm(
             "base_url": "https://api.x.ai/v1",
             "api_key_env": "CLOAKCLI_LLM_API_KEY",
             "fallbacks": [COMPAT_API_KEY_ENV, "XAI_API_KEY"],
-            "vision_model_hint": "grok-2-vision-1212 (or a vision-capable id from cloakcli llm models)",
+            "default_model": DEFAULT_LLM_MODEL,
+            "vision_model_hint": "CLOAKCLI_LLM_VISION_MODEL or llm.json vision_model (e.g. grok-2-vision-1212)",
         },
     }
 
@@ -643,7 +709,7 @@ TINY_PNG = bytes.fromhex(
 class DryRunPage:
     """Playwright-shaped stub for --dry-run (no CloakBrowser, no system Chrome)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, persist_logged_in: bool = False) -> None:
         self.url = "about:blank"
         self.viewport_size = {"width": 1280, "height": 720}
         self.clicked: list[str] = []
@@ -658,20 +724,54 @@ class DryRunPage:
         self.focused: str | None = None
         self.keyboard = self
         self.mouse = self
+        self._stage = "signup"
+        self.logged_in = False
+        self._persist_logged_in = persist_logged_in
+        self.selector_counts: dict[str, int] | None = None
         self._body = "Sign up  Log in  Email  Password  Birthday  Continue"
+        if persist_logged_in:
+            self.enter_logged_in(persist=True)
+
+    def enter_logged_in(self, *, persist: bool = False) -> None:
+        self._stage = "logged_in"
+        self.logged_in = True
+        if persist:
+            self._persist_logged_in = True
+        self.url = "https://www.pinterest.com/homefeed/"
+        self._body = "Search Pinterest  header-accounts  Your home feed"
+
+    def _advance_after_continue(self) -> None:
+        if self.logged_in:
+            return
+        if self._stage == "signup":
+            self._stage = "code"
+            self.url = SIGNUP_URL
+            self._body = "Enter the code we sent you  Continue"
+            return
+        if self._stage == "code":
+            self.enter_logged_in()
 
     def click(self, sel: Any, timeout: int = 0, force: bool = False, y: int | None = None) -> None:
         if isinstance(sel, (int, float)):
             yy = int(y if y is not None else timeout)
             self.coord_clicks.append((int(sel), yy))
             return
-        self.clicked.append(str(sel))
-        self.focused = str(sel)
+        s = str(sel)
+        self.clicked.append(s)
+        self.focused = s
+        low = s.lower()
+        if "continue" in low and "google" not in low:
+            self._advance_after_continue()
 
     def goto(self, url: str, wait_until: str = "domcontentloaded", timeout: int = 0) -> None:
         self.gotos.append(url)
+        if self._persist_logged_in:
+            self.enter_logged_in(persist=True)
+            return
         self.url = url
         if "signup" in url:
+            self._stage = "signup"
+            self.logged_in = False
             self._body = "Create your account  Email  Password  Birthday  Continue  Continue with Google"
 
     def screenshot(self, path: str | None = None, full_page: bool = False, **kwargs: Any) -> bytes:
@@ -711,6 +811,37 @@ class DryRunPage:
     def locator(self, sel: str) -> "_DryLoc":
         return _DryLoc(self, sel)
 
+    def _count_one(self, sel: str) -> int:
+        if self.selector_counts is not None and sel in self.selector_counts:
+            return int(self.selector_counts[sel])
+        s = sel.strip()
+        low = s.lower()
+        if self.logged_in:
+            if "header-accounts" in low or "header-profile" in low:
+                return 1
+            if "/pin/" in low:
+                return 5
+            if "unauth-header" in low or "simple-login" in low or "simple-signup" in low:
+                return 0
+            if s == "#code":
+                return 0
+            return 1
+        if self._stage == "code":
+            if s == "#code":
+                return 1
+            if "header-accounts" in low or "header-profile" in low or "/pin/" in low:
+                return 0
+            if "unauth-header" in low or "simple-login" in low or "simple-signup" in low:
+                return 0
+            return 1
+        if "header-accounts" in low or "header-profile" in low or "/pin/" in low:
+            return 0
+        if "unauth-header" in low or "simple-login" in low or "simple-signup" in low:
+            return 1
+        if s == "#code":
+            return 0
+        return 1
+
     def evaluate(self, script: str, arg: Any = None) -> Any:
         return {
             "title": "Pinterest",
@@ -733,10 +864,16 @@ class _DryLoc:
         return self
 
     def count(self) -> int:
-        return 1
+        if self.page.selector_counts is not None and self.sel in self.page.selector_counts:
+            return int(self.page.selector_counts[self.sel])
+        total = 0
+        for part in (p.strip() for p in self.sel.split(",")):
+            if part:
+                total += self.page._count_one(part)
+        return total
 
     def is_visible(self, timeout: int = 0) -> bool:
-        return True
+        return self.count() > 0
 
     def scroll_into_view_if_needed(self, timeout: int = 0) -> None:
         self.page.scrolls.append(("into_view", self.sel))
@@ -816,22 +953,102 @@ def looks_like_continue(action: dict[str, Any]) -> bool:
     return "continue" in blob and "google" not in blob
 
 
-def page_heuristic(page: Any) -> str:
+def _page_body(page: Any, n: int = 3000) -> str:
     try:
-        body = (page.inner_text("body") or "")[:3000]
+        return (page.inner_text("body") or "")[:n]
     except Exception:
-        body = ""
-    url = ""
+        return ""
+
+
+def _page_url(page: Any) -> str:
     try:
-        url = page.url or ""
+        return str(page.url or "")
     except Exception:
-        url = ""
-    code_vis = False
+        return ""
+
+
+def _locator_count(page: Any, sel: str) -> int:
+    try:
+        return int(page.locator(sel).count() or 0)
+    except Exception:
+        return 0
+
+
+def _code_visible(page: Any) -> bool:
     try:
         loc = page.locator("#code")
-        code_vis = loc.count() > 0 and loc.first.is_visible()
+        return loc.count() > 0 and loc.first.is_visible()
     except Exception:
-        code_vis = False
+        return False
+
+
+def page_login_gate(page: Any) -> dict[str, Any]:
+    """Independent login-state check. Model claims are hints only.
+
+    Logged-in requires account menu, pin feed, or feed-like page without
+    unauth Log in+Sign up CTA. Signup / code UI / Oops never count.
+    """
+    body = _page_body(page)
+    url = _page_url(page)
+    unauth = _locator_count(page, UNAUTH_SELS)
+    acct = _locator_count(page, ACCT_SELS)
+    pins = _locator_count(page, PIN_LINK)
+    code_vis = _code_visible(page)
+    has_cta = "Log in" in body[:1500] and "Sign up" in body[:1500]
+    feedish = (
+        "Search Pinterest" in body
+        or "/homefeed" in url
+        or "/today" in url
+        or "header-accounts" in body
+    )
+    info: dict[str, Any] = {
+        "unauth": unauth,
+        "acct": acct,
+        "pins": pins,
+        "has_cta": has_cta,
+        "feedish": feedish,
+        "url": url[:200],
+    }
+    if re.search(r"account has been deactivated", body, re.I):
+        return {"ok": False, "gate": "account_deactivated", **info}
+    if "Oops" in body and not code_vis and "Enter the code" not in body:
+        return {"ok": False, "gate": "oops", **info}
+    if "Enter the code" in body or code_vis:
+        return {"ok": False, "gate": "code_ui", "reason": "code_ui", **info}
+    if "signup" in url and acct == 0 and pins < 3:
+        return {"ok": False, "gate": "not_logged_in", "reason": "signup_url", **info}
+    if unauth > 0 and acct == 0:
+        return {"ok": False, "gate": "not_logged_in", "reason": "unauth_header", **info}
+    if has_cta and acct == 0 and pins < 3:
+        return {"ok": False, "gate": "not_logged_in", "reason": "unauth_cta", **info}
+    if acct > 0:
+        return {"ok": True, "gate": "logged_in", "reason": "account_menu", **info}
+    if pins >= 3 and not has_cta:
+        return {"ok": True, "gate": "logged_in", "reason": "pin_feed", **info}
+    if not has_cta and feedish:
+        return {"ok": True, "gate": "logged_in", "reason": "feed_no_unauth_cta", **info}
+    return {"ok": False, "gate": "not_logged_in", "reason": "no_login_signals", **info}
+
+
+def confirm_logged_in(page: Any) -> bool:
+    return bool(page_login_gate(page).get("ok"))
+
+
+def status_when_login_unconfirmed(gate: dict[str, Any]) -> str:
+    g = str(gate.get("gate") or "not_logged_in")
+    if g == "account_deactivated":
+        return "account_deactivated"
+    if g == "oops":
+        return "oops_blocked"
+    if g == "not_logged_in":
+        return "not_logged_in"
+    return "visual_stuck"
+
+
+def page_heuristic(page: Any) -> str:
+    body = _page_body(page)
+    url = _page_url(page)
+    code_vis = _code_visible(page)
     if re.search(r"account has been deactivated", body, re.I):
         return "account_deactivated"
     if "Oops" in body and not code_vis and "Enter the code" not in body:
@@ -840,10 +1057,10 @@ def page_heuristic(page: Any) -> str:
         return "code_ui"
     if ("What's your name" in body) or ("Nice to meet you" in body):
         return "onboarding"
-    cta = "Log in" in body[:1500] and "Sign up" in body[:1500]
-    feedish = ("Search Pinterest" in body) or ("/homefeed" in url) or ("/today" in url)
-    if (not cta and feedish) or "header-accounts" in body:
+    gate = page_login_gate(page)
+    if gate.get("ok"):
         return "logged_in"
+    cta = "Log in" in body[:1500] and "Sign up" in body[:1500]
     if cta or "signup" in url:
         return "signup_form"
     return "unknown"
@@ -1004,7 +1221,13 @@ def imap_max_uid(secrets_path: str, root: Path) -> int:
     )
 
 
-def imap_wait_code(secrets_path: str, after_uid: int, timeout: int, root: Path) -> dict[str, Any] | None:
+def imap_wait_code(
+    secrets_path: str,
+    after_uid: int,
+    timeout: int,
+    root: Path,
+    extra_secrets: list[str] | None = None,
+) -> dict[str, Any] | None:
     import subprocess
 
     proc = subprocess.run(
@@ -1023,8 +1246,10 @@ def imap_wait_code(secrets_path: str, after_uid: int, timeout: int, root: Path) 
         capture_output=True,
     )
     if proc.returncode != 0:
-        if proc.stderr:
-            sys.stderr.write(proc.stderr)
+        err = redact_text(proc.stderr or "", extra=extra_secrets)
+        if err:
+            sys.stderr.write(err if err.endswith("\n") else err + "\n")
+            log({"status": "imap_stderr", "stderr": err[:500]})
         return None
     lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
     if not lines:
@@ -1093,6 +1318,7 @@ def chain_nurture(
     min_sec: int,
     max_sec: int,
     dry_run: bool,
+    extra_secrets: list[str] | None = None,
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "nurture_status": "skipped",
@@ -1161,9 +1387,10 @@ def chain_nurture(
             }
         )
     except Exception as e:
+        msg = redact_text(f"{type(e).__name__}: {e}", extra=extra_secrets)[:200]
         fields["nurture_status"] = f"error:{type(e).__name__}"
-        fields["nurture_error"] = str(e)[:200]
-        log({"status": "nurture_error", "err": type(e).__name__, "message": str(e)[:200]})
+        fields["nurture_error"] = msg
+        log({"status": "nurture_error", "err": type(e).__name__, "message": msg})
     return fields
 
 
@@ -1307,10 +1534,23 @@ def run_loop(
                 report[k] = nurture_fields[k]
         return report
 
-    def do_nurture() -> None:
+    def do_nurture() -> bool:
+        """Chain nurture only after independent login confirmation.
+
+        Never writes .cloak_session_ok unless page_login_gate says logged-in.
+        Returns True if the login gate passed (register success still stands
+        even if the subsequent nurture fails).
+        """
         nonlocal nurtured, nurture_fields
         if nurtured:
-            return
+            return confirm_logged_in(page)
+        gate = page_login_gate(page)
+        if not gate.get("ok"):
+            log({"status": "session_ok_refused", **{k: gate.get(k) for k in ("gate", "reason", "url", "has_cta", "acct", "pins", "unauth")}})
+            nurture_fields["nurture_status"] = "skipped_not_logged_in"
+            nurture_fields["session_keepalive_probe"] = gate
+            return False
+        touch_session_ok(ud)
         if args.skip_nurture:
             log(
                 {
@@ -1324,8 +1564,7 @@ def run_loop(
             nurture_fields["nurture_status"] = "skipped"
             nurture_fields["nurture_skip_warning"] = True
             nurtured = True
-            return
-        touch_session_ok(ud)
+            return True
         nurture_fields.update(
             chain_nurture(
                 page,
@@ -1337,6 +1576,7 @@ def run_loop(
                 min_sec=args.nurture_min_sec,
                 max_sec=args.nurture_max_sec,
                 dry_run=dry_run,
+                extra_secrets=extra_secrets,
             )
         )
         nurtured = True
@@ -1344,6 +1584,7 @@ def run_loop(
             page.screenshot(path=str(art / "05-nurture.png"), full_page=False)
         except Exception:
             pass
+        return True
 
     while steps_done < max_steps and time.time() < deadline:
         heuristic = page_heuristic(page)
@@ -1420,11 +1661,47 @@ def run_loop(
             st = map_done_status(action)
             path_hint = action.get("path") or path_hint
             if st == "registered_ok":
+                gate = page_login_gate(page)
+                if not gate.get("ok"):
+                    fail_st = status_when_login_unconfirmed(gate)
+                    log(
+                        {
+                            "status": "login_gate_rejected_done",
+                            "model_status": "registered_ok",
+                            "gate": gate.get("gate"),
+                            "reason": gate.get("reason"),
+                        }
+                    )
+                    return finish(
+                        fail_st,
+                        reason="model registered_ok but page not logged-in",
+                        path=path_hint,
+                    )
                 registered = True
                 do_nurture()
+                return finish("registered_ok", reason=action.get("reason") or st, path=path_hint)
             return finish(st, reason=action.get("reason") or st, path=path_hint)
 
         if atype == "nurture":
+            gate = page_login_gate(page)
+            if not gate.get("ok"):
+                last_feedback = "nurture rejected: page not logged-in (login heuristic)"
+                log(
+                    {
+                        "status": "nurture_rejected_not_logged_in",
+                        "gate": gate.get("gate"),
+                        "reason": gate.get("reason"),
+                    }
+                )
+                consecutive_rejects += 1
+                if consecutive_rejects >= 6:
+                    return finish(
+                        status_when_login_unconfirmed(gate),
+                        reason=last_feedback,
+                        path=path_hint,
+                    )
+                steps_done += 1
+                continue
             registered = True
             path_hint = path_hint or heuristic or "logged_in"
             do_nurture()
@@ -1440,7 +1717,9 @@ def run_loop(
                 log({"status": "code_received", "code_len": 6, "dry_run": True})
             else:
                 timeout = int(action.get("timeout") or 180)
-                hit = imap_wait_code(secrets_path, after_uid, timeout, root)
+                hit = imap_wait_code(
+                    secrets_path, after_uid, timeout, root, extra_secrets=extra_secrets
+                )
                 if hit is None:
                     last_feedback = "imap timeout"
                     log({"status": "imap_timeout"})
@@ -1510,11 +1789,18 @@ def run_loop(
         if h2 == "oops":
             # Do not auto-park on a single heuristic; tell the model next turn.
             last_feedback = "page heuristic=oops (park if still Oops; do not re-Continue spam)"
-        if h2 in ("logged_in", "onboarding"):
+        if h2 == "logged_in" and confirm_logged_in(page):
             registered = True
-            path_hint = path_hint or h2
+            path_hint = path_hint or "logged_in"
 
     if registered:
+        if not confirm_logged_in(page):
+            gate = page_login_gate(page)
+            return finish(
+                status_when_login_unconfirmed(gate),
+                reason="login heuristic failed at finish",
+                path=path_hint,
+            )
         do_nurture()
         return finish("registered_ok", path=path_hint or "timeout_after_register")
     if time.time() >= deadline:
@@ -1572,7 +1858,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mock vision + stub page (no CloakBrowser, no live LLM). Smoke only.",
     )
     ap.add_argument("--base-url", default="", help="OpenAI-compatible base (http(s); overrides llm.json)")
-    ap.add_argument("--model", default="", help="Vision model id (overrides llm.json)")
+    ap.add_argument(
+        "--model",
+        default="",
+        help="Vision model id for screenshot chat/completions (overrides CLOAKCLI_LLM_VISION_MODEL / llm.json vision_model)",
+    )
     ap.add_argument("--digest", default="", help="Skill package digest (python_runner identity)")
     return ap
 
@@ -1643,6 +1933,9 @@ def main(argv: list[str] | None = None, stdin_payload: dict[str, Any] | None = N
         for k in (
             "base_url",
             "model",
+            "text_model",
+            "vision_model",
+            "vision_source",
             "api_key_env",
             "key_present",
             "key_source",
@@ -1651,6 +1944,7 @@ def main(argv: list[str] | None = None, stdin_payload: dict[str, Any] | None = N
             "grok_compat",
             "grok_docs",
             "chat_completions",
+            "default_model",
         )
         if k in disc
     }
@@ -1681,8 +1975,12 @@ def main(argv: list[str] | None = None, stdin_payload: dict[str, Any] | None = N
             missing = [k for k in REQUIRED_SECRET_KEYS if k not in env]
             if missing:
                 issues.append("secrets_missing_keys:" + ",".join(missing))
-        if not disc.get("base_url") or not disc.get("model"):
-            issues.append("llm_incomplete: need config/llm.json or --base-url/--model (Grok: https://api.x.ai/v1 + vision model)")
+        if not disc.get("base_url"):
+            issues.append(
+                "llm_incomplete: need config/llm.json or --base-url "
+                "(Grok: https://api.x.ai/v1). Model defaults to grok-4.6; "
+                "override vision with CLOAKCLI_LLM_VISION_MODEL or llm.json vision_model"
+            )
         if not disc.get("key_present"):
             issues.append(
                 f"llm_key_missing: set {disc.get('api_key_env') or DEFAULT_API_KEY_ENV} "
