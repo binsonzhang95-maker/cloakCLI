@@ -1,4 +1,4 @@
-"""Product multimodal Pinterest register runner (0.2.5) — parse, LLM discover, dry-run."""
+"""Product multimodal Pinterest register runner (0.2.6) — parse, LLM discover, dry-run."""
 from __future__ import annotations
 
 import argparse
@@ -353,7 +353,7 @@ class DryRunSmokeTests(unittest.TestCase):
         self.assertTrue(lines)
         report = json.loads(lines[-1])
         self.assertEqual(report["skill_id"], "pinterest-register-visual")
-        self.assertEqual(report["version"], "0.2.5")
+        self.assertEqual(report["version"], "0.2.6")
         self.assertEqual(report["status"], "registered_ok")
         self.assertEqual(report["nurture_status"], "browsed_ok")
         self.assertTrue(report.get("dry_run"))
@@ -377,11 +377,11 @@ class DryRunSmokeTests(unittest.TestCase):
         report = json.loads([ln for ln in proc.stdout.splitlines() if ln.strip()][-1])
         self.assertEqual(report["status"], "visual_stuck")
 
-    def test_skill_manifest_python_runner_0_2_5(self) -> None:
+    def test_skill_manifest_python_runner_0_2_6(self) -> None:
         man = json.loads(
             (ROOT / "skills/pinterest-register-visual/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(man["version"], "0.2.5")
+        self.assertEqual(man["version"], "0.2.6")
         self.assertEqual(man["entry"]["kind"], "python_runner")
         self.assertEqual(man["entry"]["path"], "scripts/run_pinterest_register_visual_mm.py")
         ids = {s["id"] for s in man["statuses"]}
@@ -425,6 +425,16 @@ class DryRunSmokeTests(unittest.TestCase):
         self.assertEqual(mm.process_exit_code("not_logged_in"), 8)
         self.assertEqual(mm.process_exit_code("visual_stuck"), 4)
         self.assertEqual(mm.process_exit_code("invented"), 4)
+        skill = (ROOT / "skills/pinterest-register-visual/skill.json").read_text(
+            encoding="utf-8"
+        )
+        operator = (ROOT / "skills/pinterest-register-visual/OPERATOR.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("0.1.7+", skill)
+        self.assertNotIn("0.1.7+", operator)
+        self.assertIn("0.2.1+", skill)
+        self.assertIn("0.2.1+", operator)
 
 
 class ProviderMimeTests(unittest.TestCase):

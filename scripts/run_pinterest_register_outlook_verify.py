@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E2E Pinterest register + Outlook IMAP 6-digit verify (0.1.2).
+"""E2E Pinterest register + Outlook IMAP 6-digit verify (0.1.3).
 
 Birthday: random age 25–35 as YYYY-MM-DD for #birthdate (type=date).
 Prefer --headed (default). Headless often gets Pinterest Oops.
@@ -15,12 +15,14 @@ even if nurture fails. Use --skip-nurture only when batch already nurtures
 separately (logs a warning). Never treat independent nurture minutes later as
 the primary post-register path.
 
-Behavior (0.1.2): shares nurture 0.2.1 human helpers — trail-only
+Behavior (0.1.3): shares nurture 0.2.1 human helpers — trail-only
 human_click_locator (never locator.click / force teleport), human_type_text
-key stream, log-normal pauses, quiet window after signup land. 0.1.1: human
-pacing between fields / around Continue; longer settle after Continue before
-judging Oops vs soft verify vs success; Oops parks (no re-Continue spam);
-soft verify may Send-new-code once.
+key stream, log-normal pauses, quiet window after signup land. After typing
+#code, if input_value != target, fail immediately (verify_soft_fail) and do
+not click Continue. 0.1.2: same human helpers. 0.1.1: human pacing between
+fields / around Continue; longer settle after Continue before judging Oops vs
+soft verify vs success; Oops parks (no re-Continue spam); soft verify may
+Send-new-code once.
 """
 from __future__ import annotations
 
@@ -50,7 +52,7 @@ from pinterest_nurture_behavior import (  # noqa: E402
     session_mouse,
 )
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 SESSION_OK_NAME = ".cloak_session_ok"
 
 ERROR_RE = re.compile(
@@ -572,18 +574,41 @@ def maybe_nurture(page, ctx, ud: Path, args, register_payload: dict) -> dict:
 def submit_verify_code(page, code: str) -> dict:
     """Fill code, paced Continue, settle; return diagnostic dict."""
     val = fill_code_react(page, code)
+    match = val == code
     print(
         json.dumps(
             {
                 "status": "code_filled",
                 "len": len(code),
                 "value_len": len(val),
-                "value_match": val == code,
+                "value_match": match,
             },
             ensure_ascii=False,
         ),
         flush=True,
     )
+    if not match:
+        print(
+            json.dumps(
+                {
+                    "status": "code_value_mismatch",
+                    "len": len(code),
+                    "value_len": len(val),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return {
+            "status": "verify_soft_fail",
+            "still_code_ui": True,
+            "login_signup_cta": False,
+            "has_oops": False,
+            "error_snip": "code_value_mismatch",
+            "url": getattr(page, "url", "") or "",
+            "code_value_len": len(val),
+            "value_match": False,
+        }
     human_pause(page, 1200, 2800, "after_code_fill")
     art = ROOT / "artifacts/pinterest"
     art.mkdir(parents=True, exist_ok=True)

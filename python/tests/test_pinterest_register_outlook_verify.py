@@ -1,10 +1,11 @@
-"""Pinterest register outlook-verify runner (0.1.2) — human behavior wiring."""
+"""Pinterest register outlook-verify runner (0.1.3) — human behavior wiring."""
 from __future__ import annotations
 
 import importlib.util
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "scripts" / "run_pinterest_register_outlook_verify.py"
@@ -139,7 +140,7 @@ class OutlookVerifyBehaviorTests(unittest.TestCase):
         cls.ov = load_mod(RUNNER, "run_pinterest_register_outlook_verify")
 
     def test_version_and_imports(self) -> None:
-        self.assertEqual(self.ov.VERSION, "0.1.2")
+        self.assertEqual(self.ov.VERSION, "0.1.3")
         self.assertTrue(callable(self.ov.human_click_locator))
         self.assertTrue(callable(self.ov.human_type_text))
         self.assertTrue(callable(self.ov._hclick))
@@ -168,7 +169,7 @@ class OutlookVerifyBehaviorTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertIn("0.1.2", skill["description"])
+        self.assertIn("0.1.3", skill["description"])
         readme = (ROOT / "skills/pinterest-register-outlook-verify/README.md").read_text(
             encoding="utf-8"
         )
@@ -232,6 +233,39 @@ class OutlookVerifyBehaviorTests(unittest.TestCase):
     def test_behavior_module_is_the_nurture_helper(self) -> None:
         self.assertTrue(BEHAVIOR.is_file())
         self.assertIn("pinterest_nurture_behavior", RUNNER.read_text(encoding="utf-8"))
+
+    def test_submit_verify_code_mismatch_does_not_click_continue(self) -> None:
+        page = FakePage()
+        shots: list[str] = []
+        page.screenshot = lambda path="", **k: shots.append(str(path))  # type: ignore[method-assign]
+        with (
+            mock.patch.object(self.ov, "fill_code_react", return_value="000000") as fill,
+            mock.patch.object(self.ov, "_hclick") as hclick,
+            mock.patch.object(self.ov, "find_verify_continue") as find_cont,
+            mock.patch.object(self.ov, "human_pause") as pause,
+        ):
+            result = self.ov.submit_verify_code(page, "654321")
+        fill.assert_called_once_with(page, "654321")
+        hclick.assert_not_called()
+        find_cont.assert_not_called()
+        pause.assert_not_called()
+        self.assertEqual(shots, [])
+        self.assertEqual(result["status"], "verify_soft_fail")
+        self.assertEqual(result.get("error_snip"), "code_value_mismatch")
+        self.assertFalse(result.get("value_match", True))
+        self.assertTrue(result.get("still_code_ui"))
+        self.assertEqual(result.get("code_value_len"), 6)
+
+    def test_skill_docs_nurture_version_is_0_2_1(self) -> None:
+        files = [
+            ROOT / "skills/pinterest-register-visual/skill.json",
+            ROOT / "skills/pinterest-register-visual/OPERATOR.md",
+            ROOT / "skills/pinterest-register-outlook-verify/README.md",
+        ]
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("0.1.7+", text, msg=str(path))
+            self.assertIn("0.2.1+", text, msg=str(path))
 
 
 if __name__ == "__main__":

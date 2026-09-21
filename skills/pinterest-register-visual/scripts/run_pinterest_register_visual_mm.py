@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinterest visual register — PRODUCT multimodal loop (0.2.5).
+"""Pinterest visual register — PRODUCT multimodal loop (0.2.6).
 
 screenshot → OpenAI-compatible vision (chat/completions + image_url) → JSON
 action → CloakBrowser execute → same-session nurture BEFORE ctx.close.
@@ -15,6 +15,7 @@ package manifest (skills/pinterest-register-visual/manifest.json, or the
 manifest next to this runner). Success terminals require an independent login
 gate; the model cannot mint registered_ok / browsed_ok on a signup page.
 
+0.2.6: skill docs chain nurture 0.2.1+ (was stale 0.1.7+).
 0.2.5: click/type go through nurture human_click_locator (trail-only) and
 human_type_text (log-normal key delays); quiet window after signup land;
 log-normal pauses. Never locator.click / force teleport.
@@ -41,7 +42,7 @@ from typing import Any
 
 SKILL_ID = "pinterest-register-visual"
 # Fallback until the skill-package manifest is loaded below.
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 SESSION_OK_NAME = ".cloak_session_ok"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"

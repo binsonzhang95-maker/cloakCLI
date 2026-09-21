@@ -1,4 +1,4 @@
-# pinterest-register-visual (0.2.5)
+# pinterest-register-visual (0.2.6)
 
 **PRODUCT path:** multimodal loop on **CloakBrowser** —
 
@@ -16,7 +16,7 @@ Skill package entry is `python_runner` → `scripts/run_pinterest_register_visua
 
 ## When to use vs `pinterest-register-outlook-verify`
 
-| | `pinterest-register-visual` 0.2.5 | `pinterest-register-outlook-verify` |
+| | `pinterest-register-visual` 0.2.6 | `pinterest-register-outlook-verify` |
 |--|-----------------------------------|-------------------------------------|
 | Execution | Product MM loop (`python_runner`) | Declarative `skill.json` steps + selector runner |
 | Targeting | Vision JSON actions (`click` css or x/y + `screenshot_id`) | CSS / Playwright selectors |
@@ -132,7 +132,7 @@ Mock vision + stub page. Does **not** launch CloakBrowser or call a live model. 
 ## Related
 
 - Product runner: `scripts/run_pinterest_register_visual_mm.py`
-- Declarative register: `skills/pinterest-register-outlook-verify/` (runner 0.1.2, same human helpers)
+- Declarative register: `skills/pinterest-register-outlook-verify/` (runner 0.1.3, same human helpers)
 - Nurture: `skills/pinterest-nurture-browse/` (0.2.1+)
 - IMAP helper: `scripts/outlook_imap_pinterest_code.py`
 - Operator playbook: `OPERATOR.md`
