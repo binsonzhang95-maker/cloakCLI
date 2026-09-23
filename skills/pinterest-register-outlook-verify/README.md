@@ -23,7 +23,7 @@ python3 scripts/run_pinterest_register_outlook_verify.py \
 
 ## Behavior pacing (runner 0.1.4)
 
-Register now shares nurture 0.2.2+ human behavior (trail click + key stream). Signup/verify Continue, email/password focus, and Send-new-code use `human_click_locator` (never `locator.click` / force teleport; one trail retry then fail). Email/password/code/name use `human_type_text`. Birthdate `#birthdate` still `fill` after trail focus. Quiet window after signup land; log-normal pauses. After nurture (or skip), ambient hang ~60–180s then storage flush before `ctx.close` (`CLOAKCLI_HANG_BEFORE_CLOSE_MS=0` to skip in tests).
+Register now shares nurture 0.2.3+ human behavior (trail click + key stream). Signup/verify Continue, email/password focus, and Send-new-code use `human_click_locator` (never `locator.click` / force teleport; one trail retry then fail). Email/password/code/name use `human_type_text`. Birthdate `#birthdate` still `fill` after trail focus. Quiet window after signup land; log-normal pauses. After nurture (or skip), ambient hang ~60–180s then storage flush before `ctx.close` (`CLOAKCLI_HANG_BEFORE_CLOSE_MS=0` to skip in tests).
 
 - Between form fields: **800–2500ms** log-normal
 - Before Continue (signup + verify): **2–5s**

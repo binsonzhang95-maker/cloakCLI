@@ -16,7 +16,7 @@ manifest next to this runner). Success terminals require an independent login
 gate; the model cannot mint registered_ok / browsed_ok on a signup page.
 
 0.2.7: hang idle ~60–180s (ambient drift) + storage flush before ctx.close;
-chain nurture 0.2.2+.
+chain nurture 0.2.3+.
 0.2.6: skill docs chain nurture 0.2.1+ (was stale 0.1.7+).
 0.2.5: click/type go through nurture human_click_locator (trail-only) and
 human_type_text (log-normal key delays); quiet window after signup land;

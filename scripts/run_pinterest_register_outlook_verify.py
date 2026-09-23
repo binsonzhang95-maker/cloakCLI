@@ -16,7 +16,7 @@ separately (logs a warning). Never treat independent nurture minutes later as
 the primary post-register path.
 
 Behavior (0.1.4): after nurture (or skip), hang idle ~60–180s with ambient
-drift + storage flush before ctx.close. Shares nurture 0.2.2+ human helpers — trail-only
+drift + storage flush before ctx.close. Shares nurture 0.2.3+ human helpers — trail-only
 human_click_locator (never locator.click / force teleport), human_type_text
 key stream, log-normal pauses, quiet window after signup land. After typing
 #code, if input_value != target, fail immediately (verify_soft_fail) and do

@@ -2,7 +2,10 @@
 """Pure Pinterest human-behavior helpers (no CloakBrowser fingerprint knobs).
 
 Continuous randomized mouse trails, inertial scroll, log-normal/gamma pauses,
-and session personas. Used by nurture browse and register runners. Stdlib only.
+session personas, pin linger planning, visibility keepalive, micro reverse
+scroll, and mixed close-path weights (nurture 0.2.3). Used by nurture browse
+and register runners. Stdlib only. Every pause site must re-sample independently
+(no fixed identical timing chains across steps/runs).
 """
 from __future__ import annotations
 
@@ -139,28 +142,60 @@ def plan_nurture_session(
     max_sec: int = 180,
     rng: Any = None,
 ) -> dict[str, Any]:
-    """Pick persona, pin count (1–12), like probability (may be 0), session target.
+    """Pick persona, pin count (0–12), like probability (may be 0), session target.
 
     Always clamps target_sec into [min_sec, max_sec].
+    When pins is None/<=0 (auto), ~15–25% of sessions are feed-only (0 pins),
+    mostly bounce_early / browse_only. Explicit pins>0 never forces zero-pin.
     """
     rng = _as_rng(rng)
     if max_sec < min_sec:
         min_sec, max_sec = max_sec, min_sec
+    raw_persona = (persona or "").strip().lower()
+    explicit_persona = bool(raw_persona) and raw_persona not in ("auto", "*")
     pname = choose_persona(persona, rng=rng)
     spec = PERSONAS[pname]
+    feed_only = False
     if pins is not None and int(pins) > 0:
         n_pins = max(1, min(12, int(pins)))
     else:
-        lo, hi = spec["pins"]
-        n_pins = max(1, min(12, int(rng.randint(int(lo), int(hi)))))
+        # Re-sample zero-pin session probability in [0.15, 0.25] each plan call.
+        # Mostly bounce_early / browse_only; auto may reassign into those.
+        # Explicit deep_browse / light_like keep their pin bands (no forced 0).
+        zero_p = float(rng.uniform(0.15, 0.25))
+        allow_zero = (not explicit_persona) or pname in ("bounce_early", "browse_only")
+        if allow_zero and rng.random() < zero_p:
+            feed_only = True
+            n_pins = 0
+            if pname not in ("bounce_early", "browse_only"):
+                pname = str(rng.choice(("bounce_early", "browse_only")))
+                spec = PERSONAS[pname]
+        else:
+            lo, hi = spec["pins"]
+            n_pins = max(1, min(12, int(rng.randint(int(lo), int(hi)))))
     pr = spec.get("like_prob_range") or (0.0, 0.0)
-    like_p = float(rng.uniform(float(pr[0]), float(pr[1])))
+    like_p = 0.0 if feed_only or n_pins == 0 else float(
+        rng.uniform(float(pr[0]), float(pr[1]))
+    )
     span = max(0, int(max_sec) - int(min_sec))
-    if spec.get("bounce"):
+    if feed_only or spec.get("bounce"):
         target_sec = int(min_sec) + int(span * rng.uniform(0.0, 0.2))
     else:
         target_sec = int(min_sec) + int(span * rng.uniform(0.0, 1.0))
     target_sec = max(int(min_sec), min(int(max_sec), target_sec))
+    # Feed-only dwell band (independent of min_sec clamp for gate accounting).
+    feed_dwell_sec = 0
+    feed_scroll_screens = 0
+    if feed_only or n_pins == 0:
+        feed_dwell_sec = int(
+            round(
+                sample_lognormal_ms(
+                    25_000, 90_000, mu=math.log(45.0), sigma=0.30, rng=rng
+                )
+                / 1000.0
+            )
+        )
+        feed_scroll_screens = int(rng.randint(3, 7))
     return {
         "persona": pname,
         "pins": n_pins,
@@ -168,8 +203,11 @@ def plan_nurture_session(
         "min_sec": int(min_sec),
         "max_sec": int(max_sec),
         "target_sec": target_sec,
-        "bounce": bool(spec.get("bounce")),
+        "bounce": bool(spec.get("bounce")) or feed_only,
         "view_scale": float(spec.get("view_scale") or 1.0),
+        "feed_only": bool(feed_only or n_pins == 0),
+        "feed_dwell_sec": int(feed_dwell_sec),
+        "feed_scroll_screens": int(feed_scroll_screens),
     }
 
 
@@ -674,3 +712,301 @@ def inertial_scroll(
         if wait:
             page.wait_for_timeout(int(wait))
     return plan
+
+
+# --- nurture 0.2.3: linger / visibility / reverse / close weights / browsed_ok ---
+
+# browsed_ok gate mins (feed-only zero-pin success). Documented in README.
+BROWSED_OK_MIN_FEED_DWELL_SEC = 25
+BROWSED_OK_MIN_SCROLL_PX = 1500
+
+# Close-path weights: button / Esc / history back / backdrop.
+CLOSE_PATH_WEIGHTS: tuple[tuple[str, float], ...] = (
+    ("button", 0.50),
+    ("escape", 0.30),
+    ("history_back", 0.15),
+    ("backdrop", 0.05),
+)
+
+# Persona-weighted micro-reverse probability after a downward feed scroll.
+REVERSE_SCROLL_P: dict[str, float] = {
+    "deep_browse": 0.18,
+    "light_like": 0.15,
+    "browse_only": 0.14,
+    "bounce_early": 0.07,
+}
+
+# Min seconds between feed scroll direction flips (anti oscillation).
+REVERSE_FLIP_MIN_SEC = 1.5
+
+
+def browsed_ok(
+    *,
+    pins_opened: int,
+    feed_dwell_sec: float,
+    scroll_distance_px: float,
+    min_feed_dwell_sec: int = BROWSED_OK_MIN_FEED_DWELL_SEC,
+    min_scroll_px: int = BROWSED_OK_MIN_SCROLL_PX,
+) -> bool:
+    """Success if any pin opened OR feed dwell+scroll mins met (zero-pin bounce)."""
+    if int(pins_opened) >= 1:
+        return True
+    return (
+        float(feed_dwell_sec) >= float(min_feed_dwell_sec)
+        and float(scroll_distance_px) >= float(min_scroll_px)
+    )
+
+
+def plan_pin_linger(
+    *,
+    persona: str | None = None,
+    bounce: bool = False,
+    rng: Any = None,
+) -> dict[str, Any]:
+    """Plan one pin closeup linger; every field independently re-sampled.
+
+    Sequence intended by runner:
+      gaze quiet → optional peek scroll → (like at like_frac of total) → pre-exit → close
+    Like must never be immediate after open (mid/late 60–85% of planned dwell).
+    """
+    rng = _as_rng(rng)
+    pname = (persona or "").strip().lower() or "light_like"
+    is_bounce = bool(bounce) or pname == "bounce_early"
+    if is_bounce:
+        total_ms = sample_lognormal_ms(
+            2000, 4500, mu=math.log(3.2), sigma=0.28, rng=rng
+        )
+    else:
+        total_ms = sample_lognormal_ms(
+            4500, 22000, mu=math.log(9.0), sigma=0.40, rng=rng
+        )
+    # Independent gaze; clamp so bounce still fits inside total.
+    gaze_ms = sample_lognormal_ms(2500, 5500, mu=math.log(3.6), sigma=0.28, rng=rng)
+    if is_bounce:
+        gaze_ms = min(gaze_ms, max(800, int(total_ms * 0.55)))
+    else:
+        gaze_ms = min(gaze_ms, max(1200, int(total_ms * 0.55)))
+    # Optional ~50% peek; independently allow skip.
+    do_peek = bool(rng.random() < 0.50)
+    peek_px = int(rng.randint(300, 600)) if do_peek else 0
+    peek_ms = (
+        sample_gamma_ms(350, 1200, alpha=2.2, beta=220.0, rng=rng) if do_peek else 0
+    )
+    like_frac = float(rng.uniform(0.60, 0.85))
+    pre_exit_ms = sample_lognormal_ms(1000, 3000, mu=math.log(1.8), sigma=0.35, rng=rng)
+    return {
+        "persona": pname,
+        "bounce": is_bounce,
+        "total_ms": int(total_ms),
+        "gaze_ms": int(gaze_ms),
+        "do_peek": do_peek,
+        "peek_px": int(peek_px),
+        "peek_ms": int(peek_ms),
+        "like_frac": like_frac,
+        "like_at_ms": int(total_ms * like_frac),
+        "pre_exit_ms": int(pre_exit_ms),
+    }
+
+
+def ensure_page_visible(
+    page: Any,
+    *,
+    rng: Any = None,
+    log_fn: Any = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Soft page/window focus keepalive (no fingerprint/launch changes).
+
+    If visibilityState != visible or !hasFocus, bring_to_front + focus dispatch,
+    short independently sampled wait, re-check. Logs visibility_keepalive.
+    """
+    rng = _as_rng(rng)
+    emit = log_fn if callable(log_fn) else (
+        lambda payload: print(json.dumps(payload, ensure_ascii=False), flush=True)
+    )
+    out: dict[str, Any] = {
+        "event": "visibility_keepalive",
+        "acted": False,
+        "ok": True,
+    }
+    try:
+        state = page.evaluate(
+            """() => ({
+              visibilityState: String(document.visibilityState || ''),
+              hasFocus: !!document.hasFocus(),
+            })"""
+        )
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = type(e).__name__
+        emit(out)
+        return out
+    if not isinstance(state, dict):
+        state = {}
+    vis = str(state.get("visibilityState") or "")
+    focused = bool(state.get("hasFocus"))
+    out["visibilityState"] = vis
+    out["hasFocus"] = focused
+    need = force or (vis != "visible") or (not focused)
+    if not need:
+        emit(out)
+        return out
+    out["acted"] = True
+    try:
+        bring = getattr(page, "bring_to_front", None)
+        if callable(bring):
+            bring()
+    except Exception:
+        pass
+    try:
+        page.evaluate(
+            """() => {
+              try { window.focus(); } catch (e) {}
+              try {
+                if (document.body && document.body.focus) document.body.focus();
+              } catch (e) {}
+              try { window.dispatchEvent(new Event('focus')); } catch (e) {}
+              try {
+                document.dispatchEvent(new Event('visibilitychange'));
+              } catch (e) {}
+            }"""
+        )
+    except Exception as e:
+        out["focus_error"] = type(e).__name__
+    wait_ms = sample_gamma_ms(80, 420, alpha=2.5, beta=60.0, rng=rng)
+    out["wait_ms"] = int(wait_ms)
+    try:
+        page.wait_for_timeout(int(wait_ms))
+    except Exception:
+        pass
+    try:
+        state2 = page.evaluate(
+            """() => ({
+              visibilityState: String(document.visibilityState || ''),
+              hasFocus: !!document.hasFocus(),
+            })"""
+        )
+        if isinstance(state2, dict):
+            out["visibilityState_after"] = str(state2.get("visibilityState") or "")
+            out["hasFocus_after"] = bool(state2.get("hasFocus"))
+            out["ok"] = (
+                out["visibilityState_after"] == "visible"
+                or bool(out["hasFocus_after"])
+            )
+    except Exception as e:
+        out["recheck_error"] = type(e).__name__
+    emit(out)
+    return out
+
+
+def scroll_plan_down_magnitude(plan: list[tuple[int, int]]) -> int:
+    """Sum of positive (downward) delta_y in an inertial plan."""
+    return int(sum(max(0, int(dy)) for dy, _w in plan))
+
+
+def reverse_scroll_probability(persona: str | None, *, rng: Any = None) -> float:
+    """Persona-weighted P(micro reverse | after down scroll), ~12–18% typical."""
+    rng = _as_rng(rng)
+    base = float(REVERSE_SCROLL_P.get((persona or "").strip().lower(), 0.14))
+    # Tiny independent jitter so runs don't share identical thresholds.
+    return max(0.05, min(0.22, base + float(rng.uniform(-0.02, 0.02))))
+
+
+def maybe_micro_reverse_scroll(
+    page: Any,
+    down_magnitude_px: int,
+    *,
+    persona: str | None = None,
+    last_flip_mono: float | None = None,
+    rng: Any = None,
+    log_fn: Any = None,
+) -> dict[str, Any]:
+    """Occasional micro reverse after a downward feed scroll.
+
+    Reverse delta ≈ 20–45% of previous down magnitude. Pause 1–3s after.
+    Skips if direction flipped within REVERSE_FLIP_MIN_SEC. Net session scroll
+    should remain downward (caller tracks). Returns updated last_flip_mono.
+    """
+    rng = _as_rng(rng)
+    emit = log_fn if callable(log_fn) else (
+        lambda payload: print(json.dumps(payload, ensure_ascii=False), flush=True)
+    )
+    now = time.monotonic()
+    out: dict[str, Any] = {
+        "event": "micro_reverse_scroll",
+        "did": False,
+        "down_magnitude_px": int(down_magnitude_px),
+        "last_flip_mono": last_flip_mono,
+    }
+    if int(down_magnitude_px) < 80:
+        emit(out)
+        return out
+    if last_flip_mono is not None and (now - float(last_flip_mono)) < REVERSE_FLIP_MIN_SEC:
+        out["skipped"] = "flip_cooldown"
+        emit(out)
+        return out
+    p = reverse_scroll_probability(persona, rng=rng)
+    out["p"] = round(p, 4)
+    if rng.random() >= p:
+        out["skipped"] = "bernoulli"
+        emit(out)
+        return out
+    frac = float(rng.uniform(0.20, 0.45))
+    reverse_px = max(40, int(abs(down_magnitude_px) * frac))
+    out["frac"] = round(frac, 3)
+    out["reverse_px"] = int(reverse_px)
+    # Soft upward inertial burst: a few decaying negative wheel steps (not PageDown).
+    remain = float(reverse_px)
+    steps = 0
+    while remain > 12 and steps < 14:
+        chunk = max(8.0, remain * float(rng.uniform(0.18, 0.42)))
+        chunk = min(chunk, remain)
+        dy = -int(round(chunk + rng.gauss(0.0, 4.0)))
+        try:
+            page.mouse.wheel(0, dy)
+        except Exception as e:
+            out["error"] = type(e).__name__
+            break
+        wait = sample_gamma_ms(10, 48, alpha=2.2, beta=10.0, rng=rng)
+        try:
+            page.wait_for_timeout(int(wait))
+        except Exception:
+            pass
+        remain -= abs(dy)
+        steps += 1
+    out["steps"] = steps
+    out["did"] = steps > 0
+    pause_ms = sample_lognormal_ms(1000, 3000, mu=math.log(1.8), sigma=0.35, rng=rng)
+    out["pause_ms"] = int(pause_ms)
+    try:
+        page.wait_for_timeout(int(pause_ms))
+    except Exception:
+        pass
+    out["last_flip_mono"] = time.monotonic()
+    emit(out)
+    return out
+
+
+def choose_close_path(rng: Any = None) -> str:
+    """Weighted close path: button 50% / escape 30% / history_back 15% / backdrop 5%."""
+    rng = _as_rng(rng)
+    names = [n for n, _w in CLOSE_PATH_WEIGHTS]
+    weights = [float(w) for _n, w in CLOSE_PATH_WEIGHTS]
+    # random.choices available 3.6+
+    return str(rng.choices(names, weights=weights, k=1)[0])
+
+
+def close_path_fallback_order(primary: str, *, rng: Any = None) -> list[str]:
+    """Primary first, then remaining paths shuffled (fallback if chosen fails)."""
+    rng = _as_rng(rng)
+    names = [n for n, _w in CLOSE_PATH_WEIGHTS]
+    if primary not in names:
+        primary = "button"
+    rest = [n for n in names if n != primary]
+    rng.shuffle(rest)
+    return [primary] + rest
+
+
+def sample_esc_key_hold_ms(rng: Any = None) -> int:
+    """Real keydown→keyup hold for Esc (independent sample each press)."""
+    return sample_gamma_ms(60, 120, alpha=3.0, beta=28.0, rng=rng)

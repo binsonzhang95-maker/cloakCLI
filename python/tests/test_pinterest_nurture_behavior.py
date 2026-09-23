@@ -1,4 +1,4 @@
-"""Nurture 0.2.2 behavior helpers: mouse path, pauses, personas, inertial scroll."""
+"""Nurture 0.2.3 behavior helpers: linger, reverse scroll, close paths, browsed_ok."""
 from __future__ import annotations
 
 import importlib.util
@@ -162,8 +162,13 @@ class PersonaTests(unittest.TestCase):
         )
         self.assertEqual(locked["pins"], 3)
         auto = bh.plan_nurture_session(pins=0, min_sec=30, max_sec=90, rng=random.Random(8))
-        self.assertGreaterEqual(auto["pins"], 1)
+        self.assertGreaterEqual(auto["pins"], 0)
         self.assertLessEqual(auto["pins"], 12)
+        locked0 = bh.plan_nurture_session(
+            persona="deep_browse", pins=5, min_sec=10, max_sec=20, rng=random.Random(1)
+        )
+        self.assertEqual(locked0["pins"], 5)
+        self.assertFalse(locked0.get("feed_only"))
 
 
 class MousePathTests(unittest.TestCase):
@@ -323,7 +328,7 @@ class RunnerCliTests(unittest.TestCase):
         cls.runner = load_mod(RUNNER, "run_pinterest_nurture_browse")
 
     def test_default_headed_and_persona_pins(self) -> None:
-        self.assertEqual(self.runner.VERSION, "0.2.2")
+        self.assertEqual(self.runner.VERSION, "0.2.3")
         ns = self.runner.build_arg_parser().parse_args(["--profile", "geo46"])
         self.assertFalse(ns.headless)
         self.assertEqual(ns.pins, 0)
@@ -350,7 +355,7 @@ class RunnerCliTests(unittest.TestCase):
         manifest = json.loads(
             (ROOT / "skills/pinterest-nurture-browse/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["version"], "0.2.2")
+        self.assertEqual(manifest["version"], "0.2.3")
         self.assertEqual(manifest["entry"]["path"], "scripts/run_pinterest_nurture_browse.py")
         behavior_src = (ROOT / "scripts/pinterest_nurture_behavior.py").read_text(encoding="utf-8")
         click_fn = behavior_src.split("def human_click_locator", 1)[1].split("\ndef ", 1)[0]
@@ -435,6 +440,172 @@ class HangBeforeCloseTests(unittest.TestCase):
         ):
             self.assertIn("hang_before_close(", src, msg=label)
             self.assertIn("hang_before_close", src, msg=label)
+
+
+
+class LingerPlanTests(unittest.TestCase):
+    def test_like_not_immediate_mid_late_frac(self) -> None:
+        for seed in range(40):
+            plan = bh.plan_pin_linger(
+                persona="deep_browse", bounce=False, rng=random.Random(seed)
+            )
+            self.assertGreaterEqual(plan["like_frac"], 0.60)
+            self.assertLessEqual(plan["like_frac"], 0.85)
+            self.assertGreaterEqual(plan["like_at_ms"], int(plan["total_ms"] * 0.60) - 1)
+            self.assertGreaterEqual(plan["gaze_ms"], 800)
+            # Gaze completes before like_at in the intended ordering.
+            self.assertLess(plan["gaze_ms"], plan["like_at_ms"])
+
+    def test_bounce_shorter_band(self) -> None:
+        xs = [
+            bh.plan_pin_linger(persona="bounce_early", bounce=True, rng=random.Random(i))[
+                "total_ms"
+            ]
+            for i in range(60)
+        ]
+        self.assertTrue(all(2000 <= x <= 4500 for x in xs))
+
+    def test_independent_resamples_differ(self) -> None:
+        a = [bh.plan_pin_linger(persona="light_like", rng=random.Random(1)) for _ in range(5)]
+        # Same seed sequence for plan_pin_linger alone is deterministic per call with new rng
+        b = bh.plan_pin_linger(persona="light_like", rng=random.Random(2))
+        self.assertNotEqual(a[0]["total_ms"], b["total_ms"])
+
+
+class ReverseScrollTests(unittest.TestCase):
+    def test_reverse_bounds_and_cooldown(self) -> None:
+        page = FakePage()
+        logs: list[dict] = []
+        # Force reverse by patching probability via high persona + many trials
+        did = 0
+        mags = []
+        last = None
+        for i in range(80):
+            # Use deep_browse (~18%); inject large down magnitude
+            out = bh.maybe_micro_reverse_scroll(
+                page,
+                800,
+                persona="deep_browse",
+                last_flip_mono=last,
+                rng=random.Random(i),
+                log_fn=logs.append,
+            )
+            if out.get("did"):
+                did += 1
+                mags.append(out["reverse_px"])
+                self.assertGreaterEqual(out["reverse_px"], int(800 * 0.20) - 1)
+                self.assertLessEqual(out["reverse_px"], int(800 * 0.45) + 1)
+                last = out.get("last_flip_mono")
+                # Immediate retry should hit cooldown
+                skip = bh.maybe_micro_reverse_scroll(
+                    page,
+                    800,
+                    persona="deep_browse",
+                    last_flip_mono=last,
+                    rng=random.Random(999),
+                    log_fn=logs.append,
+                )
+                self.assertFalse(skip.get("did"))
+                self.assertEqual(skip.get("skipped"), "flip_cooldown")
+                last = None  # reset for next outer trial diversity
+        self.assertGreater(did, 5)
+        self.assertTrue(mags)
+
+    def test_down_magnitude_helper(self) -> None:
+        plan = [(100, 10), (-20, 10), (50, 10), (0, 200)]
+        self.assertEqual(bh.scroll_plan_down_magnitude(plan), 150)
+
+
+class ClosePathTests(unittest.TestCase):
+    def test_weights_smoke(self) -> None:
+        from collections import Counter
+
+        c = Counter(bh.choose_close_path(rng=random.Random(i)) for i in range(2000))
+        self.assertGreater(c["button"], c["escape"])
+        self.assertGreater(c["escape"], c["history_back"])
+        self.assertGreater(c["history_back"], c["backdrop"])
+        self.assertEqual(set(c), {"button", "escape", "history_back", "backdrop"})
+        order = bh.close_path_fallback_order("escape", rng=random.Random(3))
+        self.assertEqual(order[0], "escape")
+        self.assertEqual(len(order), 4)
+        self.assertEqual(len(set(order)), 4)
+
+
+class BrowsedOkGateTests(unittest.TestCase):
+    def test_pin_open_or_feed_mins(self) -> None:
+        self.assertTrue(
+            bh.browsed_ok(pins_opened=1, feed_dwell_sec=0, scroll_distance_px=0)
+        )
+        self.assertTrue(
+            bh.browsed_ok(pins_opened=0, feed_dwell_sec=25, scroll_distance_px=1500)
+        )
+        self.assertTrue(
+            bh.browsed_ok(pins_opened=0, feed_dwell_sec=40, scroll_distance_px=2000)
+        )
+        self.assertFalse(
+            bh.browsed_ok(pins_opened=0, feed_dwell_sec=24, scroll_distance_px=5000)
+        )
+        self.assertFalse(
+            bh.browsed_ok(pins_opened=0, feed_dwell_sec=60, scroll_distance_px=1499)
+        )
+
+    def test_zero_pin_plan_share_and_fields(self) -> None:
+        zeros = 0
+        for i in range(400):
+            plan = bh.plan_nurture_session(pins=0, rng=random.Random(i))
+            if plan["pins"] == 0:
+                zeros += 1
+                self.assertTrue(plan["feed_only"])
+                self.assertIn(plan["persona"], {"bounce_early", "browse_only"})
+                self.assertGreaterEqual(plan["feed_dwell_sec"], 25)
+                self.assertLessEqual(plan["feed_dwell_sec"], 90)
+                self.assertGreaterEqual(plan["feed_scroll_screens"], 3)
+                self.assertLessEqual(plan["feed_scroll_screens"], 7)
+                self.assertEqual(plan["like_prob"], 0.0)
+        rate = zeros / 400
+        self.assertGreaterEqual(rate, 0.10)
+        self.assertLessEqual(rate, 0.30)
+
+
+class VisibilityKeepaliveTests(unittest.TestCase):
+    def test_logs_without_acting_when_focused(self) -> None:
+        class VisPage(FakePage):
+            def evaluate(self, script: str) -> dict:
+                return {"visibilityState": "visible", "hasFocus": True}
+
+            def bring_to_front(self) -> None:
+                raise AssertionError("should not bring_to_front when visible+focused")
+
+        logs: list[dict] = []
+        out = bh.ensure_page_visible(VisPage(), rng=random.Random(1), log_fn=logs.append)
+        self.assertFalse(out["acted"])
+        self.assertEqual(logs[0]["event"], "visibility_keepalive")
+
+    def test_acts_when_hidden(self) -> None:
+        class VisPage(FakePage):
+            def __init__(self) -> None:
+                super().__init__()
+                self.brought = 0
+                self._n = 0
+
+            def evaluate(self, script: str):
+                self._n += 1
+                if "window.focus" in script or "visibilitychange" in script:
+                    return None
+                if self._n == 1:
+                    return {"visibilityState": "hidden", "hasFocus": False}
+                return {"visibilityState": "visible", "hasFocus": True}
+
+            def bring_to_front(self) -> None:
+                self.brought += 1
+
+        page = VisPage()
+        logs: list[dict] = []
+        out = bh.ensure_page_visible(page, rng=random.Random(2), log_fn=logs.append)
+        self.assertTrue(out["acted"])
+        self.assertEqual(page.brought, 1)
+        self.assertTrue(page.waits)
+
 
 
 if __name__ == "__main__":

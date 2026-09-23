@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Pinterest nurture browse (0.2.2).
+"""Pinterest nurture browse (0.2.3).
 
-Logged-in feed browse with behavior hardening (Gemini 2026-09-21): default
-headed, continuous randomized mouse trails, inertial scroll, session personas
-(browse_only / light_like / deep_browse / bounce_early), log-normal/gamma
-pauses, quiet window after load. CloakBrowser persistent context; one account
-↔ one geo/proxy. Does NOT change fingerprint/launch knobs.
+Logged-in feed browse with behavior hardening (Gemini 2026-09-21 + 2026-09-23):
+default headed, continuous randomized mouse trails, inertial scroll, session
+personas (browse_only / light_like / deep_browse / bounce_early),
+log-normal/gamma pauses (independently re-sampled at every site), quiet window
+after load, longer pin linger, visibility keepalive, occasional micro reverse
+scroll, mixed close paths, zero-pin feed bounce + browsed_ok gate.
+CloakBrowser persistent context; one account ↔ one geo/proxy. Does NOT change
+fingerprint/launch knobs.
 
 At session start, clears name onboarding ("What's your name") then use-case
 picker if present. Does NOT wipe user_data_dir. Does NOT attempt login /
@@ -36,23 +39,31 @@ if str(_HERE.parent) not in sys.path:
 
 from pinterest_nurture_behavior import (  # noqa: E402
     PERSONA_NAMES,
+    browsed_ok,
+    choose_close_path,
+    close_path_fallback_order,
+    ensure_page_visible,
     human_click_locator,
     human_move_to,
     human_type_text,
     inertial_scroll,
     hang_before_close,
+    maybe_micro_reverse_scroll,
     plan_nurture_session,
+    plan_pin_linger,
     play_ambient_drift,
     reset_session_mouse,
+    sample_esc_key_hold_ms,
     sample_gamma_ms,
     sample_lognormal_ms,
     sample_pause_ms,
     sample_quiet_window_ms,
+    scroll_plan_down_magnitude,
     session_mouse,
 )
 
 ART = ROOT / "artifacts/pinterest/nurture-browse"
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 # Draft selectors — refine after a healthy logged-in probe
 PIN_LINK = 'a[href*="/pin/"]'
@@ -101,13 +112,23 @@ def log(obj: dict) -> None:
 
 
 def pause(page, lo_ms: int, hi_ms: int, label: str = "", *, ambient: bool = False) -> int:
-    """Heavy-tailed pause (log-normal). Optional ambient mouse drift while reading."""
+    """Heavy-tailed pause (log-normal). Optional ambient mouse drift while reading.
+
+    Every call re-samples duration independently (no fixed chains across steps).
+    Long pauses may soft-check page visibility (orthogonal to hang/cookies).
+    """
     if hi_ms < lo_ms:
         lo_ms, hi_ms = hi_ms, lo_ms
     lo_ms = max(0, int(lo_ms))
     hi_ms = max(lo_ms, int(hi_ms))
     ms = sample_pause_ms(lo_ms, hi_ms)
     log({"pause_ms": ms, "label": label})
+    # Periodic soft visibility check during long pauses (independent of hang).
+    if ms >= 2500 and random.random() < 0.45:
+        try:
+            ensure_page_visible(page, log_fn=log)
+        except Exception:
+            pass
     if ambient and ms >= 500 and random.random() < 0.6:
         budget = min(ms // 3, 900)
         try:
@@ -778,27 +799,133 @@ def collect_pin_ids(page, want: int = 3, pool: int = 24) -> list[str]:
     return random.sample(pool_ids, want)
 
 
-def close_pin(page) -> str:
+def _close_still_on_pin(page) -> bool:
+    try:
+        return "/pin/" in (page.url or "")
+    except Exception:
+        return False
+
+
+def _close_via_button(page) -> str | None:
     for sel in CLOSE_CANDIDATES:
         try:
+            ensure_page_visible(page, log_fn=log)
             loc = page.locator(sel)
             if loc.count() and loc.first.is_visible(timeout=500):
                 clk = _hclick(page, loc.first)
                 if clk.get("ok"):
                     pause(page, 800, 1600, "after_close_click")
-                    return sel
+                    if not _close_still_on_pin(page):
+                        return f"button:{sel}"
+                    return f"button:{sel}"
         except Exception:
             continue
+    return None
+
+
+def _close_via_escape(page) -> str | None:
     try:
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(1000)
-        if "/pin/" not in (page.url or ""):
-            return "Escape"
-        page.go_back(wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1200)
-        return "history_back"
+        ensure_page_visible(page, log_fn=log)
+        # Prefer focus inside modal/dialog before Esc.
+        try:
+            page.evaluate(
+                """() => {
+                  const root = document.querySelector(
+                    '[role=dialog], [data-test-id*=closeup], [data-test-id*=Closeup]'
+                  ) || document.body;
+                  if (root && root.focus) root.focus();
+                  else if (document.body && document.body.focus) document.body.focus();
+                }"""
+            )
+        except Exception:
+            pass
+        hold = sample_esc_key_hold_ms()
+        # Real keydown/keyup timing (not a single press helper when available).
+        try:
+            page.keyboard.down("Escape")
+            page.wait_for_timeout(int(hold))
+            page.keyboard.up("Escape")
+        except Exception:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(int(hold))
+        pause(page, 700, 1600, "after_escape")
+        if not _close_still_on_pin(page):
+            return "escape"
+        return None
     except Exception:
-        return "close_failed"
+        return None
+
+
+def _close_via_history_back(page) -> str | None:
+    try:
+        ensure_page_visible(page, log_fn=log)
+        page.go_back(wait_until="domcontentloaded", timeout=30000)
+        pause(page, 900, 1800, "after_history_back")
+        if not _close_still_on_pin(page):
+            return "history_back"
+        return None
+    except Exception:
+        return None
+
+
+def _close_via_backdrop(page) -> str | None:
+    """Click near viewport edge / dimmed backdrop (low weight path)."""
+    try:
+        ensure_page_visible(page, log_fn=log)
+        box = page.evaluate(
+            """() => {
+              const dlg = document.querySelector('[role=dialog]');
+              const w = window.innerWidth || 1200;
+              const h = window.innerHeight || 800;
+              // Prefer a point left/top outside the dialog box if present.
+              if (dlg) {
+                const r = dlg.getBoundingClientRect();
+                if (r.left > 24) return {x: Math.max(8, r.left / 2), y: Math.min(h - 8, r.top + 24)};
+                if (r.top > 24) return {x: Math.min(w - 8, r.left + 24), y: Math.max(8, r.top / 2)};
+              }
+              return {x: 12 + Math.random() * 18, y: 12 + Math.random() * 18};
+            }"""
+        )
+        if not isinstance(box, dict):
+            return None
+        human_move_to(page, float(box["x"]), float(box["y"]), session_mouse())
+        page.wait_for_timeout(sample_gamma_ms(40, 140, alpha=2.5, beta=22.0))
+        page.mouse.down()
+        page.wait_for_timeout(sample_gamma_ms(35, 120, alpha=3.0, beta=18.0))
+        page.mouse.up()
+        pause(page, 800, 1700, "after_backdrop")
+        if not _close_still_on_pin(page):
+            return "backdrop"
+        return None
+    except Exception:
+        return None
+
+
+def close_pin(page, *, preferred: str | None = None) -> str:
+    """Mixed return paths from closeup (weighted + fallback). Logs which worked."""
+    primary = preferred or choose_close_path()
+    order = close_path_fallback_order(primary)
+    log({"close_pin_plan": {"primary": primary, "order": order}})
+    handlers = {
+        "button": _close_via_button,
+        "escape": _close_via_escape,
+        "history_back": _close_via_history_back,
+        "backdrop": _close_via_backdrop,
+    }
+    for path in order:
+        fn = handlers.get(path)
+        if not fn:
+            continue
+        try:
+            got = fn(page)
+        except Exception as e:
+            log({"close_path_err": path, "error": type(e).__name__})
+            got = None
+        if got:
+            log({"close_pin_worked": got, "path": path, "primary": primary})
+            return got
+    log({"close_pin_worked": "close_failed", "primary": primary, "order": order})
+    return "close_failed"
 
 
 
@@ -893,7 +1020,7 @@ def run_nurture_session(
 
     Returns a dict with at least: status, elapsed_sec, liked, pins_opened.
     Does not close the page/context — caller owns lifecycle.
-    pins<=0 means the persona chooses 1–12. 0 likes is a valid success.
+    pins<=0 means the persona chooses 0–12 (incl. feed-only bounce). 0 likes OK.
     """
     worked: dict = {}
     t0 = time.time()
@@ -906,8 +1033,6 @@ def run_nurture_session(
     log({"nurture_plan": plan})
     n_pins = int(plan["pins"])
     like_p = float(plan["like_prob"])
-    view_lo = int(2800 * float(plan["view_scale"]))
-    view_hi = int(8500 * float(plan["view_scale"]))
     target_sec = int(plan["target_sec"])
 
     try:
@@ -970,110 +1095,283 @@ def run_nurture_session(
         if onboarding.get("complete"):
             dismiss_light(page)
 
-        scroll_rounds = random.randint(1, 3) if plan["bounce"] else random.randint(3, 7)
+        # Visibility keepalive before first feed interaction burst.
+        try:
+            ensure_page_visible(page, log_fn=log)
+        except Exception:
+            pass
+
+        feed_t0 = time.time()
+        scroll_distance_px = 0
+        last_flip_mono = None
+        feed_only = bool(plan.get("feed_only") or int(plan.get("pins") or 0) == 0)
+        if feed_only and int(plan.get("feed_scroll_screens") or 0) > 0:
+            scroll_rounds = int(plan["feed_scroll_screens"])
+        elif plan["bounce"]:
+            scroll_rounds = random.randint(1, 3)
+        else:
+            scroll_rounds = random.randint(3, 7)
+
         for i in range(scroll_rounds):
-            inertial_scroll(page, direction=1)
+            try:
+                ensure_page_visible(page, log_fn=log)
+            except Exception:
+                pass
+            plan_steps = inertial_scroll(page, direction=1)
+            down_mag = scroll_plan_down_magnitude(plan_steps)
+            scroll_distance_px += int(down_mag)
+            rev = maybe_micro_reverse_scroll(
+                page,
+                down_mag,
+                persona=plan.get("persona"),
+                last_flip_mono=last_flip_mono,
+                log_fn=log,
+            )
+            if rev.get("did"):
+                scroll_distance_px += int(rev.get("reverse_px") or 0)  # distance traveled
+                last_flip_mono = rev.get("last_flip_mono") or last_flip_mono
             pause(page, 3500, 9000, f"feed_scroll_{i}", ambient=True)
+            # Optional hover-without-click on zero-pin / feed phases (~35%).
+            if feed_only and random.random() < 0.35:
+                try:
+                    nlinks = page.locator(PIN_LINK).count()
+                    if nlinks > 0:
+                        loc = page.locator(PIN_LINK).nth(random.randrange(min(nlinks, 12)))
+                        box = loc.bounding_box()
+                        if box and box.get("width"):
+                            tx = float(box["x"]) + float(box["width"]) * random.uniform(0.25, 0.75)
+                            ty = float(box["y"]) + float(box["height"]) * random.uniform(0.25, 0.75)
+                            human_move_to(page, tx, ty, session_mouse())
+                            pause(page, 1000, 2500, f"feed_hover_{i}", ambient=True)
+                except Exception:
+                    pass
+            if feed_only:
+                # Independently re-sampled feed dwell target may already be met.
+                if time.time() - feed_t0 >= float(plan.get("feed_dwell_sec") or 25):
+                    break
             if time.time() - t0 > plan["max_sec"] - 50:
                 break
+
+        # Extra feed dwell for zero-pin until planned band (independently sampled pauses).
+        if feed_only:
+            target_feed = float(plan.get("feed_dwell_sec") or 45)
+            while time.time() - feed_t0 < target_feed and time.time() - t0 < plan["max_sec"]:
+                try:
+                    ensure_page_visible(page, log_fn=log)
+                except Exception:
+                    pass
+                if random.random() < 0.55:
+                    plan_steps = inertial_scroll(page, direction=1)
+                    down_mag = scroll_plan_down_magnitude(plan_steps)
+                    scroll_distance_px += int(down_mag)
+                    rev = maybe_micro_reverse_scroll(
+                        page,
+                        down_mag,
+                        persona=plan.get("persona"),
+                        last_flip_mono=last_flip_mono,
+                        log_fn=log,
+                    )
+                    if rev.get("did"):
+                        scroll_distance_px += int(rev.get("reverse_px") or 0)
+                        last_flip_mono = rev.get("last_flip_mono") or last_flip_mono
+                pause(page, 2000, 7000, "feed_only_dwell", ambient=True)
+
+        feed_dwell_sec = round(time.time() - feed_t0, 1)
+        worked["feed_dwell_sec"] = feed_dwell_sec
+        worked["scroll_distance_px"] = int(scroll_distance_px)
+        log(
+            {
+                "feed_stats": {
+                    "feed_dwell_sec": feed_dwell_sec,
+                    "scroll_distance_px": int(scroll_distance_px),
+                    "feed_only": feed_only,
+                }
+            }
+        )
 
         try:
             page.screenshot(path=str(run_art / "02-feed.png"))
         except Exception:
             pass
 
-        for _ in range(6):
-            if page.locator(PIN_LINK).count() >= max(n_pins, 3):
-                break
-            inertial_scroll(page, direction=1)
-            pause(page, 900, 2000, "load_more_pins", ambient=True)
-
-        pin_ids = collect_pin_ids(page, want=n_pins, pool=max(n_pins * 4, 16))
-        log({"pin_ids_n": len(pin_ids), "pin_ids": pin_ids})
-        if not pin_ids:
-            return {
-                "status": "like_failed",
-                "profile": profile,
-                "error": "no_pin_links",
-                "note": "logged_in_but_empty_feed",
-                "elapsed_sec": round(time.time() - t0, 1),
-                "liked": False,
-                "pins_opened": 0,
-                "persona": plan["persona"],
-                "worked": worked,
-            }
-
         opened = 0
         liked = False
         like_sel = None
         like_attempts = 0
-        for pi, pid in enumerate(pin_ids):
-            if time.time() - t0 > plan["max_sec"] - 15:
-                break
-            pause(page, 2500, 7500, f"before_open_{pi}", ambient=True)
-            try:
-                loc = page.locator(f'a[href*="/pin/{pid}"]').first
-                loc.scroll_into_view_if_needed(timeout=5000)
-                pause(page, 700, 2200, f"into_view_{pi}", ambient=True)
-                clk = _hclick(page, loc)
-                if not clk.get("ok"):
-                    raise RuntimeError(clk.get("error") or "open_click_failed")
-            except Exception as e:
-                log({"open_err": str(e)[:120]})
+        pin_ids: list[str] = []
+
+        if not feed_only:
+            for _ in range(6):
+                if page.locator(PIN_LINK).count() >= max(n_pins, 3):
+                    break
+                plan_steps = inertial_scroll(page, direction=1)
+                scroll_distance_px += scroll_plan_down_magnitude(plan_steps)
+                pause(page, 900, 2000, "load_more_pins", ambient=True)
+
+            pin_ids = collect_pin_ids(page, want=n_pins, pool=max(n_pins * 4, 16))
+            log({"pin_ids_n": len(pin_ids), "pin_ids": pin_ids})
+            if not pin_ids:
+                return {
+                    "status": "like_failed",
+                    "profile": profile,
+                    "error": "no_pin_links",
+                    "note": "logged_in_but_empty_feed",
+                    "elapsed_sec": round(time.time() - t0, 1),
+                    "liked": False,
+                    "pins_opened": 0,
+                    "feed_dwell_sec": feed_dwell_sec,
+                    "scroll_distance_px": int(scroll_distance_px),
+                    "persona": plan["persona"],
+                    "worked": worked,
+                }
+
+            for pi, pid in enumerate(pin_ids):
+                if time.time() - t0 > plan["max_sec"] - 15:
+                    break
+                pause(page, 2500, 7500, f"before_open_{pi}", ambient=True)
                 try:
-                    nlinks = page.locator(PIN_LINK).count()
-                    if nlinks <= 0:
-                        continue
-                    alt = page.locator(PIN_LINK).nth(random.randrange(min(nlinks, 20)))
-                    clk = _hclick(page, alt)
-                    if not clk.get("ok"):
-                        continue
+                    ensure_page_visible(page, log_fn=log)
                 except Exception:
-                    continue
-            pause(page, 1400, 3200, f"after_open_{pi}", ambient=True)
-            opened += 1
-            worked["pin_card"] = PIN_LINK
-            try:
-                page.screenshot(path=str(run_art / f"03-pin-{pi + 1}.png"))
-            except Exception:
-                pass
-
-            pause(page, view_lo, view_hi, f"view_pin_{pi}", ambient=True)
-
-            want_like = random.random() < like_p
-            if want_like or pi == 0:
-                probe = dump_closeup_selectors(page)
-                log({"closeup_probe": probe})
+                    pass
                 try:
-                    (run_art / f"03-pin-{pi + 1}-dom.json").write_text(
-                        json.dumps(probe, ensure_ascii=False, indent=2), encoding="utf-8"
-                    )
+                    loc = page.locator(f'a[href*="/pin/{pid}"]').first
+                    loc.scroll_into_view_if_needed(timeout=5000)
+                    pause(page, 700, 2200, f"into_view_{pi}", ambient=True)
+                    clk = _hclick(page, loc)
+                    if not clk.get("ok"):
+                        raise RuntimeError(clk.get("error") or "open_click_failed")
+                except Exception as e:
+                    log({"open_err": str(e)[:120]})
+                    try:
+                        nlinks = page.locator(PIN_LINK).count()
+                        if nlinks <= 0:
+                            continue
+                        alt = page.locator(PIN_LINK).nth(random.randrange(min(nlinks, 20)))
+                        clk = _hclick(page, alt)
+                        if not clk.get("ok"):
+                            continue
+                    except Exception:
+                        continue
+                pause(page, 1400, 3200, f"after_open_{pi}", ambient=True)
+                opened += 1
+                worked["pin_card"] = PIN_LINK
+                try:
+                    page.screenshot(path=str(run_art / f"03-pin-{pi + 1}.png"))
                 except Exception:
                     pass
 
-            if want_like:
-                like_attempts += 1
-                sel = like_pin(page)
-                log({"like_result": sel, "like_prob": like_p, "pin_index": pi})
-                if sel:
-                    liked = True
-                    like_sel = sel
-                    worked["like"] = sel
-                    try:
-                        page.screenshot(path=str(run_art / "04-liked.png"))
-                    except Exception:
-                        pass
+                # --- P0 longer pin linger (independently re-sampled each pin) ---
+                linger = plan_pin_linger(
+                    persona=plan.get("persona"),
+                    bounce=bool(plan.get("bounce")),
+                )
+                log({"pin_linger_plan": linger, "pin_index": pi})
+                pin_t0 = time.time()
+
+                # 1) Initial gaze quiet (no like yet) — re-sample independently
+                if linger.get("bounce"):
+                    pause(page, 800, 2800, f"pin_gaze_{pi}", ambient=True)
                 else:
+                    pause(page, 2500, 5500, f"pin_gaze_{pi}", ambient=True)
+
+                # 2) Optional ~50% light inertial peek scroll inside closeup
+                if linger.get("do_peek") and int(linger.get("peek_px") or 0) > 0:
                     try:
-                        page.screenshot(path=str(run_art / "04-like-failed.png"))
+                        ensure_page_visible(page, log_fn=log)
+                        remain = float(linger["peek_px"])
+                        steps = 0
+                        while remain > 20 and steps < 10:
+                            chunk = max(20.0, remain * random.uniform(0.2, 0.45))
+                            page.mouse.wheel(0, int(chunk))
+                            page.wait_for_timeout(
+                                sample_gamma_ms(12, 50, alpha=2.2, beta=10.0)
+                            )
+                            remain -= chunk
+                            steps += 1
+                        # Re-sample peek settle independently (optional beat).
+                        if random.random() < 0.85:
+                            pause(page, 350, 1200, f"pin_peek_{pi}", ambient=True)
                     except Exception:
                         pass
 
-            worked["close"] = close_pin(page)
-            pause(page, 1800, 5500, f"after_close_{pi}", ambient=True)
-            if pi < len(pin_ids) - 1 and random.random() < 0.7:
-                inertial_scroll(page, direction=1)
-                pause(page, 1600, 4500, f"between_pins_scroll_{pi}", ambient=True)
+                want_like = random.random() < like_p
+                if want_like or pi == 0:
+                    probe = dump_closeup_selectors(page)
+                    log({"closeup_probe": probe})
+                    try:
+                        (run_art / f"03-pin-{pi + 1}-dom.json").write_text(
+                            json.dumps(probe, ensure_ascii=False, indent=2), encoding="utf-8"
+                        )
+                    except Exception:
+                        pass
+
+                # 3) Like only in mid/late linger (60–85% of planned total)
+                if want_like:
+                    like_at = float(linger.get("like_at_ms") or linger["total_ms"] * 0.7)
+                    elapsed_pin_ms = (time.time() - pin_t0) * 1000.0
+                    wait_more = max(0, int(like_at - elapsed_pin_ms))
+                    if wait_more > 0:
+                        # Re-sample a wait band around remaining gap (not a fixed sleep).
+                        lo = max(200, int(wait_more * 0.55))
+                        hi = max(lo, int(wait_more * 1.15))
+                        pause(page, lo, hi, f"pre_like_linger_{pi}", ambient=True)
+                    like_attempts += 1
+                    try:
+                        ensure_page_visible(page, log_fn=log)
+                    except Exception:
+                        pass
+                    sel = like_pin(page)
+                    log({"like_result": sel, "like_prob": like_p, "pin_index": pi})
+                    if sel:
+                        liked = True
+                        like_sel = sel
+                        worked["like"] = sel
+                        try:
+                            page.screenshot(path=str(run_art / "04-liked.png"))
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            page.screenshot(path=str(run_art / "04-like-failed.png"))
+                        except Exception:
+                            pass
+
+                # 4) Pre-exit dwell then close — always re-sample at this site
+                pause(page, 1000, 3000, f"pre_exit_{pi}", ambient=True)
+
+                # Fill remaining total linger if still short (independent pause).
+                elapsed_pin_ms = (time.time() - pin_t0) * 1000.0
+                remain_total = int(linger["total_ms"] - elapsed_pin_ms)
+                if remain_total > 400:
+                    pause(
+                        page,
+                        max(300, remain_total // 2),
+                        max(400, remain_total),
+                        f"linger_fill_{pi}",
+                        ambient=True,
+                    )
+
+                worked["close"] = close_pin(page)
+                pause(page, 1800, 5500, f"after_close_{pi}", ambient=True)
+                if pi < len(pin_ids) - 1 and random.random() < 0.7:
+                    try:
+                        ensure_page_visible(page, log_fn=log)
+                    except Exception:
+                        pass
+                    plan_steps = inertial_scroll(page, direction=1)
+                    down_mag = scroll_plan_down_magnitude(plan_steps)
+                    scroll_distance_px += int(down_mag)
+                    rev = maybe_micro_reverse_scroll(
+                        page,
+                        down_mag,
+                        persona=plan.get("persona"),
+                        last_flip_mono=last_flip_mono,
+                        log_fn=log,
+                    )
+                    if rev.get("did"):
+                        scroll_distance_px += int(rev.get("reverse_px") or 0)
+                        last_flip_mono = rev.get("last_flip_mono") or last_flip_mono
+                    pause(page, 1600, 4500, f"between_pins_scroll_{pi}", ambient=True)
 
         linger_until = max(int(plan["min_sec"]), target_sec)
         while time.time() - t0 < linger_until:
@@ -1082,7 +1380,23 @@ def run_nurture_session(
                 break
             if time.time() - t0 > plan["max_sec"]:
                 break
-            inertial_scroll(page, direction=1)
+            try:
+                ensure_page_visible(page, log_fn=log)
+            except Exception:
+                pass
+            plan_steps = inertial_scroll(page, direction=1)
+            down_mag = scroll_plan_down_magnitude(plan_steps)
+            scroll_distance_px += int(down_mag)
+            rev = maybe_micro_reverse_scroll(
+                page,
+                down_mag,
+                persona=plan.get("persona"),
+                last_flip_mono=last_flip_mono,
+                log_fn=log,
+            )
+            if rev.get("did"):
+                scroll_distance_px += int(rev.get("reverse_px") or 0)
+                last_flip_mono = rev.get("last_flip_mono") or last_flip_mono
             hi = max(400, min(8000, int(remain * 1000) + 500))
             lo = min(3000, hi)
             pause(page, lo, hi, "final_linger", ambient=True)
@@ -1092,6 +1406,8 @@ def run_nurture_session(
         except Exception:
             pass
 
+        # Refresh feed dwell to include any post-pin feed time for gate.
+        feed_dwell_sec = round(max(feed_dwell_sec, time.time() - feed_t0), 1)
         elapsed = round(time.time() - t0, 1)
         payload = {
             "profile": profile,
@@ -1105,10 +1421,18 @@ def run_nurture_session(
             "persona": plan["persona"],
             "like_prob": round(like_p, 3),
             "target_sec": target_sec,
+            "feed_only": feed_only,
+            "feed_dwell_sec": feed_dwell_sec,
+            "scroll_distance_px": int(scroll_distance_px),
             "worked": worked,
         }
-        # 0 likes is allowed (browse_only / unlucky light_like). Empty feed already returned.
-        if opened >= 1:
+        # browsed_ok: pins_opened>=1 OR (feed_dwell>=min AND scroll_distance>=min)
+        # Do NOT call zero-pin success like_failed.
+        if browsed_ok(
+            pins_opened=opened,
+            feed_dwell_sec=feed_dwell_sec,
+            scroll_distance_px=scroll_distance_px,
+        ):
             return {"status": "browsed_ok", **payload}
         return {"status": "like_failed", "like_done": liked, **payload}
     except Exception as e:

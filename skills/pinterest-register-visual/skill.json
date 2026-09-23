@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "name": "pinterest-register-visual",
-  "description": "PRODUCT multimodal Pinterest register (0.2.7): CloakBrowser screenshot → OpenAI-compatible vision JSON actions → execute (human_click_locator trail + human_type_text, shared with nurture 0.2.2); same-session nurture BEFORE ctx.close; hang_before_close (~60–180s) then flush. Bot must call scripts/run_pinterest_register_visual_mm.py. computerUse is not the product path. Never system Chrome. IMAP via scripts/outlook_imap_pinterest_code.py. Nurture 0.2.2+.",
+  "description": "PRODUCT multimodal Pinterest register (0.2.7): CloakBrowser screenshot → OpenAI-compatible vision JSON actions → execute (human_click_locator trail + human_type_text, shared with nurture 0.2.2); same-session nurture BEFORE ctx.close; hang_before_close (~60–180s) then flush. Bot must call scripts/run_pinterest_register_visual_mm.py. computerUse is not the product path. Never system Chrome. IMAP via scripts/outlook_imap_pinterest_code.py. Nurture 0.2.3+.",
   "params": [
     "EMAIL",
     "PASSWORD",

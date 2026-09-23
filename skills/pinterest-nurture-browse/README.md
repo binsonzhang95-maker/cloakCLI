@@ -1,4 +1,4 @@
-# pinterest-nurture-browse (0.2.2)
+# pinterest-nurture-browse (0.2.3)
 
 Logged-in **nurture browse** for a single Pinterest account. Behavior hardening
 (Gemini JS strategy 2026-09-21): default **headed**, continuous **randomized
@@ -13,20 +13,33 @@ pauses, quiet window after load. 0 likes is a valid success.
 - Do **not** change CloakBrowser fingerprint / launch knobs.
 - Use the account’s **bound proxy** from `profile.json`.
 
-## Behavior hardening (0.2.2)
+## Behavior hardening (0.2.3)
 
 | Surface | What the runner does |
 |---------|----------------------|
 | Display | Headed by default; `--headless` opt-in; Xvfb OK |
 | Mouse | Many small `mouse.move` steps: randomized multi-segment Bézier, speed (gamma dwell), tremor, curve wander, overshoot then correct. Hover, then `mousedown`/`mouseup`. No teleport click to center. Ambient drift while “reading” |
 | Scroll | Inertial wheel: `v(t)=v0 e^{-kt}`, pause, slight reverse — not a fixed delta square wave |
-| Session | Personas `browse_only` / `light_like` / `deep_browse` / `bounce_early`. Pins **1–12** (or `--pins`). Like probability **15–40%** (browse_only = 0). **0 likes allowed** |
+| Session | Personas `browse_only` / `light_like` / `deep_browse` / `bounce_early`. Pins **0–12** (or `--pins`; ~15–25% feed-only). Like probability **15–40%** (browse_only / feed-only = 0). **0 likes allowed** |
 | Timing | Log-normal / gamma pauses (not `randint`). Quiet window 1–2s after load before first pointer/key event |
 | Typing | Focus + per-key delays; **no `fill`** for human fields (NUX name) |
 | Duration | Respects `--min-sec` / `--max-sec` |
 
-- **Hang before close (0.2.2):** after browse ends, ambient idle hang ~60–180s (lognormal; `CLOAKCLI_HANG_BEFORE_CLOSE_MS=0` skips in tests), then storage_state flush, then `ctx.close`.
+- **Hang before close (0.2.2+):** after browse ends, ambient idle hang ~60–180s (lognormal; `CLOAKCLI_HANG_BEFORE_CLOSE_MS=0` skips in tests), then storage_state flush, then `ctx.close`.
+- **Pin linger (0.2.3 P0):** open → independently sampled gaze 2.5–5.5s → optional ~50% peek scroll 300–600px → like only at 60–85% of planned dwell (never immediate) → pre-exit 1–3s → mixed close. Total ~4.5–22s (bounce ~2–4.5s).
+- **Visibility keepalive (0.2.3 P0):** before key/mouse bursts and during long pauses, soft-check `visibilityState` / `hasFocus`; bring_to_front + focus if needed. Logs `visibility_keepalive` (no secrets).
+- **Micro reverse scroll (0.2.3 P1):** after downward feed scrolls, ~12–18% (persona-weighted) reverse 20–45% of prior down magnitude; pause 1–3s; ≥1.5s between direction flips; net scroll still down.
+- **Mixed close paths (0.2.3 P1):** weighted button 50% / Esc 30% / `goBack` 15% / backdrop 5% with fallbacks; logs which path worked.
+- **Zero-pin bounce + browsed_ok (0.2.3 P1):** ~15–25% sessions open 0 pins (mostly bounce_early / browse_only); feed scroll 3–7 screens, dwell ~25–90s (lognormal ~45s). Success gate:
+  `browsed_ok` iff `(pins_opened >= 1) OR (feed_dwell_sec >= 25 AND scroll_distance_px >= 1500)`.
+  Zero-pin success is **not** `like_failed`.
+- **Timing variation (must):** every intermediate pause re-samples lognormal/gamma independently — no identical fixed sleep chains across steps/runs/profiles.
+
 Helpers: `scripts/pinterest_nurture_behavior.py` (unit-tested). Product path is this **python_runner**.
+
+## Supervisor timeout
+
+Hang 60–180s + longer pin linger → recommend wall clock **≥30–35 min** (bump from prior ~20 min).
 
 ## Pipeline (register → nurture same job)
 

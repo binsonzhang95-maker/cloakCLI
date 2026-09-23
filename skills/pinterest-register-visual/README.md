@@ -22,7 +22,7 @@ Skill package entry is `python_runner` → `scripts/run_pinterest_register_visua
 | Targeting | Vision JSON actions (`click` css or x/y + `screenshot_id`) | CSS / Playwright selectors |
 | Best for | Geo/UI drift, Oops-prone selector arm, A/B visual arm | Stable automated fleet when selectors hold |
 | IMAP | Same: `scripts/outlook_imap_pinterest_code.py` + secrets env | Same |
-| Nurture | Same-session **before** `ctx.close` (nurture 0.2.2+) | Same (register runner chains by default) |
+| Nurture | Same-session **before** `ctx.close` (nurture 0.2.3+) | Same (register runner chains by default) |
 
 ## Hard constraints
 
@@ -89,7 +89,7 @@ cloakcli llm models
 
 ## Behavior pacing
 
-Register now shares nurture 0.2.2+ human behavior (trail click + key stream). Clicks use `human_click_locator` (mouse trail then mousedown/mouseup — never `locator.click` / `force=True` teleport). Email/password/code/name use `human_type_text`. Quiet window after signup land; log-normal pauses (ambient drift on longer waits).
+Register now shares nurture 0.2.3+ human behavior (trail click + key stream). Clicks use `human_click_locator` (mouse trail then mousedown/mouseup — never `locator.click` / `force=True` teleport). Email/password/code/name use `human_type_text`. Quiet window after signup land; log-normal pauses (ambient drift on longer waits).
 
 - Fields: 800–2500ms · before Continue: 2–5s · after Continue settle: 3–8s · no click storms
 - Signup anti-loop: skip duplicate field types; after three fills bias Continue; one-shot Continue recovery after 3 redundant types

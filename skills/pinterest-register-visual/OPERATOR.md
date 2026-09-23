@@ -36,7 +36,7 @@ The product runner already does this. Bot should **exec the runner**, not reimpl
 
 ### Human pacing (mandatory — no rapid click storms)
 
-Register now shares nurture 0.2.2+ human behavior (trail click + key stream). `click` / Continue / field focus use `human_click_locator` (never `locator.click` / force teleport; one trail retry then fail). `type` uses `human_type_text`. Quiet window after signup land.
+Register now shares nurture 0.2.3+ human behavior (trail click + key stream). `click` / Continue / field focus use `human_click_locator` (never `locator.click` / force teleport; one trail retry then fail). `type` uses `human_type_text`. Quiet window after signup land.
 
 Applied by the runner around model actions:
 
