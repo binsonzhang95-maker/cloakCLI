@@ -1,0 +1,98 @@
+{
+  "version": "0.1.0",
+  "entry": {
+    "kind": "python_runner",
+    "path": "scripts/run_pinterest_create_pin.py"
+  },
+  "secrets": [],
+  "statuses": [
+    {
+      "id": "published_ok",
+      "success": true,
+      "retryable": false,
+      "label": "Pin published; pin_url/pin_id captured",
+      "exit": 0
+    },
+    {
+      "id": "dry_run_ok",
+      "success": true,
+      "retryable": false,
+      "label": "Dry-run: params validated; result.json written (no browser)",
+      "exit": 0
+    },
+    {
+      "id": "login_required",
+      "success": false,
+      "retryable": true,
+      "label": "Not logged in / login wall",
+      "exit": 8
+    },
+    {
+      "id": "upload_fail",
+      "success": false,
+      "retryable": true,
+      "label": "Image missing or upload failed",
+      "exit": 3
+    },
+    {
+      "id": "board_missing",
+      "success": false,
+      "retryable": true,
+      "label": "Board not selected; placeholder still present",
+      "exit": 5
+    },
+    {
+      "id": "publish_fail",
+      "success": false,
+      "retryable": true,
+      "label": "Publish click no-op or no pin URL",
+      "exit": 6
+    },
+    {
+      "id": "captcha_parked",
+      "success": false,
+      "retryable": false,
+      "label": "Captcha / verify-human — park, no retries",
+      "exit": 2
+    },
+    {
+      "id": "oops_park",
+      "success": false,
+      "retryable": false,
+      "label": "Pinterest Oops / unusual activity — park",
+      "exit": 2
+    },
+    {
+      "id": "account_deactivated",
+      "success": false,
+      "retryable": false,
+      "label": "Account deactivated",
+      "exit": 7
+    },
+    {
+      "id": "ui_unknown_park",
+      "success": false,
+      "retryable": true,
+      "label": "Unknown UI / create tool stuck",
+      "exit": 4
+    },
+    {
+      "id": "parked_risk",
+      "success": false,
+      "retryable": false,
+      "label": "Risk signal parked (generic)",
+      "exit": 2
+    }
+  ],
+  "live_note": "0.1.0 live CloakBrowser runner. Explore evidence remains artifacts/pinterest/create-pin/ (geo46 pin 1152217885972567993). That tree is a reference, not the product entry.",
+  "verified_probe": {
+    "profile": "geo46",
+    "user_data_dir": "data/profiles/geo46-pinterest-run",
+    "pin_id": "1152217885972567993",
+    "pin_url": "https://www.pinterest.com/pin/1152217885972567993/",
+    "board": "Classic World",
+    "image": "cw-10048-forest-friend-gift-sq.jpg",
+    "at": "2026-09-23T12:15:08-04:00",
+    "runner": "artifacts/pinterest/create-pin/run_create_pin_explore_r2.py"
+  }
+}

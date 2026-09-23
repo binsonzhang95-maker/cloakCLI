@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "name": "pinterest-create-pin",
+  "description": "0.1.0 — Publish one Pinterest Pin via CloakBrowser persistent profile with nurture-grade humanization (geo46 explore verified 2026-09-23, pin 1152217885972567993). Product path: python_runner scripts/run_pinterest_create_pin.py. Reuse scripts/pinterest_nurture_behavior.py human_click_locator / human_type_text. Prefer data/profiles/<id>-pinterest-run. Never system Chrome; never fill title/description; never teleport click; gate Publish on board-dropdown-placeholder gone. Explore artifacts remain the evidence reference.",
+  "params": [
+    "PROFILE",
+    "IMAGE_PATH",
+    "TITLE",
+    "DESCRIPTION",
+    "BOARD",
+    "CREATE_BOARD_IF_MISSING",
+    "HEADED",
+    "PUBLISH",
+    "DRY_RUN"
+  ],
+  "steps": [
+    {
+      "action": "note",
+      "text": "SCOPE: Publish one Pin to a logged-in CloakCLI Pinterest profile. Inputs: PROFILE, IMAGE_PATH, TITLE, DESCRIPTION, BOARD (select or create-if-missing, default create). Artifacts under artifacts/pinterest/create-pin/<profile>-run/. Explore evidence stays in artifacts/pinterest/create-pin/ (RESULT.json, EXPLORE-NOTES.md, run_create_pin_explore_r2.py)."
+    },
+    {
+      "action": "note",
+      "text": "HARD RULES: Open browser only via CloakBrowser launch_persistent_context on the CloakCLI profile. Secrets stay in data/secrets/. Prefer user_data_dir data/profiles/<PROFILE>-pinterest-run when present. No system Chrome. No fingerprint/launch knobs. No locator teleport click. No fill for title/description/board name — human_type_text. One Publish click on storyboard-creation-nav-done when enabled; do not thrash."
+    },
+    {
+      "action": "note",
+      "text": "PREFLIGHT: Resolve ud (nurture -pinterest-run preferred, else profiles/<PROFILE>/profile.json). Load proxy from that profile.json and do not log it. Image must exist. --dry-run validates params only (no browser) and exits dry_run_ok."
+    },
+    {
+      "action": "note",
+      "text": "START: goto https://www.pinterest.com/ → quiet window → assert logged-in (header-profile / feed, no unauth CTA). Park login_required | captcha_parked | oops_park | account_deactivated | parked_risk immediately. Viewport 1440x960."
+    },
+    {
+      "action": "note",
+      "text": "CREATE UI: human-click [data-test-id=create-tab] → a[href*=pin-creation-tool]. If the menu misses, open https://www.pinterest.com/pin-creation-tool/ directly. Stuck off that URL → ui_unknown_park."
+    },
+    {
+      "action": "note",
+      "text": "UPLOAD: human-click the upload area, then input[type=file].set_input_files(IMAGE_PATH) (file chooser fallback). Fail → upload_fail."
+    },
+    {
+      "action": "note",
+      "text": "TITLE: focus #storyboard-selector-title + human_type_text. DESCRIPTION: scroll [data-test-id=storyboard-description-field-container]; type into [data-test-id=editor-with-mentions] contenteditable (placeholder Tell everyone what your Pin is about). No fill. Missing field or failed focus → ui_unknown_park."
+    },
+    {
+      "action": "note",
+      "text": "BOARD: scroll [data-test-id=board-dropdown-select-button] → open → exact first-line match on [role=option] / board-row / boardFromList / boardWithoutSection. NEVER loose div:has-text(board name) — that hits the pin title (round 1). No fallback to a different board. If missing and create-if-missing (default true): Create board → human_type_text name → [data-test-id=board-form-submit-button]. REQUIRE [data-test-id=board-dropdown-placeholder] gone. Else board_missing. Do not Publish."
+    },
+    {
+      "action": "note",
+      "text": "PUBLISH: only [data-test-id=storyboard-creation-nav-done] when enabled; natural dwell; human_click_locator. --no-publish stops after the board gate (publish_fail, reason publish_skipped_by_flag) and does not click."
+    },
+    {
+      "action": "note",
+      "text": "VERIFY: published_ok only with a new pin_id. Accept the toast link aria Navigate to created Pin, a /pin/<id>/ redirect off the creation tool, or a link on the drafts card that says Publish Complete. Publish Complete text alone keeps polling briefly, then publish_fail. Staying on /pin-creation-tool/ is fine when the pin URL was captured. Screenshots under the run's steps/."
+    }
+  ]
+}
