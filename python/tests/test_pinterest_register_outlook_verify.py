@@ -1,4 +1,4 @@
-"""Pinterest register outlook-verify runner (0.1.3) — human behavior wiring."""
+"""Pinterest register outlook-verify runner (0.1.4) — human behavior wiring."""
 from __future__ import annotations
 
 import importlib.util
@@ -140,7 +140,7 @@ class OutlookVerifyBehaviorTests(unittest.TestCase):
         cls.ov = load_mod(RUNNER, "run_pinterest_register_outlook_verify")
 
     def test_version_and_imports(self) -> None:
-        self.assertEqual(self.ov.VERSION, "0.1.3")
+        self.assertEqual(self.ov.VERSION, "0.1.4")
         self.assertTrue(callable(self.ov.human_click_locator))
         self.assertTrue(callable(self.ov.human_type_text))
         self.assertTrue(callable(self.ov._hclick))
@@ -169,7 +169,7 @@ class OutlookVerifyBehaviorTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertIn("0.1.3", skill["description"])
+        self.assertIn("0.1.4", skill["description"])
         readme = (ROOT / "skills/pinterest-register-outlook-verify/README.md").read_text(
             encoding="utf-8"
         )
@@ -256,7 +256,7 @@ class OutlookVerifyBehaviorTests(unittest.TestCase):
         self.assertTrue(result.get("still_code_ui"))
         self.assertEqual(result.get("code_value_len"), 6)
 
-    def test_skill_docs_nurture_version_is_0_2_1(self) -> None:
+    def test_skill_docs_nurture_version_is_0_2_2(self) -> None:
         files = [
             ROOT / "skills/pinterest-register-visual/skill.json",
             ROOT / "skills/pinterest-register-visual/OPERATOR.md",
@@ -265,7 +265,7 @@ class OutlookVerifyBehaviorTests(unittest.TestCase):
         for path in files:
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("0.1.7+", text, msg=str(path))
-            self.assertIn("0.2.1+", text, msg=str(path))
+            self.assertIn("0.2.2+", text, msg=str(path))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinterest nurture browse (0.2.1).
+"""Pinterest nurture browse (0.2.2).
 
 Logged-in feed browse with behavior hardening (Gemini 2026-09-21): default
 headed, continuous randomized mouse trails, inertial scroll, session personas
@@ -40,6 +40,7 @@ from pinterest_nurture_behavior import (  # noqa: E402
     human_move_to,
     human_type_text,
     inertial_scroll,
+    hang_before_close,
     plan_nurture_session,
     play_ambient_drift,
     reset_session_mouse,
@@ -51,7 +52,7 @@ from pinterest_nurture_behavior import (  # noqa: E402
 )
 
 ART = ROOT / "artifacts/pinterest/nurture-browse"
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # Draft selectors — refine after a healthy logged-in probe
 PIN_LINK = 'a[href*="/pin/"]'
@@ -1123,6 +1124,30 @@ def run_nurture_session(
         }
 
 
+
+def flush_storage_before_close(ctx, ud: Path, page=None) -> dict:
+    """Best-effort storage_state + short wait before ctx.close (no fingerprint knobs)."""
+    out: dict = {"storage_state": False, "wait_ms": 0}
+    wait_ms = sample_lognormal_ms(800, 2200, mu=-0.1, sigma=0.35)
+    try:
+        if page is not None:
+            page.wait_for_timeout(int(wait_ms))
+        out["wait_ms"] = int(wait_ms)
+    except Exception:
+        out["wait_ms"] = int(wait_ms)
+    try:
+        if ctx is not None and hasattr(ctx, "storage_state"):
+            ud.mkdir(parents=True, exist_ok=True)
+            state_file = ud / "playwright_storage_state.json"
+            ctx.storage_state(path=str(state_file))
+            out["storage_state"] = True
+            out["storage_state_path"] = str(state_file)
+    except Exception as e:
+        out["storage_err"] = type(e).__name__
+    log({"status": "session_flush_before_close", **{k: v for k, v in out.items() if k != "storage_state_path"}})
+    return out
+
+
 def run_nurture_reopen(
     *,
     profile: str,
@@ -1200,6 +1225,14 @@ def run_nurture_reopen(
             persona=persona,
         )
     finally:
+        try:
+            hang_before_close(page, session_mouse())
+        except Exception:
+            pass
+        try:
+            flush_storage_before_close(ctx, ud, page)
+        except Exception:
+            pass
         try:
             ctx.close()
         except Exception:

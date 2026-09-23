@@ -1,5 +1,5 @@
 {
-  "version": "0.2.6",
+  "version": "0.2.7",
   "entry": {
     "kind": "python_runner",
     "path": "scripts/run_pinterest_register_visual_mm.py"
@@ -31,7 +31,7 @@
       "id": "oops_blocked",
       "success": false,
       "retryable": false,
-      "label": "Pinterest Oops — park",
+      "label": "Pinterest Oops \u2014 park",
       "exit": 2
     },
     {

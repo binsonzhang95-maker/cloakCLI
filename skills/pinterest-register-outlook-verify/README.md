@@ -21,9 +21,9 @@ python3 scripts/run_pinterest_register_outlook_verify.py \
 # Default chains same-session nurture before ctx.close (omit --skip-nurture)
 ```
 
-## Behavior pacing (runner 0.1.3)
+## Behavior pacing (runner 0.1.4)
 
-Register now shares nurture 0.2.1 human behavior (trail click + key stream). Signup/verify Continue, email/password focus, and Send-new-code use `human_click_locator` (never `locator.click` / force teleport; one trail retry then fail). Email/password/code/name use `human_type_text`. Birthdate `#birthdate` still `fill` after trail focus. Quiet window after signup land; log-normal pauses.
+Register now shares nurture 0.2.2+ human behavior (trail click + key stream). Signup/verify Continue, email/password focus, and Send-new-code use `human_click_locator` (never `locator.click` / force teleport; one trail retry then fail). Email/password/code/name use `human_type_text`. Birthdate `#birthdate` still `fill` after trail focus. Quiet window after signup land; log-normal pauses. After nurture (or skip), ambient hang ~60–180s then storage flush before `ctx.close` (`CLOAKCLI_HANG_BEFORE_CLOSE_MS=0` to skip in tests).
 
 - Between form fields: **800–2500ms** log-normal
 - Before Continue (signup + verify): **2–5s**
@@ -83,7 +83,7 @@ On **register/login success** (`status=ok`, including path `signup_ok_no_code_ch
 1. Touch `.cloak_session_ok`
 2. Flush session (2–4s wait + optional `storage_state` + navigate home once)
 3. `session_keepalive_probe` — if login wall → `nurture_status=session_lost_before_nurture` (not `browsed_ok`)
-4. Nurture browse (0.2.1+); register `status=ok` preserved even if nurture fails
+4. Nurture browse (0.2.2+); then hang ~60–180s + flush before `ctx.close`; register `status=ok` preserved even if nurture fails
 
 **Never** run independent nurture minutes later as the **primary** path (server session often revoked; cookies on disk ≠ logged-in; one password probe can deactivate). Independent nurture only for already-warm alive accounts.
 
@@ -114,5 +114,5 @@ Flags for Bot:
 - `--fresh-profile` only on brand-new attempt (no `.cloak_session_ok`)
 - Concurrency ≤2–3; shared udeal → serial / 1 per exit; 5–10min cooldown after Oops
 
-Standalone nurture (already-alive session): see `skills/pinterest-nurture-browse/` (0.2.1+).
+Standalone nurture (already-alive session): see `skills/pinterest-nurture-browse/` (0.2.2+).
 

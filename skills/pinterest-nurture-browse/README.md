@@ -1,4 +1,4 @@
-# pinterest-nurture-browse (0.2.1)
+# pinterest-nurture-browse (0.2.2)
 
 Logged-in **nurture browse** for a single Pinterest account. Behavior hardening
 (Gemini JS strategy 2026-09-21): default **headed**, continuous **randomized
@@ -13,7 +13,7 @@ pauses, quiet window after load. 0 likes is a valid success.
 - Do **not** change CloakBrowser fingerprint / launch knobs.
 - Use the account’s **bound proxy** from `profile.json`.
 
-## Behavior hardening (0.2.1)
+## Behavior hardening (0.2.2)
 
 | Surface | What the runner does |
 |---------|----------------------|
@@ -25,6 +25,7 @@ pauses, quiet window after load. 0 likes is a valid success.
 | Typing | Focus + per-key delays; **no `fill`** for human fields (NUX name) |
 | Duration | Respects `--min-sec` / `--max-sec` |
 
+- **Hang before close (0.2.2):** after browse ends, ambient idle hang ~60–180s (lognormal; `CLOAKCLI_HANG_BEFORE_CLOSE_MS=0` skips in tests), then storage_state flush, then `ctx.close`.
 Helpers: `scripts/pinterest_nurture_behavior.py` (unit-tested). Product path is this **python_runner**.
 
 ## Pipeline (register → nurture same job)
@@ -106,3 +107,4 @@ python3 -m unittest python/tests/test_pinterest_nurture_behavior.py -v
 - Exposes `run_nurture_session(page, …)` for in-process keep-open chaining and `run_nurture_reopen(…)` for persistent reopen.
 - Source of truth for this pass: `artifacts/pinterest/js-strategy-20260921/gemini-analysis.md` + `SUMMARY.md`.
 - 0.2.1: no `locator.click` / `force=True` teleport fallback — trail then mousedown/mouseup, or fail.
+- 0.2.2: hang before close (~60–180s ambient drift) + storage flush; then `ctx.close`.

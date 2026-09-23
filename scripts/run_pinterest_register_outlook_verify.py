@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E2E Pinterest register + Outlook IMAP 6-digit verify (0.1.3).
+"""E2E Pinterest register + Outlook IMAP 6-digit verify (0.1.4).
 
 Birthday: random age 25–35 as YYYY-MM-DD for #birthdate (type=date).
 Prefer --headed (default). Headless often gets Pinterest Oops.
@@ -15,7 +15,8 @@ even if nurture fails. Use --skip-nurture only when batch already nurtures
 separately (logs a warning). Never treat independent nurture minutes later as
 the primary post-register path.
 
-Behavior (0.1.3): shares nurture 0.2.1 human helpers — trail-only
+Behavior (0.1.4): after nurture (or skip), hang idle ~60–180s with ambient
+drift + storage flush before ctx.close. Shares nurture 0.2.2+ human helpers — trail-only
 human_click_locator (never locator.click / force teleport), human_type_text
 key stream, log-normal pauses, quiet window after signup land. After typing
 #code, if input_value != target, fail immediately (verify_soft_fail) and do
@@ -43,6 +44,7 @@ if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
 from pinterest_nurture_behavior import (  # noqa: E402
+    hang_before_close,
     human_click_locator,
     human_type_text,
     play_ambient_drift,
@@ -52,7 +54,7 @@ from pinterest_nurture_behavior import (  # noqa: E402
     session_mouse,
 )
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 SESSION_OK_NAME = ".cloak_session_ok"
 
 ERROR_RE = re.compile(
@@ -239,10 +241,13 @@ def touch_session_ok(ud: Path) -> None:
         pass
 
 
-def flush_session(ctx, page, ud: Path) -> dict:
-    """Best-effort cookie/storage flush + short home navigate before nurture."""
+def flush_session(ctx, page, ud: Path, *, home_nav: bool = True) -> dict:
+    """Best-effort cookie/storage flush; optional home navigate (before nurture).
+
+    Before ctx.close, call with home_nav=False after hang_before_close (storage + short wait).
+    """
     out: dict = {"storage_state": False, "home_nav": False, "wait_ms": 0}
-    wait_ms = random.randint(2000, 4000)
+    wait_ms = random.randint(2000, 4000) if home_nav else random.randint(800, 2200)
     try:
         page.wait_for_timeout(wait_ms)
         out["wait_ms"] = wait_ms
@@ -256,19 +261,26 @@ def flush_session(ctx, page, ud: Path) -> dict:
             out["storage_state_path"] = str(state_file)
     except Exception as e:
         out["storage_err"] = type(e).__name__
-    try:
-        page.goto(
-            "https://www.pinterest.com/",
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        page.wait_for_timeout(random.randint(1500, 3000))
-        out["home_nav"] = True
-    except Exception as e:
-        out["home_err"] = type(e).__name__
-    print(json.dumps({"status": "session_flush", **out}, ensure_ascii=False), flush=True)
+    if home_nav:
+        try:
+            page.goto(
+                "https://www.pinterest.com/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(random.randint(1500, 3000))
+            out["home_nav"] = True
+        except Exception as e:
+            out["home_err"] = type(e).__name__
+    status = "session_flush" if home_nav else "session_flush_before_close"
+    print(
+        json.dumps(
+            {"status": status, **{k: v for k, v in out.items() if k != "storage_state_path"}},
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     return out
-
 
 def settle_after_continue(
     page,
@@ -1068,7 +1080,15 @@ def main() -> int:
             return 2
         return 5
     finally:
-        # Lifecycle: nurture (if any) already finished above; now safe to close
+        # Lifecycle: nurture (if any) already finished; hang + flush, then close
+        try:
+            hang_before_close(page, session_mouse())
+        except Exception:
+            pass
+        try:
+            flush_session(ctx, page, ud, home_nav=False)
+        except Exception:
+            pass
         try:
             ctx.close()
         except Exception:

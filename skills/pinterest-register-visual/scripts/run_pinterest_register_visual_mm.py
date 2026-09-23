@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinterest visual register — PRODUCT multimodal loop (0.2.6).
+"""Pinterest visual register — PRODUCT multimodal loop (0.2.7).
 
 screenshot → OpenAI-compatible vision (chat/completions + image_url) → JSON
 action → CloakBrowser execute → same-session nurture BEFORE ctx.close.
@@ -15,6 +15,8 @@ package manifest (skills/pinterest-register-visual/manifest.json, or the
 manifest next to this runner). Success terminals require an independent login
 gate; the model cannot mint registered_ok / browsed_ok on a signup page.
 
+0.2.7: hang idle ~60–180s (ambient drift) + storage flush before ctx.close;
+chain nurture 0.2.2+.
 0.2.6: skill docs chain nurture 0.2.1+ (was stale 0.1.7+).
 0.2.5: click/type go through nurture human_click_locator (trail-only) and
 human_type_text (log-normal key delays); quiet window after signup land;
@@ -42,7 +44,7 @@ from typing import Any
 
 SKILL_ID = "pinterest-register-visual"
 # Fallback until the skill-package manifest is loaded below.
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 SESSION_OK_NAME = ".cloak_session_ok"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
@@ -252,6 +254,7 @@ if _REPO_SCRIPTS not in sys.path:
     sys.path.insert(0, _REPO_SCRIPTS)
 
 from pinterest_nurture_behavior import (  # noqa: E402
+    hang_before_close,
     human_click_locator,
     human_move_to,
     human_type_text,
@@ -1827,9 +1830,21 @@ def touch_session_ok(ud: Path) -> None:
         pass
 
 
-def flush_session(ctx: Any, page: Any, ud: Path, *, dry_run: bool = False) -> dict[str, Any]:
+def flush_session(
+    ctx: Any,
+    page: Any,
+    ud: Path,
+    *,
+    dry_run: bool = False,
+    home_nav: bool = True,
+) -> dict[str, Any]:
     out: dict[str, Any] = {"storage_state": False, "home_nav": False, "wait_ms": 0}
-    wait_ms = 0 if dry_run else random.randint(2000, 4000)
+    if dry_run:
+        wait_ms = 0
+    elif home_nav:
+        wait_ms = random.randint(2000, 4000)
+    else:
+        wait_ms = random.randint(800, 2200)
     try:
         page.wait_for_timeout(wait_ms)
         out["wait_ms"] = wait_ms
@@ -1843,13 +1858,15 @@ def flush_session(ctx: Any, page: Any, ud: Path, *, dry_run: bool = False) -> di
                 out["storage_state"] = True
         except Exception as e:
             out["storage_err"] = type(e).__name__
-        try:
-            page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(random.randint(1500, 3000))
-            out["home_nav"] = True
-        except Exception as e:
-            out["home_err"] = type(e).__name__
-    log({"status": "session_flush", **{k: v for k, v in out.items() if k != "storage_state_path"}})
+        if home_nav:
+            try:
+                page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(random.randint(1500, 3000))
+                out["home_nav"] = True
+            except Exception as e:
+                out["home_err"] = type(e).__name__
+    status = "session_flush" if home_nav else "session_flush_before_close"
+    log({"status": status, **{k: v for k, v in out.items() if k != "storage_state_path"}})
     return out
 
 
@@ -2894,6 +2911,16 @@ def main(argv: list[str] | None = None, stdin_payload: dict[str, Any] | None = N
         )
     finally:
         if ctx is not None:
+            try:
+                if page is not None and not dry_run:
+                    hang_before_close(page, session_mouse())
+            except Exception:
+                pass
+            try:
+                if page is not None and not dry_run:
+                    flush_session(ctx, page, ud, dry_run=False, home_nav=False)
+            except Exception:
+                pass
             try:
                 ctx.close()
             except Exception:

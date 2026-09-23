@@ -1,4 +1,4 @@
-# OPERATOR — pinterest-register-visual (product MM loop) 0.2.6
+# OPERATOR — pinterest-register-visual (product MM loop) 0.2.7
 
 Short playbook. Execution kind: **`python_runner`**.
 
@@ -36,7 +36,7 @@ The product runner already does this. Bot should **exec the runner**, not reimpl
 
 ### Human pacing (mandatory — no rapid click storms)
 
-Register now shares nurture 0.2.1 human behavior (trail click + key stream). `click` / Continue / field focus use `human_click_locator` (never `locator.click` / force teleport; one trail retry then fail). `type` uses `human_type_text`. Quiet window after signup land.
+Register now shares nurture 0.2.2+ human behavior (trail click + key stream). `click` / Continue / field focus use `human_click_locator` (never `locator.click` / force teleport; one trail retry then fail). `type` uses `human_type_text`. Quiet window after signup land.
 
 Applied by the runner around model actions:
 
@@ -64,7 +64,7 @@ IMAP: `scripts/outlook_imap_pinterest_code.py --secrets <env>` (runner action `i
 
 **Signup type (0.2.5):** `field: email|password|birthday|name|code` auto-binds `#email` / `#password` / `#birthdate` / `#code` (birthday **YYYY-MM-DD**). Runner **trail-clicks** the real input then `human_type_text` (date uses fill after trail focus). Missing selector after bind, or a failed focus/click, is rejected (`ok=False`) — never silent `keyboard.type` or teleport click. Re-typing a filled field is skipped; after email+password+birthday the model must click `button:has-text('Continue')` (not Google). After 3 redundant types the runner may one-shot that Continue (trail click). Vision timeout / transient HTTP retries 2–3× before `model_error` (does not burn `max_steps` on timeouts alone).
 
-On **independently confirmed** logged-in (account menu / pin feed / no unauth Log in+Sign up CTA) → **same-session nurture BEFORE `ctx.close()`** (mandatory unless `--skip-nurture`). Model `done: registered_ok` / `done: browsed_ok` / `nurture` are hints; they do **not** write `.cloak_session_ok` or count as success by themselves. A success claim on the register/login page is rejected (`not_logged_in` / `visual_stuck`). Flush cookies; `session_keepalive_probe` — login wall → `nurture_status=session_lost_before_nurture` (not a fake top-level `browsed_ok`). Nurture **0.2.1+**. Nurture failure does not negate a confirmed `registered_ok`.
+On **independently confirmed** logged-in (account menu / pin feed / no unauth Log in+Sign up CTA) → **same-session nurture BEFORE `ctx.close()`** (mandatory unless `--skip-nurture`). Model `done: registered_ok` / `done: browsed_ok` / `nurture` are hints; they do **not** write `.cloak_session_ok` or count as success by themselves. A success claim on the register/login page is rejected (`not_logged_in` / `visual_stuck`). Flush cookies; `session_keepalive_probe` — login wall → `nurture_status=session_lost_before_nurture` (not a fake top-level `browsed_ok`). Nurture **0.2.2+**. After nurture: hang ~60–180s (ambient) + flush, then close. Nurture failure does not negate a confirmed `registered_ok`.
 
 If **Oops** → stop, `oops_blocked`, park (cooldown 5–10 min on that exit).
 
@@ -84,7 +84,7 @@ Last stdout / job result must include:
 ```json
 {
   "skill_id": "pinterest-register-visual",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "status": "registered_ok",
   "path": "code_ui|settings_confirm|already_logged_in|…",
   "nurture_status": "browsed_ok|skipped|session_lost_before_nurture|like_failed|error:…",

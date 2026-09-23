@@ -1,4 +1,4 @@
-"""Product multimodal Pinterest register runner (0.2.6) — parse, LLM discover, dry-run."""
+"""Product multimodal Pinterest register runner (0.2.7) — parse, LLM discover, dry-run."""
 from __future__ import annotations
 
 import argparse
@@ -340,20 +340,22 @@ class DryRunSmokeTests(unittest.TestCase):
         env = os.environ.copy()
         env["CLOAKCLI_ROOT"] = str(ROOT)
         env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
+        env["CLOAKCLI_HANG_BEFORE_CLOSE_MS"] = "0"
         proc = subprocess.run(
             [sys.executable, str(RUNNER), "--dry-run", "--profile", "geo02"],
             cwd=str(ROOT),
             text=True,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             env=env,
-            timeout=30,
+            timeout=60,
         )
         self.assertEqual(proc.returncode, 0, msg=proc.stderr[-2000:] + proc.stdout[-2000:])
         lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
         self.assertTrue(lines)
         report = json.loads(lines[-1])
         self.assertEqual(report["skill_id"], "pinterest-register-visual")
-        self.assertEqual(report["version"], "0.2.6")
+        self.assertEqual(report["version"], "0.2.7")
         self.assertEqual(report["status"], "registered_ok")
         self.assertEqual(report["nurture_status"], "browsed_ok")
         self.assertTrue(report.get("dry_run"))
@@ -368,6 +370,7 @@ class DryRunSmokeTests(unittest.TestCase):
             cwd=str(ROOT),
             text=True,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             env=env,
             timeout=15,
         )
@@ -381,7 +384,7 @@ class DryRunSmokeTests(unittest.TestCase):
         man = json.loads(
             (ROOT / "skills/pinterest-register-visual/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(man["version"], "0.2.6")
+        self.assertEqual(man["version"], "0.2.7")
         self.assertEqual(man["entry"]["kind"], "python_runner")
         self.assertEqual(man["entry"]["path"], "scripts/run_pinterest_register_visual_mm.py")
         ids = {s["id"] for s in man["statuses"]}
@@ -433,8 +436,8 @@ class DryRunSmokeTests(unittest.TestCase):
         )
         self.assertNotIn("0.1.7+", skill)
         self.assertNotIn("0.1.7+", operator)
-        self.assertIn("0.2.1+", skill)
-        self.assertIn("0.2.1+", operator)
+        self.assertIn("0.2.2+", skill)
+        self.assertIn("0.2.2+", operator)
 
 
 class ProviderMimeTests(unittest.TestCase):

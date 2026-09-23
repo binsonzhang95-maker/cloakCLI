@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "name": "pinterest-register-outlook-verify",
-  "description": "Pinterest signup email/password/birthday (ISO). Runner 0.1.3: shares nurture 0.2.1 human helpers (trail click + key stream, quiet window); fail-fast if #code value mismatches (no Continue); post-Continue settle, same-session nurture before ctx.close (session_keepalive_probe). Path A: 6-digit #code UI (runner IMAP + soft Send-new-code once). Path B (IP/geo): signup_ok_no_code_challenge → pinterest-settings-email-verify. Concurrency ≤2–3; Oops → park.",
+  "description": "Pinterest signup email/password/birthday (ISO). Runner 0.1.4: shares nurture 0.2.2+ human helpers (trail click + key stream, quiet window); fail-fast if #code value mismatches (no Continue); post-Continue settle, same-session nurture before ctx.close (session_keepalive_probe). Path A: 6-digit #code UI (runner IMAP + soft Send-new-code once). Path B (IP/geo): signup_ok_no_code_challenge → pinterest-settings-email-verify. Concurrency ≤2–3; Oops → park.",
   "params": [
     "EMAIL",
     "PASSWORD",

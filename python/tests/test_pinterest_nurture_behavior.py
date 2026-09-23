@@ -1,4 +1,4 @@
-"""Nurture 0.2.1 behavior helpers: mouse path, pauses, personas, inertial scroll."""
+"""Nurture 0.2.2 behavior helpers: mouse path, pauses, personas, inertial scroll."""
 from __future__ import annotations
 
 import importlib.util
@@ -323,7 +323,7 @@ class RunnerCliTests(unittest.TestCase):
         cls.runner = load_mod(RUNNER, "run_pinterest_nurture_browse")
 
     def test_default_headed_and_persona_pins(self) -> None:
-        self.assertEqual(self.runner.VERSION, "0.2.1")
+        self.assertEqual(self.runner.VERSION, "0.2.2")
         ns = self.runner.build_arg_parser().parse_args(["--profile", "geo46"])
         self.assertFalse(ns.headless)
         self.assertEqual(ns.pins, 0)
@@ -350,7 +350,7 @@ class RunnerCliTests(unittest.TestCase):
         manifest = json.loads(
             (ROOT / "skills/pinterest-nurture-browse/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["version"], "0.2.1")
+        self.assertEqual(manifest["version"], "0.2.2")
         self.assertEqual(manifest["entry"]["path"], "scripts/run_pinterest_nurture_browse.py")
         behavior_src = (ROOT / "scripts/pinterest_nurture_behavior.py").read_text(encoding="utf-8")
         click_fn = behavior_src.split("def human_click_locator", 1)[1].split("\ndef ", 1)[0]
@@ -360,6 +360,81 @@ class RunnerCliTests(unittest.TestCase):
         runner_src = (ROOT / "scripts/run_pinterest_nurture_browse.py").read_text(encoding="utf-8")
         self.assertNotIn("force=True", runner_src)
         self.assertNotIn(".click(timeout=5000, force=True)", runner_src)
+
+
+
+class HangBeforeCloseTests(unittest.TestCase):
+    def test_samples_clamped_to_default_band(self) -> None:
+        import os
+
+        prev = os.environ.pop(bh.HANG_BEFORE_CLOSE_ENV, None)
+        try:
+            lo = bh.HANG_BEFORE_CLOSE_LO_MS
+            hi = bh.HANG_BEFORE_CLOSE_HI_MS
+            samples = [
+                bh.resolve_hang_before_close_ms(rng=random.Random(i))
+                for i in range(80)
+            ]
+            self.assertTrue(all(lo <= s <= hi for s in samples))
+            self.assertGreater(len(set(samples)), 5)
+        finally:
+            if prev is not None:
+                os.environ[bh.HANG_BEFORE_CLOSE_ENV] = prev
+
+    def test_env_override_zero_skips(self) -> None:
+        import os
+
+        prev = os.environ.get(bh.HANG_BEFORE_CLOSE_ENV)
+        os.environ[bh.HANG_BEFORE_CLOSE_ENV] = "0"
+        try:
+            self.assertEqual(bh.resolve_hang_before_close_ms(rng=random.Random(1)), 0)
+            page = FakePage()
+            mouse = {"x": 10.0, "y": 20.0}
+            logs: list[dict] = []
+            spent = bh.hang_before_close(page, mouse, rng=random.Random(1), log_fn=logs.append)
+            self.assertEqual(spent, 0)
+            self.assertEqual(logs[0]["status"], "hang_before_close")
+            self.assertEqual(logs[0]["ms"], 0)
+            self.assertFalse(page.mouse.events)
+        finally:
+            if prev is None:
+                os.environ.pop(bh.HANG_BEFORE_CLOSE_ENV, None)
+            else:
+                os.environ[bh.HANG_BEFORE_CLOSE_ENV] = prev
+
+    def test_hang_runs_ambient_drift_within_budget(self) -> None:
+        import os
+
+        prev = os.environ.get(bh.HANG_BEFORE_CLOSE_ENV)
+        os.environ[bh.HANG_BEFORE_CLOSE_ENV] = "1200"
+        try:
+            page = FakePage()
+            mouse = {"x": 40.0, "y": 50.0}
+            logs: list[dict] = []
+            spent = bh.hang_before_close(page, mouse, rng=random.Random(9), log_fn=logs.append)
+            self.assertGreaterEqual(spent, 1000)
+            self.assertLessEqual(spent, 2000)
+            self.assertTrue(any(e[0] == "move" for e in page.mouse.events))
+            self.assertTrue(page.waits)
+            self.assertEqual(logs[0]["ms"], 1200)
+            self.assertEqual(logs[-1]["status"], "hang_before_close_done")
+        finally:
+            if prev is None:
+                os.environ.pop(bh.HANG_BEFORE_CLOSE_ENV, None)
+            else:
+                os.environ[bh.HANG_BEFORE_CLOSE_ENV] = prev
+
+    def test_runners_wire_hang_before_close(self) -> None:
+        nurture_src = (ROOT / "scripts/run_pinterest_nurture_browse.py").read_text(encoding="utf-8")
+        outlook_src = (ROOT / "scripts/run_pinterest_register_outlook_verify.py").read_text(encoding="utf-8")
+        visual_src = (ROOT / "scripts/run_pinterest_register_visual_mm.py").read_text(encoding="utf-8")
+        for src, label in (
+            (nurture_src, "nurture"),
+            (outlook_src, "outlook"),
+            (visual_src, "visual"),
+        ):
+            self.assertIn("hang_before_close(", src, msg=label)
+            self.assertIn("hang_before_close", src, msg=label)
 
 
 if __name__ == "__main__":

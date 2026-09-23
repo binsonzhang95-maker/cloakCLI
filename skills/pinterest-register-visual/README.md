@@ -1,4 +1,4 @@
-# pinterest-register-visual (0.2.6)
+# pinterest-register-visual (0.2.7)
 
 **PRODUCT path:** multimodal loop on **CloakBrowser** —
 
@@ -16,13 +16,13 @@ Skill package entry is `python_runner` → `scripts/run_pinterest_register_visua
 
 ## When to use vs `pinterest-register-outlook-verify`
 
-| | `pinterest-register-visual` 0.2.6 | `pinterest-register-outlook-verify` |
+| | `pinterest-register-visual` 0.2.7 | `pinterest-register-outlook-verify` |
 |--|-----------------------------------|-------------------------------------|
 | Execution | Product MM loop (`python_runner`) | Declarative `skill.json` steps + selector runner |
 | Targeting | Vision JSON actions (`click` css or x/y + `screenshot_id`) | CSS / Playwright selectors |
 | Best for | Geo/UI drift, Oops-prone selector arm, A/B visual arm | Stable automated fleet when selectors hold |
 | IMAP | Same: `scripts/outlook_imap_pinterest_code.py` + secrets env | Same |
-| Nurture | Same-session **before** `ctx.close` (nurture 0.2.1+) | Same (register runner chains by default) |
+| Nurture | Same-session **before** `ctx.close` (nurture 0.2.2+) | Same (register runner chains by default) |
 
 ## Hard constraints
 
@@ -89,7 +89,7 @@ cloakcli llm models
 
 ## Behavior pacing
 
-Register now shares nurture 0.2.1 human behavior (trail click + key stream). Clicks use `human_click_locator` (mouse trail then mousedown/mouseup — never `locator.click` / `force=True` teleport). Email/password/code/name use `human_type_text`. Quiet window after signup land; log-normal pauses (ambient drift on longer waits).
+Register now shares nurture 0.2.2+ human behavior (trail click + key stream). Clicks use `human_click_locator` (mouse trail then mousedown/mouseup — never `locator.click` / `force=True` teleport). Email/password/code/name use `human_type_text`. Quiet window after signup land; log-normal pauses (ambient drift on longer waits).
 
 - Fields: 800–2500ms · before Continue: 2–5s · after Continue settle: 3–8s · no click storms
 - Signup anti-loop: skip duplicate field types; after three fills bias Continue; one-shot Continue recovery after 3 redundant types
@@ -99,6 +99,7 @@ Register now shares nurture 0.2.1 human behavior (trail click + key stream). Cli
 ## Session keep-alive
 
 - Default: same-context nurture **before** `ctx.close()`; probe with `session_keepalive_probe`; flush cookies (wait + home).
+- After nurture: ambient hang ~60–180s (`hang_before_close`) + storage flush, then `ctx.close` (`CLOAKCLI_HANG_BEFORE_CLOSE_MS=0` skips hang in tests).
 - `session_lost_before_nurture` if login wall before browse (not `browsed_ok`).
 - Touch `.cloak_session_ok` only after **independent login confirmation** (account menu / pin feed / absence of unauth Log in+Sign up CTA). Model `done: registered_ok` or `done: browsed_ok` is a hint, never enough on its own.
 
@@ -132,8 +133,8 @@ Mock vision + stub page. Does **not** launch CloakBrowser or call a live model. 
 ## Related
 
 - Product runner: `scripts/run_pinterest_register_visual_mm.py`
-- Declarative register: `skills/pinterest-register-outlook-verify/` (runner 0.1.3, same human helpers)
-- Nurture: `skills/pinterest-nurture-browse/` (0.2.1+)
+- Declarative register: `skills/pinterest-register-outlook-verify/` (runner 0.1.4, same human helpers + hang before close)
+- Nurture: `skills/pinterest-nurture-browse/` (0.2.2+)
 - IMAP helper: `scripts/outlook_imap_pinterest_code.py`
 - Operator playbook: `OPERATOR.md`
 - Preflight (no browser): `scripts/run_pinterest_register_visual_hint.py`

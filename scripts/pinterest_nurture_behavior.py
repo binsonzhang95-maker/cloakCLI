@@ -6,8 +6,11 @@ and session personas. Used by nurture browse and register runners. Stdlib only.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 import random
+import time
 from typing import Any
 
 PERSONA_NAMES = ("browse_only", "light_like", "deep_browse", "bounce_early")
@@ -428,6 +431,94 @@ def play_ambient_drift(
         spent += d
         n += 1
     return n
+
+
+# Default hang band before ctx.close: ~60–180s lognormal (geometric mean ~104s).
+HANG_BEFORE_CLOSE_LO_MS = 60_000
+HANG_BEFORE_CLOSE_HI_MS = 180_000
+# mu = ln(geo_mean_seconds); sigma keeps most mass inside the clamp band.
+HANG_BEFORE_CLOSE_MU = math.log(104.0)  # ~4.644 ln(seconds); sample_lognormal_ms multiplies by 1000
+HANG_BEFORE_CLOSE_SIGMA = 0.35
+HANG_BEFORE_CLOSE_ENV = "CLOAKCLI_HANG_BEFORE_CLOSE_MS"
+
+
+def resolve_hang_before_close_ms(
+    *,
+    lo_ms: int = HANG_BEFORE_CLOSE_LO_MS,
+    hi_ms: int = HANG_BEFORE_CLOSE_HI_MS,
+    rng: Any = None,
+) -> int:
+    """Sample hang duration. Env CLOAKCLI_HANG_BEFORE_CLOSE_MS overrides (0=skip)."""
+    raw = os.environ.get(HANG_BEFORE_CLOSE_ENV)
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(0, int(str(raw).strip()))
+        except ValueError:
+            pass
+    return sample_lognormal_ms(
+        lo_ms,
+        hi_ms,
+        mu=HANG_BEFORE_CLOSE_MU,
+        sigma=HANG_BEFORE_CLOSE_SIGMA,
+        rng=rng,
+    )
+
+
+def hang_before_close(
+    page: Any,
+    mouse: dict[str, float] | None = None,
+    *,
+    lo_ms: int = HANG_BEFORE_CLOSE_LO_MS,
+    hi_ms: int = HANG_BEFORE_CLOSE_HI_MS,
+    rng: Any = None,
+    log_fn: Any = None,
+) -> int:
+    """Ambient idle hang before ctx.close. Returns ms spent (0 if skipped).
+
+    Samples lognormal clamped to [lo_ms, hi_ms] (default 60–180s) unless
+    CLOAKCLI_HANG_BEFORE_CLOSE_MS is set (use 0 in unit tests to skip).
+    During the hang: ambient mouse drift + quiet waits (not pure sleep).
+    """
+    if mouse is None:
+        mouse = session_mouse()
+    rng = _as_rng(rng)
+    target = int(resolve_hang_before_close_ms(lo_ms=lo_ms, hi_ms=hi_ms, rng=rng))
+    emit = log_fn if callable(log_fn) else (
+        lambda payload: print(json.dumps(payload, ensure_ascii=False), flush=True)
+    )
+    emit({"status": "hang_before_close", "ms": target})
+    if target <= 0:
+        return 0
+    t0 = time.monotonic()
+    spent = 0
+    while spent < target:
+        remain = target - spent
+        drift_budget = min(
+            remain,
+            sample_lognormal_ms(250, 900, mu=-0.8, sigma=0.4, rng=rng),
+        )
+        try:
+            play_ambient_drift(page, mouse, rng=rng, budget_ms=int(drift_budget))
+        except Exception:
+            try:
+                page.wait_for_timeout(int(drift_budget))
+            except Exception:
+                pass
+        spent += int(drift_budget)
+        if spent >= target:
+            break
+        quiet = min(
+            target - spent,
+            sample_lognormal_ms(400, 1800, mu=-0.2, sigma=0.35, rng=rng),
+        )
+        try:
+            page.wait_for_timeout(int(quiet))
+        except Exception:
+            pass
+        spent += int(quiet)
+    elapsed = int(max(spent, (time.monotonic() - t0) * 1000.0))
+    emit({"status": "hang_before_close_done", "ms": target, "elapsed_ms": elapsed})
+    return elapsed
 
 
 def human_move_to(
