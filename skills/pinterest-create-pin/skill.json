@@ -20,7 +20,7 @@
     },
     {
       "action": "note",
-      "text": "HARD RULES: Open browser only via CloakBrowser launch_persistent_context on the CloakCLI profile. Secrets stay in data/secrets/. Prefer user_data_dir data/profiles/<PROFILE>-pinterest-run when present. No system Chrome. No fingerprint/launch knobs. No locator teleport click. No fill for title/description/board name — human_type_text. One Publish click on storyboard-creation-nav-done when enabled; do not thrash."
+      "text": "HARD RULES: Open browser only via CloakBrowser launch_persistent_context on the CloakCLI profile. Secrets stay in data/secrets/. Prefer user_data_dir data/profiles/<PROFILE>-pinterest-run when present. No system Chrome. Use persisted fingerprint_seed from profile.json; do not randomize per launch. No locator teleport click. No fill for title/description/board name — human_type_text. One Publish click on storyboard-creation-nav-done when enabled; do not thrash."
     },
     {
       "action": "note",

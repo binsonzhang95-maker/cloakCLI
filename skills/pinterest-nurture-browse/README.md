@@ -10,7 +10,7 @@ pauses, quiet window after load. 0 likes is a valid success.
 - **One account ↔ one geo/proxy** (`profiles/<id>/profile.json` + `data/profiles/<id>-pinterest-run`).
 - **Do not** wipe `user_data_dir` (keep cookies).
 - **Default headed.** `--headless` is opt-in only (reCAPTCHA HeadlessChrome). Linux **Xvfb** is OK (still headed).
-- Do **not** change CloakBrowser fingerprint / launch knobs.
+- Use persisted `fingerprint_seed` from profile.json; do not randomize per launch.
 - Use the account’s **bound proxy** from `profile.json`.
 
 ## Behavior hardening (0.2.3)

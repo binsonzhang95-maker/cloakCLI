@@ -40,7 +40,7 @@ ctx = launch_persistent_context(**kwargs)
 page.set_viewport_size({"width": 1440, "height": 960})
 ```
 
-No system Chrome. No fingerprint knobs. Do not log the proxy.
+No system Chrome. Use persisted fingerprint_seed from profile.json; do not randomize per launch. Do not log the proxy.
 Reuse `scripts/pinterest_nurture_behavior.py`: `human_click_locator`,
 `human_type_text`, `sample_pause_ms`, `sample_quiet_window_ms`, ambient drift.
 Default close is a short wrap-up plus `storage_state` flush. A nurture-length

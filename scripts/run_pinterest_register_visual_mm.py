@@ -7,7 +7,7 @@ action → CloakBrowser execute → same-session nurture BEFORE ctx.close.
 This is the product path. Bot / operators must call this runner.
 Free-form computerUse is not the product path.
 
-Never launches system Chrome. Never changes CloakBrowser fingerprint knobs.
+Never launches system Chrome. Use persisted fingerprint_seed from profile.json; do not randomize per launch.
 API keys are never accepted as --api-key (shell history) and never printed.
 
 Terminal statuses, success flags, and process-exit mapping come from the skill
@@ -2615,14 +2615,26 @@ def run_loop(
     return finish(FAIL_FALLBACK_STATUS, reason="max steps exceeded")
 
 
-def launch_cloakbrowser(ud: Path, headed: bool, proxy: str | None) -> Any:
-    """Persistent CloakBrowser only. No system Chrome. No fingerprint knobs."""
+def launch_cloakbrowser(
+    ud: Path,
+    headed: bool,
+    proxy: str | None,
+    *,
+    fingerprint_seed: int | None = None,
+) -> Any:
+    """Persistent CloakBrowser only. Never system Chrome.
+
+    Use persisted fingerprint_seed from profile.json; do not randomize per launch.
+    """
     from cloakbrowser import launch_persistent_context
+    from cloakcli_worker.fingerprint import fingerprint_chrome_args, log_fingerprint_seed
 
     kwargs: dict[str, Any] = {"user_data_dir": str(ud), "headless": not headed}
     if proxy:
         kwargs["proxy"] = proxy
-    # Do not pass user_agent / fingerprint / stealth extras — profile identity stays as-is.
+    if fingerprint_seed is not None:
+        kwargs["args"] = fingerprint_chrome_args(fingerprint_seed)
+        log_fingerprint_seed(fingerprint_seed)
     return launch_persistent_context(**kwargs)
 
 
@@ -2845,7 +2857,16 @@ def main(argv: list[str] | None = None, stdin_payload: dict[str, Any] | None = N
             return 6
         if ud.exists():
             shutil.rmtree(ud)
+        from cloakcli_worker.fingerprint import ensure_fingerprint_seed
+
+        ensure_fingerprint_seed(profile_path, regenerate=True)
     ud.mkdir(parents=True, exist_ok=True)
+
+    fp_seed: int | None = None
+    if not dry_run:
+        from cloakcli_worker.fingerprint import ensure_fingerprint_seed
+
+        fp_seed = ensure_fingerprint_seed(profile_path)
 
     ctx: Any = None
     page: Any
@@ -2874,7 +2895,7 @@ def main(argv: list[str] | None = None, stdin_payload: dict[str, Any] | None = N
             injected_key = True
         headed = not args.headless
         try:
-            ctx = launch_cloakbrowser(ud, headed=headed, proxy=proxy)
+            ctx = launch_cloakbrowser(ud, headed=headed, proxy=proxy, fingerprint_seed=fp_seed)
         except Exception as e:
             report = {
                 "skill_id": SKILL_ID,

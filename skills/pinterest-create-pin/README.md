@@ -17,7 +17,7 @@ does not carry `scripts/pinterest_nurture_behavior.py`, which this runner import
 ## Hard rules
 
 1. One account, one profile. CloakBrowser `launch_persistent_context` only.
-   Prefer `data/profiles/<id>-pinterest-run`. Never system Chrome. No fingerprint knobs.
+   Prefer `data/profiles/<id>-pinterest-run`. Never system Chrome. Use persisted `fingerprint_seed` from profile.json; do not randomize per launch.
 2. Secrets stay in `data/secrets/`. This skill does not read passwords. Do not log proxy URLs.
 3. Clicks go through `human_click_locator` (trail, hover, mouse down/up).
 4. Title, description, and a new board name go through `human_type_text`. No `fill`.

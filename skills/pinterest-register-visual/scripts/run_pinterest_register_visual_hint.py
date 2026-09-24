@@ -33,7 +33,7 @@ REQUIRED_SECRET_KEYS = (
 
 CHECKLIST = [
     "PRODUCT PATH: python3 scripts/run_pinterest_register_visual_mm.py (Bot must call this; computerUse is not the product path)",
-    "DISPLAY / headed CloakBrowser only (NEVER system Chrome; no fingerprint knobs)",
+    "DISPLAY / headed CloakBrowser only (NEVER system Chrome; persisted fingerprint_seed)",
     "Load proxy from profiles/<id>/profile.json (udeal/geo as bound)",
     "Persistent user_data_dir: data/profiles/<id>-pinterest-run",
     "LLM: config/llm.json + CLOAKCLI_LLM_API_KEY (default grok-4.6; vision: CLOAKCLI_LLM_VISION_MODEL / llm.json vision_model); never --api-key",

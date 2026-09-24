@@ -27,9 +27,25 @@ def launch_context(
     proxy: str | None = None,
     user_agent: str | None = None,
     extension_paths: list[str] | None = None,
+    fingerprint_seed: int | None = None,
+    profile_meta_path: str | Path | None = None,
+    profiles_root: str | Path | None = None,
 ) -> Any:
-    """Launch persistent stealth Chromium via cloakbrowser."""
+    """Launch persistent stealth Chromium via cloakbrowser.
+
+    When a fingerprint_seed is known (explicit, profile_meta_path, or best-effort
+    match of user_data_dir under profiles_root), pass args=["--fingerprint=N"] so
+    cloakbrowser build_args overrides the per-launch random default. Platform
+    stealth args are unchanged. If no profile.json can be resolved, launch still
+    proceeds (cloakbrowser picks a random seed for that launch only).
+    """
     from cloakbrowser import launch_persistent_context
+
+    from .fingerprint import (
+        fingerprint_chrome_args,
+        log_fingerprint_seed,
+        resolve_fingerprint_seed,
+    )
 
     kwargs: dict[str, Any] = {
         "user_data_dir": user_data_dir,
@@ -41,6 +57,17 @@ def launch_context(
         kwargs["user_agent"] = user_agent
     if extension_paths:
         kwargs["extension_paths"] = list(extension_paths)
+
+    seed = resolve_fingerprint_seed(
+        fingerprint_seed=fingerprint_seed,
+        profile_meta_path=profile_meta_path,
+        profiles_root=profiles_root,
+        user_data_dir=user_data_dir,
+    )
+    if seed is not None:
+        kwargs["args"] = fingerprint_chrome_args(seed)
+        log_fingerprint_seed(seed)
+
     return launch_persistent_context(**kwargs)
 
 

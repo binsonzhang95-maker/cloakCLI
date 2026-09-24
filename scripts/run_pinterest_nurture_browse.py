@@ -7,8 +7,8 @@ personas (browse_only / light_like / deep_browse / bounce_early),
 log-normal/gamma pauses (independently re-sampled at every site), quiet window
 after load, longer pin linger, visibility keepalive, occasional micro reverse
 scroll, mixed close paths, zero-pin feed bounce + browsed_ok gate.
-CloakBrowser persistent context; one account ↔ one geo/proxy. Does NOT change
-fingerprint/launch knobs.
+CloakBrowser persistent context; one account ↔ one geo/proxy. Use persisted
+fingerprint_seed from profile.json; do not randomize per launch.
 
 At session start, clears name onboarding ("What's your name") then use-case
 picker if present. Does NOT wipe user_data_dir. Does NOT attempt login /
@@ -36,6 +36,9 @@ else:
 
 if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
+_py = ROOT / "python"
+if str(_py) not in sys.path:
+    sys.path.insert(0, str(_py))
 
 from pinterest_nurture_behavior import (  # noqa: E402
     PERSONA_NAMES,
@@ -1450,7 +1453,7 @@ def run_nurture_session(
 
 
 def flush_storage_before_close(ctx, ud: Path, page=None) -> dict:
-    """Best-effort storage_state + short wait before ctx.close (no fingerprint knobs)."""
+    """Best-effort storage_state + short wait before ctx.close."""
     out: dict = {"storage_state": False, "wait_ms": 0}
     wait_ms = sample_lognormal_ms(800, 2200, mu=-0.1, sigma=0.35)
     try:
@@ -1529,9 +1532,20 @@ def run_nurture_reopen(
         )
 
     from cloakbrowser import launch_persistent_context
+    from cloakcli_worker.fingerprint import (
+        ensure_fingerprint_seed,
+        fingerprint_chrome_args,
+        log_fingerprint_seed,
+    )
 
-    # Headed is the default. Do not add fingerprint/launch knobs here.
-    kwargs: dict = {"user_data_dir": str(ud), "headless": not headed}
+    # Headed is the default. Use persisted fingerprint_seed; do not randomize per launch.
+    seed = ensure_fingerprint_seed(meta_path)
+    log_fingerprint_seed(seed)
+    kwargs: dict = {
+        "user_data_dir": str(ud),
+        "headless": not headed,
+        "args": fingerprint_chrome_args(seed),
+    }
     if meta.get("proxy"):
         kwargs["proxy"] = meta["proxy"]
 

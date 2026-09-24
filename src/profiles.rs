@@ -7,6 +7,18 @@ use std::path::{Path, PathBuf};
 use crate::state;
 use crate::util::{self, redact_proxy};
 
+
+/// CloakBrowser fingerprint seed range (inclusive), same as cloakbrowser.
+const FINGERPRINT_SEED_MIN: u32 = 10000;
+const FINGERPRINT_SEED_MAX: u32 = 99999;
+
+/// Mint a seed in 10000..=99999 using UUID entropy (no extra rand crate).
+fn mint_fingerprint_seed() -> u32 {
+    let n = uuid::Uuid::new_v4().as_u128();
+    let span = (FINGERPRINT_SEED_MAX - FINGERPRINT_SEED_MIN + 1) as u128;
+    FINGERPRINT_SEED_MIN + (n % span) as u32
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
@@ -16,6 +28,13 @@ pub struct Profile {
     pub notes: Option<String>,
     pub user_data_dir: String,
     pub created_at: String,
+    /// Persistent CloakBrowser `--fingerprint=<seed>` (10000..=99999).
+    /// Locked per profile so reopen keeps the same UA/GPU fingerprint.
+    /// Old JSON without this field deserializes as None; Python
+    /// `ensure_fingerprint_seed` / `--fresh-profile` (regenerate=True) backfills
+    /// or voids it. There is no Rust wipe/fresh path — regenerate via Python.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_seed: Option<u32>,
 }
 
 /// New layout: profiles/<name>/
@@ -96,6 +115,7 @@ pub fn create(root: &Path, name: &str, proxy: Option<String>, notes: Option<Stri
         notes,
         user_data_dir: udir.to_string_lossy().to_string(),
         created_at: Utc::now().to_rfc3339(),
+        fingerprint_seed: Some(mint_fingerprint_seed()),
     };
     write_profile(root, &profile)?;
     Ok(profile)
@@ -200,6 +220,7 @@ pub fn redacted_view(p: &Profile) -> serde_json::Value {
         "notes": p.notes,
         "user_data_dir": p.user_data_dir,
         "created_at": p.created_at,
+        "fingerprint_seed": p.fingerprint_seed,
     })
 }
 

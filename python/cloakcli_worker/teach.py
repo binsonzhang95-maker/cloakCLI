@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .browser import launch_context
-from .paths import PathTrustError, ensure_under_root, set_root
+from .paths import PathTrustError, ensure_under_root, get_root, set_root
 from .redact import redact_any, redact_text
 from .teach_hub import (
     TeachHubClient,
@@ -173,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         headed=True,
         proxy=args.proxy,
         extension_paths=[str(ext)],
+        profiles_root=get_root() / "profiles",
     )
     try:
         from .browser import get_page

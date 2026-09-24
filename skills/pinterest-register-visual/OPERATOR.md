@@ -24,9 +24,12 @@ python3 scripts/run_pinterest_register_visual_mm.py --dry-run --profile geo02
 ## 1. Headed launch (runner does this — do not spawn Chrome)
 
 ```python
-# NEVER system Chrome — CloakBrowser only. No fingerprint knobs.
+# NEVER system Chrome — CloakBrowser only.
+# Use persisted fingerprint_seed from profile.json; do not randomize per launch.
 from cloakbrowser import launch_persistent_context
-kwargs = {"user_data_dir": str(ud), "headless": False}
+from cloakcli_worker.fingerprint import ensure_fingerprint_seed, fingerprint_chrome_args
+seed = ensure_fingerprint_seed(profile_meta_path)  # persisted; do not randomize per launch
+kwargs = {"user_data_dir": str(ud), "headless": False, "args": fingerprint_chrome_args(seed)}
 if meta.get("proxy"):
     kwargs["proxy"] = meta["proxy"]  # udeal/geo as bound in profile.json
 ctx = launch_persistent_context(**kwargs)
@@ -109,5 +112,5 @@ Allowed `status`: loaded from this package `manifest.json` (`registered_ok` | `b
 - Force a proxy different from `profile.json`.
 - Put secrets in screenshots filenames, chat, or skill files.
 - Close the browser before same-session nurture completes.
-- Change fingerprint / cloakbrowser launch fingerprint knobs.
+- Randomize CloakBrowser fingerprint per launch (use persisted fingerprint_seed).
 - Pass `--api-key` on the command line.

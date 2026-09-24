@@ -5,7 +5,8 @@ Live path ports the geo46 explore r2 flow (2026-09-23, pin 1152217885972567993).
 Explore artifacts under artifacts/pinterest/create-pin/ stay the evidence reference.
 
 Hard rules:
-- CloakBrowser launch_persistent_context only. Never system Chrome. No fingerprint knobs.
+- CloakBrowser launch_persistent_context only. Never system Chrome.
+- Use persisted fingerprint_seed from profile.json; do not randomize per launch.
 - Prefer data/profiles/<id>-pinterest-run. Proxy comes from profiles/<id>/profile.json and is never logged.
 - UI clicks go through human_click_locator (trail, hover, mouse down/up).
 - Title, description, and new board name go through human_type_text. No element fill.
@@ -207,6 +208,9 @@ def find_root(start: Path | None = None) -> Path:
 ROOT = find_root()
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
+_py = ROOT / "python"
+if str(_py) not in sys.path:
+    sys.path.insert(0, str(_py))
 
 from pinterest_nurture_behavior import (  # noqa: E402
     ensure_page_visible,
@@ -648,13 +652,26 @@ def typing_ok(typed: dict[str, Any], text: str) -> bool:
     return int(typed.get("typed") or 0) >= len(text)
 
 
-def launch_cloakbrowser(ud: Path, headed: bool, proxy: str | None) -> Any:
-    """Persistent CloakBrowser only. No system Chrome. No fingerprint knobs."""
+def launch_cloakbrowser(
+    ud: Path,
+    headed: bool,
+    proxy: str | None,
+    *,
+    fingerprint_seed: int | None = None,
+) -> Any:
+    """Persistent CloakBrowser only. Never system Chrome.
+
+    Use persisted fingerprint_seed from profile.json; do not randomize per launch.
+    """
     from cloakbrowser import launch_persistent_context
+    from cloakcli_worker.fingerprint import fingerprint_chrome_args, log_fingerprint_seed
 
     kwargs: dict[str, Any] = {"user_data_dir": str(ud), "headless": not headed}
     if proxy:
         kwargs["proxy"] = proxy
+    if fingerprint_seed is not None:
+        kwargs["args"] = fingerprint_chrome_args(fingerprint_seed)
+        log_fingerprint_seed(fingerprint_seed)
     return launch_persistent_context(**kwargs)
 
 
@@ -1212,6 +1229,10 @@ def run_live(args: argparse.Namespace, root: Path, out: Path, result: dict[str, 
     proxy_s = proxy if isinstance(proxy, str) and proxy.strip() else None
     result["proxy_set"] = bool(proxy_s)
     result["user_data_dir"] = rel_to_root(ud, root)
+    meta_path = root / "profiles" / args.profile / "profile.json"
+    from cloakcli_worker.fingerprint import ensure_fingerprint_seed
+
+    fp_seed = ensure_fingerprint_seed(meta_path) if meta_path.is_file() else None
     reset_session_mouse()
     log(
         {
@@ -1226,7 +1247,7 @@ def run_live(args: argparse.Namespace, root: Path, out: Path, result: dict[str, 
     ctx = None
     page = None
     try:
-        ctx = launch_cloakbrowser(ud, bool(args.headed), proxy_s)
+        ctx = launch_cloakbrowser(ud, bool(args.headed), proxy_s, fingerprint_seed=fp_seed)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             page.set_viewport_size({"width": 1440, "height": 960})

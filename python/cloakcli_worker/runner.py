@@ -144,7 +144,24 @@ def run_skill(
 
     _validate_params(skill, variables)
 
-    ctx = launch_context(user_data_dir=str(user_data_safe), headed=headed, proxy=proxy)
+    # Persist fingerprint_seed from profiles/*/profile.json when resolvable
+    # (by user_data_dir match). No seed → cloakbrowser random for this launch only.
+    profiles_root = project_root / "profiles"
+    profile_name = None
+    if isinstance(variables.get("profile"), str) and variables["profile"].strip():
+        profile_name = variables["profile"].strip()
+    meta_path = None
+    if profile_name:
+        candidate = profiles_root / profile_name / "profile.json"
+        if candidate.is_file():
+            meta_path = candidate
+    ctx = launch_context(
+        user_data_dir=str(user_data_safe),
+        headed=headed,
+        proxy=proxy,
+        profile_meta_path=meta_path,
+        profiles_root=profiles_root,
+    )
     cookie_meta = None
     if cookie_file:
         cookie_safe = ensure_under_root(cookie_file, project_root)

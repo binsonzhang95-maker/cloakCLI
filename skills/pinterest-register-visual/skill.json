@@ -21,7 +21,7 @@
     },
     {
       "action": "note",
-      "text": "LAUNCH: Runner opens headed CloakBrowser persistent context with profile proxy. Do not wipe user_data_dir unless --fresh-profile at attempt start (refuse if .cloak_session_ok). Do not change fingerprint knobs."
+      "text": "LAUNCH: Runner opens headed CloakBrowser persistent context with profile proxy. Do not wipe user_data_dir unless --fresh-profile at attempt start (refuse if .cloak_session_ok). Use persisted fingerprint_seed from profile.json; do not randomize per launch."
     },
     {
       "action": "note",

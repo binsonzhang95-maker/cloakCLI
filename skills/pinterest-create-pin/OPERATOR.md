@@ -23,7 +23,7 @@ not contain the nurture behavior module.
 - One account, one CloakCLI profile. `cloakbrowser.launch_persistent_context` only.
 - Prefer `data/profiles/<PROFILE>-pinterest-run` when that directory exists.
 - Proxy is read from `profiles/<PROFILE>/profile.json` and never logged.
-- Never system Chrome. No fingerprint or launch knobs.
+- Never system Chrome. Use persisted fingerprint_seed from profile.json; do not randomize per launch.
 - No teleport click. No `fill` for title, description, or new board name.
 - Publish only `[data-test-id="storyboard-creation-nav-done"]`, and only after
   `[data-test-id="board-dropdown-placeholder"]` is gone.

@@ -34,7 +34,7 @@ Skill package entry is `python_runner` → `scripts/run_pinterest_register_visua
 6. Do **not** wipe live `user_data_dir` unless `--fresh-profile` at **attempt start** (refused if `.cloak_session_ok` exists).
 7. Do not commit/push secrets; do not embed tokens/passwords in README / OPERATOR / scripts.
 8. **Never close before same-session nurture** (unless explicit `--skip-nurture`). Independent nurture minutes later is not the primary path.
-9. Do **not** change fingerprint / cloakbrowser launch fingerprint knobs.
+9. Use persisted `fingerprint_seed` from profile.json; do not randomize per launch.
 10. Do **not** pass `--api-key` on the CLI (shell history). Use env / `config/llm.json`.
 
 ## LLM env (product, OpenAI-compatible + Grok)

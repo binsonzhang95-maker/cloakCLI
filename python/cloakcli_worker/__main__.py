@@ -106,7 +106,21 @@ def _cmd_open(req_id: str, req: dict[str, Any]) -> dict[str, Any]:
     url = req.get("url") or "about:blank"
     profile = req.get("profile") or "default"
 
-    ctx = launch_context(user_data_dir=user_data_dir, headed=headed, proxy=proxy)
+    root = get_root()
+    profiles_root = root / "profiles"
+    meta_path = None
+    # Prefer explicit profile name → profiles/<name>/profile.json
+    if profile and profile != "default":
+        candidate = profiles_root / str(profile) / "profile.json"
+        if candidate.is_file():
+            meta_path = candidate
+    ctx = launch_context(
+        user_data_dir=user_data_dir,
+        headed=headed,
+        proxy=proxy,
+        profile_meta_path=meta_path,
+        profiles_root=profiles_root,
+    )
 
     cookie_meta = None
     cookie_file = _trusted_path(req, "cookie_file")

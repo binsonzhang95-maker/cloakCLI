@@ -42,6 +42,9 @@ _HERE = Path(__file__).resolve()
 ROOT = _HERE.parents[1]
 if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
+_py = ROOT / "python"
+if str(_py) not in sys.path:
+    sys.path.insert(0, str(_py))
 
 from pinterest_nurture_behavior import (  # noqa: E402
     hang_before_close,
@@ -773,8 +776,14 @@ def main() -> int:
     base_uid = imap_max_uid(args.secrets)
 
     from cloakbrowser import launch_persistent_context
+    from cloakcli_worker.fingerprint import (  # noqa: E402
+        ensure_fingerprint_seed,
+        fingerprint_chrome_args,
+        log_fingerprint_seed,
+    )
 
-    meta = json.loads((ROOT / "profiles" / args.profile / "profile.json").read_text())
+    meta_path = ROOT / "profiles" / args.profile / "profile.json"
+    meta = json.loads(meta_path.read_text())
     proxy = meta.get("proxy")
     ud = ROOT / "data/profiles" / f"{args.profile}-pinterest-run"
     if getattr(args, "fresh_profile", False):
@@ -796,8 +805,16 @@ def main() -> int:
             return 6
         if ud.exists():
             shutil.rmtree(ud)
+        # Void prior fingerprint when wiping user_data_dir
+        ensure_fingerprint_seed(meta_path, regenerate=True)
     ud.mkdir(parents=True, exist_ok=True)
-    kwargs = {"user_data_dir": str(ud), "headless": not headed}
+    seed = ensure_fingerprint_seed(meta_path)
+    log_fingerprint_seed(seed)
+    kwargs = {
+        "user_data_dir": str(ud),
+        "headless": not headed,
+        "args": fingerprint_chrome_args(seed),
+    }
     if proxy:
         kwargs["proxy"] = proxy
     ctx = launch_persistent_context(**kwargs)
