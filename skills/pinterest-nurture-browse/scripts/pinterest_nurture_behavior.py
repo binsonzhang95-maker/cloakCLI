@@ -3,9 +3,9 @@
 
 Continuous randomized mouse trails, inertial scroll, log-normal/gamma pauses,
 session personas, pin linger planning, visibility keepalive, micro reverse
-scroll, and mixed close-path weights (nurture 0.2.3). Used by nurture browse
-and register runners. Stdlib only. Every pause site must re-sample independently
-(no fixed identical timing chains across steps/runs).
+scroll, mixed close-path weights, and idle ambient mouse wander (nurture 0.2.4; DEFAULT OFF in 0.2.5). 0.2.5 P0: BehaviorProfile params + split RNG streams + session budgets (engineering de-homology, not an anti-detect claim).
+Used by nurture browse and register runners. Stdlib only. Every pause site must
+re-sample independently (no fixed identical timing chains across steps/runs).
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import math
 import os
 import random
 import time
+from dataclasses import dataclass
 from typing import Any
 
 PERSONA_NAMES = ("browse_only", "light_like", "deep_browse", "bounce_early")
@@ -50,7 +51,141 @@ _SESSION_MOUSE: dict[str, float] = {"x": 0.0, "y": 0.0}
 
 
 def _as_rng(rng: Any) -> Any:
-    return random if rng is None else rng
+    """Resolve rng. Bare None yields a fresh Random() — not the process-global module."""
+    if rng is not None:
+        return rng
+    return random.Random()
+
+
+# --- nurture 0.2.5 P0: resolved config + split streams (injected by runner) ---
+
+@dataclass
+class BehaviorContext:
+    """Session-scoped resolved config + RNG streams. Prefer over process-global random."""
+
+    config: Any = None  # ResolvedBehaviorConfig | None
+    streams: Any = None  # BehaviorStreams | None
+    budget: Any = None  # SessionBudget | None
+    idle_wander_enabled: bool = False
+    end_reason: str | None = None
+
+    def pause_rng(self) -> Any:
+        if self.streams is not None:
+            return self.streams.pause_rng
+        return random.Random()
+
+    def scroll_rng(self) -> Any:
+        if self.streams is not None:
+            return self.streams.scroll_rng
+        return random.Random()
+
+    def session_rng(self) -> Any:
+        if self.streams is not None:
+            return self.streams.session_rng
+        return random.Random()
+
+    def optional_rng(self) -> Any:
+        if self.streams is not None:
+            return self.streams.optional_rng
+        return random.Random()
+
+
+_BEHAVIOR_CTX: BehaviorContext | None = None
+
+
+def set_behavior_context(ctx: BehaviorContext | None) -> BehaviorContext | None:
+    """Install (or clear) the process-local behavior context for this nurture session."""
+    global _BEHAVIOR_CTX
+    _BEHAVIOR_CTX = ctx
+    return _BEHAVIOR_CTX
+
+
+def get_behavior_context() -> BehaviorContext | None:
+    return _BEHAVIOR_CTX
+
+
+def _ctx_rng(rng: Any, *, kind: str = "session") -> Any:
+    """Prefer explicit rng; else context substream; else fresh Random (never share module state across profiles)."""
+    if rng is not None:
+        return rng
+    ctx = _BEHAVIOR_CTX
+    if ctx is not None:
+        if kind == "pause":
+            return ctx.pause_rng()
+        if kind == "scroll":
+            return ctx.scroll_rng()
+        if kind == "optional":
+            return ctx.optional_rng()
+        return ctx.session_rng()
+    # Isolated ephemeral RNG — do not fall back to process-global random module state.
+    return random.Random()
+
+
+def _cfg_pause_scale() -> float:
+    ctx = _BEHAVIOR_CTX
+    if ctx is not None and ctx.config is not None:
+        return float(getattr(ctx.config, "pause_scale", 1.0) or 1.0)
+    return 1.0
+
+
+def _cfg_pause_dispersion() -> float:
+    ctx = _BEHAVIOR_CTX
+    if ctx is not None and ctx.config is not None:
+        return float(getattr(ctx.config, "pause_dispersion", 1.0) or 1.0)
+    return 1.0
+
+
+def _cfg_scroll_step_scale() -> float:
+    ctx = _BEHAVIOR_CTX
+    if ctx is not None and ctx.config is not None:
+        return float(getattr(ctx.config, "scroll_step_scale", 1.0) or 1.0)
+    return 1.0
+
+
+def _cfg_scroll_decay() -> float:
+    ctx = _BEHAVIOR_CTX
+    if ctx is not None and ctx.config is not None:
+        return float(getattr(ctx.config, "scroll_decay", 1.0) or 1.0)
+    return 1.0
+
+
+def optional_action_weight(key: str, default: float = 1.0) -> float:
+    ctx = _BEHAVIOR_CTX
+    if ctx is not None and ctx.config is not None:
+        try:
+            return float(ctx.config.optional_weight(key, default))
+        except Exception:
+            return float(default)
+    return float(default)
+
+
+def is_idle_wander_enabled() -> bool:
+    ctx = _BEHAVIOR_CTX
+    if ctx is not None:
+        return bool(ctx.idle_wander_enabled)
+    return False
+
+
+def budget_allows(*, action: bool = False, state: str | None = None, state_cap: int | None = None) -> bool:
+    """Return False when session budget says stop (and set ctx.end_reason)."""
+    ctx = _BEHAVIOR_CTX
+    if ctx is None or ctx.budget is None:
+        return True
+    if ctx.budget.check():
+        ctx.end_reason = ctx.budget.end_reason
+        return False
+    if state is not None:
+        if not ctx.budget.visit_state(state, cap=state_cap):
+            if ctx.budget.end_reason:
+                ctx.end_reason = ctx.budget.end_reason
+            return False
+    if action:
+        reason = ctx.budget.record_action()
+        if reason:
+            ctx.end_reason = reason
+            return False
+    return True
+
 
 
 def reset_session_mouse(x: float = 0.0, y: float = 0.0) -> dict[str, float]:
@@ -70,17 +205,27 @@ def sample_lognormal_ms(
     mu: float | None = None,
     sigma: float = 0.5,
     rng: Any = None,
+    apply_behavior_scale: bool = False,
 ) -> int:
-    """Truncated log-normal milliseconds. Not uniform randint."""
-    rng = _as_rng(rng)
+    """Truncated log-normal milliseconds. Not uniform randint.
+
+    When apply_behavior_scale=True, sigma is multiplied by profile pause_dispersion
+    and the sampled value by pause_scale (still clamped to [lo, hi]).
+    """
+    rng = _ctx_rng(rng, kind="pause") if apply_behavior_scale else _as_rng(rng)
     lo = max(0, int(lo_ms))
     hi = max(lo, int(hi_ms))
     if hi <= lo:
         return lo
+    use_sigma = float(sigma)
+    if apply_behavior_scale:
+        use_sigma = max(0.15, min(1.2, use_sigma * _cfg_pause_dispersion()))
     if mu is None:
         mid = math.sqrt(max(1.0, float(lo)) * float(hi))
         mu = math.log(mid / 1000.0)
-    val = int(rng.lognormvariate(mu, float(sigma)) * 1000.0)
+    val = int(rng.lognormvariate(mu, use_sigma) * 1000.0)
+    if apply_behavior_scale:
+        val = int(round(val * _cfg_pause_scale()))
     return max(lo, min(hi, val))
 
 
@@ -109,9 +254,15 @@ def sample_pause_ms(
     rng: Any = None,
     kind: str = "lognormal",
 ) -> int:
+    rng = _ctx_rng(rng, kind="pause")
     if kind == "gamma":
-        return sample_gamma_ms(lo_ms, hi_ms, rng=rng)
-    return sample_lognormal_ms(lo_ms, hi_ms, rng=rng)
+        # Scale gamma sample via pause_scale after clamp-band sample.
+        raw = sample_gamma_ms(lo_ms, hi_ms, rng=rng)
+        scaled = int(round(raw * _cfg_pause_scale()))
+        lo = max(0, int(lo_ms))
+        hi = max(lo, int(hi_ms))
+        return max(lo, min(hi, scaled))
+    return sample_lognormal_ms(lo_ms, hi_ms, rng=rng, apply_behavior_scale=True)
 
 
 def sample_key_delay_ms(rng: Any = None) -> int:
@@ -405,11 +556,15 @@ def inertial_scroll_plan(
     rng: Any = None,
     direction: int = 1,
 ) -> list[tuple[int, int]]:
-    """[(delta_y, wait_ms), ...] with v(t)=v0 e^{-kt}, a pause, then slight reverse."""
-    rng = _as_rng(rng)
+    """[(delta_y, wait_ms), ...] with v(t)=v0 e^{-kt}, a pause, then slight reverse.
+
+    Profile scroll_step_scale multiplies v0; scroll_decay multiplies k (clamped).
+    """
+    rng = _ctx_rng(rng, kind="scroll")
     sign = 1 if direction >= 0 else -1
-    v0 = rng.uniform(320.0, 980.0) * sign
-    k = rng.uniform(1.7, 3.4)
+    v0 = rng.uniform(320.0, 980.0) * sign * _cfg_scroll_step_scale()
+    k = rng.uniform(1.7, 3.4) * _cfg_scroll_decay()
+    k = max(1.2, min(4.5, float(k)))
     dt = 0.018
     min_v = rng.uniform(14.0, 32.0)
     steps: list[tuple[int, int]] = []
@@ -471,6 +626,351 @@ def play_ambient_drift(
     return n
 
 
+# --- nurture 0.2.4: idle ambient mouse wander (between actions / during dwell) ---
+#
+# Small (frequent): every ~2–8s of idle/dwell, short bezier hop 15–80px, no click.
+# Large (occasional): every ~25–60s, one loose lap/half-lap at radius 120–280px.
+# Scheduler skips motion while busy (intentional click/type/scroll in progress).
+
+IDLE_SMALL_INTERVAL_LO_MS = 2_000
+IDLE_SMALL_INTERVAL_HI_MS = 8_000
+IDLE_SMALL_DIST_LO_PX = 15.0
+IDLE_SMALL_DIST_HI_PX = 80.0
+
+IDLE_LARGE_INTERVAL_LO_MS = 25_000
+IDLE_LARGE_INTERVAL_HI_MS = 60_000
+IDLE_LARGE_RADIUS_LO_PX = 120.0
+IDLE_LARGE_RADIUS_HI_PX = 280.0
+
+# Do not start a large loop if remaining dwell budget is below this.
+IDLE_LARGE_MIN_BUDGET_MS = 900
+# Cap a single wander play so it cannot overrun a short pause slice.
+IDLE_SMALL_MAX_PLAY_MS = 700
+IDLE_LARGE_MAX_PLAY_MS = 2_800
+
+
+class IdleWanderState:
+    """Tracks next small/large due times and intentional-action busy flag."""
+
+    def __init__(self, *, rng: Any = None, now_ms: float | None = None) -> None:
+        self.rng = _as_rng(rng)
+        self.busy = False
+        self.small_count = 0
+        self.large_count = 0
+        t0 = float(now_ms) if now_ms is not None else time.monotonic() * 1000.0
+        # First small soon (0–1.2s) so short dwells/hangs still show motion; later gaps 2–8s.
+        self.next_small_at_ms = t0 + float(self.rng.randint(0, 1200))
+        self.next_large_at_ms = t0 + float(
+            sample_lognormal_ms(
+                IDLE_LARGE_INTERVAL_LO_MS,
+                IDLE_LARGE_INTERVAL_HI_MS,
+                mu=math.log(38.0),
+                sigma=0.30,
+                rng=self.rng,
+            )
+        )
+
+    def mark_busy(self) -> None:
+        self.busy = True
+
+    def mark_idle(self) -> None:
+        self.busy = False
+
+    def schedule_next_small(self, now_ms: float) -> None:
+        gap = sample_lognormal_ms(
+            IDLE_SMALL_INTERVAL_LO_MS,
+            IDLE_SMALL_INTERVAL_HI_MS,
+            mu=math.log(4.0),
+            sigma=0.35,
+            rng=self.rng,
+        )
+        self.next_small_at_ms = float(now_ms) + float(gap)
+
+    def schedule_next_large(self, now_ms: float) -> None:
+        gap = sample_lognormal_ms(
+            IDLE_LARGE_INTERVAL_LO_MS,
+            IDLE_LARGE_INTERVAL_HI_MS,
+            mu=math.log(38.0),
+            sigma=0.30,
+            rng=self.rng,
+        )
+        self.next_large_at_ms = float(now_ms) + float(gap)
+
+
+def build_idle_small_wander(
+    origin: tuple[float, float],
+    *,
+    rng: Any = None,
+) -> list[tuple[float, float, int]]:
+    """Short-amplitude bezier hop (15–80px). No click. Reuses build_mouse_path."""
+    rng = _as_rng(rng)
+    ox, oy = float(origin[0]), float(origin[1])
+    dist = float(rng.uniform(IDLE_SMALL_DIST_LO_PX, IDLE_SMALL_DIST_HI_PX))
+    ang = float(rng.uniform(0.0, 2.0 * math.pi))
+    end = (ox + dist * math.cos(ang), oy + dist * math.sin(ang))
+    return build_mouse_path((ox, oy), end, rng=rng)
+
+
+def build_idle_circle_wander(
+    origin: tuple[float, float],
+    *,
+    rng: Any = None,
+    half_lap: bool | None = None,
+) -> list[tuple[float, float, int]]:
+    """Larger looping/arc wander (radius 120–280px), one loose lap or half-lap.
+
+    Multi-segment cubic path with tremor; settles near origin. No click.
+    """
+    rng = _as_rng(rng)
+    ox, oy = float(origin[0]), float(origin[1])
+    radius = float(rng.uniform(IDLE_LARGE_RADIUS_LO_PX, IDLE_LARGE_RADIUS_HI_PX))
+    if half_lap is None:
+        half_lap = bool(rng.random() < 0.40)
+    span = math.pi * rng.uniform(0.85, 1.10) if half_lap else (2.0 * math.pi * rng.uniform(0.88, 1.08))
+    start_ang = float(rng.uniform(0.0, 2.0 * math.pi))
+    direction = 1.0 if rng.random() < 0.5 else -1.0
+    n_wp = int(rng.randint(4, 6)) if half_lap else int(rng.randint(6, 10))
+
+    waypoints: list[tuple[float, float]] = []
+    for i in range(n_wp + 1):
+        t = i / max(1, n_wp)
+        ang = start_ang + direction * span * t
+        r = radius * float(rng.uniform(0.86, 1.14))
+        waypoints.append((ox + r * math.cos(ang), oy + r * math.sin(ang)))
+
+    points: list[tuple[float, float, int]] = [
+        (ox, oy, sample_gamma_ms(8, 28, alpha=2.0, beta=8.0, rng=rng))
+    ]
+    cur = (ox, oy)
+    for wi, wp in enumerate(waypoints):
+        sdx, sdy = wp[0] - cur[0], wp[1] - cur[1]
+        slen = math.hypot(sdx, sdy) or 1.0
+        sux, suy = sdx / slen, sdy / slen
+        spx, spy = -suy, sux
+        c1off = rng.uniform(0.25, 0.45)
+        c2off = rng.uniform(0.55, 0.80)
+        lat_scale = 0.18 if wi == 0 else 0.35
+        c1lat = rng.uniform(-0.5, 0.5) * slen * lat_scale
+        c2lat = rng.uniform(-0.5, 0.5) * slen * lat_scale
+        if rng.random() < 0.65:
+            c2lat = -abs(c2lat) if c1lat > 0 else abs(c2lat)
+        p1 = (cur[0] + sux * slen * c1off + spx * c1lat, cur[1] + suy * slen * c1off + spy * c1lat)
+        p2 = (cur[0] + sux * slen * c2off + spx * c2lat, cur[1] + suy * slen * c2off + spy * c2lat)
+        n_steps = max(6, min(28, int(slen / rng.uniform(5.0, 10.0))))
+        for k in range(1, n_steps + 1):
+            tt = k / n_steps
+            bx, by = cubic_bezier(cur, p1, p2, wp, tt)
+            jamp = rng.uniform(0.5, 1.6)
+            jx = rng.gauss(0.0, jamp)
+            jy = rng.gauss(0.0, jamp)
+            ease = 1.45 - math.sin(tt * math.pi)
+            dwell = sample_gamma_ms(
+                5,
+                55,
+                alpha=2.1,
+                beta=max(5.0, 12.0 * ease),
+                rng=rng,
+            )
+            points.append((bx + jx, by + jy, dwell))
+        cur = wp
+
+    settle = (
+        ox + float(rng.uniform(-18.0, 18.0)),
+        oy + float(rng.uniform(-18.0, 18.0)),
+    )
+    # Light settle hop via existing path builder (may overshoot slightly — human-like).
+    settle_path = build_mouse_path(cur, settle, rng=rng)
+    if settle_path:
+        points.extend(settle_path[1:] if len(settle_path) > 1 else settle_path)
+    return points
+
+
+def _path_play_budget_ms(path: list[tuple[float, float, int]], *, cap_ms: int) -> list[tuple[float, float, int]]:
+    """Trim path so summed dwell stays within cap_ms (always keep ≥1 point if any)."""
+    if not path or cap_ms <= 0:
+        return []
+    out: list[tuple[float, float, int]] = []
+    spent = 0
+    for x, y, dwell in path:
+        d = max(0, int(dwell))
+        if out and spent + d > int(cap_ms):
+            break
+        out.append((float(x), float(y), d))
+        spent += d
+    return out if out else [path[0]]
+
+
+def play_idle_wander_path(
+    page: Any,
+    path: list[tuple[float, float, int]],
+    mouse: dict[str, float],
+    *,
+    budget_ms: int | None = None,
+) -> tuple[int, int]:
+    """Play path moves (no click). Optional budget trims by dwell sum.
+
+    Returns (move_count, play_ms) where play_ms is the summed dwell of played points.
+    """
+    if budget_ms is not None:
+        path = _path_play_budget_ms(path, cap_ms=int(budget_ms))
+    play_ms = sum(max(0, int(d)) for _x, _y, d in path)
+    moves = play_mouse_path(page, path, mouse)
+    return int(moves), int(play_ms)
+
+
+def idle_wander_tick(
+    page: Any,
+    mouse: dict[str, float],
+    state: IdleWanderState,
+    *,
+    now_ms: float | None = None,
+    remain_ms: int = 10_000,
+    rng: Any = None,
+    log_fn: Any = None,
+) -> dict[str, Any]:
+    """Run at most one due wander (large preferred over small) or quiet wait.
+
+    Skips motion when state.busy — still reports skipped. Never clicks.
+    Returns kind/moves/wait_ms/play_ms so callers can advance a virtual clock
+    (important when page.wait_for_timeout is a no-op stub in unit tests).
+    """
+    rng = _as_rng(rng if rng is not None else state.rng)
+    emit = log_fn if callable(log_fn) else (lambda _payload: None)
+    now = float(now_ms) if now_ms is not None else time.monotonic() * 1000.0
+    remain = max(0, int(remain_ms))
+    out: dict[str, Any] = {
+        "kind": "none",
+        "moves": 0,
+        "wait_ms": 0,
+        "play_ms": 0,
+        "skipped_busy": False,
+    }
+    if remain <= 0:
+        return out
+
+    large_due = now >= float(state.next_large_at_ms)
+    small_due = now >= float(state.next_small_at_ms)
+
+    if state.busy and (large_due or small_due):
+        out["kind"] = "skipped_busy"
+        out["skipped_busy"] = True
+        # Push due times slightly so we retry after the intentional action.
+        if large_due:
+            state.next_large_at_ms = now + float(rng.randint(400, 1200))
+        if small_due:
+            state.next_small_at_ms = now + float(rng.randint(200, 800))
+        wait = min(remain, int(rng.randint(80, 220)))
+        try:
+            page.wait_for_timeout(wait)
+        except Exception:
+            pass
+        out["wait_ms"] = wait
+        return out
+
+    origin = (float(mouse.get("x") or 0.0), float(mouse.get("y") or 0.0))
+
+    if large_due and remain >= IDLE_LARGE_MIN_BUDGET_MS:
+        path = build_idle_circle_wander(origin, rng=rng)
+        cap = min(remain, IDLE_LARGE_MAX_PLAY_MS)
+        moves, play_ms = play_idle_wander_path(page, path, mouse, budget_ms=cap)
+        state.large_count += 1
+        state.schedule_next_large(now)
+        # Avoid immediate small on top of a just-finished large.
+        state.schedule_next_small(now)
+        out.update({"kind": "large", "moves": int(moves), "wait_ms": 0, "play_ms": int(play_ms)})
+        emit({"status": "idle_wander", "kind": "large", "moves": int(moves)})
+        return out
+
+    if small_due:
+        path = build_idle_small_wander(origin, rng=rng)
+        cap = min(remain, IDLE_SMALL_MAX_PLAY_MS)
+        moves, play_ms = play_idle_wander_path(page, path, mouse, budget_ms=cap)
+        state.small_count += 1
+        state.schedule_next_small(now)
+        out.update({"kind": "small", "moves": int(moves), "wait_ms": 0, "play_ms": int(play_ms)})
+        emit({"status": "idle_wander", "kind": "small", "moves": int(moves)})
+        return out
+
+    # Quiet until next due event or remain exhausted.
+    next_due = min(float(state.next_small_at_ms), float(state.next_large_at_ms))
+    wait = int(max(1, min(remain, next_due - now)))
+    wait = max(1, min(wait, int(sample_lognormal_ms(120, 900, mu=-0.6, sigma=0.4, rng=rng))))
+    try:
+        page.wait_for_timeout(wait)
+    except Exception:
+        pass
+    out.update({"kind": "quiet", "wait_ms": wait})
+    return out
+
+
+def idle_wander_fill(
+    page: Any,
+    mouse: dict[str, float],
+    state: IdleWanderState,
+    *,
+    budget_ms: int,
+    rng: Any = None,
+    log_fn: Any = None,
+    now_ms: float | None = None,
+    force: bool = False,
+) -> int:
+    """Spend up to budget_ms in scheduled idle small/large wanders + quiet waits.
+
+    Used during nurture dwell pauses (and hang). Respects state.busy.
+    Advances a virtual clock from wait/play ms so unit-test stubs that do not
+    sleep still terminate. Returns ms accounted toward the budget.
+
+    0.2.5: DEFAULT OFF unless force=True or behavior context idle_wander_enabled.
+    When disabled, performs a plain wait (no ambient motion).
+    """
+    budget = max(0, int(budget_ms))
+    if budget <= 0:
+        return 0
+    enabled = bool(force) or is_idle_wander_enabled()
+    if not enabled:
+        try:
+            page.wait_for_timeout(budget)
+        except Exception:
+            pass
+        return budget
+    rng = _ctx_rng(rng if rng is not None else state.rng, kind="optional")
+    virtual_now = float(now_ms) if now_ms is not None else time.monotonic() * 1000.0
+    # Fast path for very short pauses.
+    if budget < 500:
+        try:
+            page.wait_for_timeout(budget)
+        except Exception:
+            pass
+        return budget
+
+    spent = 0
+    guard = 0
+    while spent < budget and guard < 10_000:
+        guard += 1
+        remain = budget - spent
+        tick = idle_wander_tick(
+            page,
+            mouse,
+            state,
+            now_ms=virtual_now,
+            remain_ms=remain,
+            rng=rng,
+            log_fn=log_fn,
+        )
+        advanced = int(tick.get("wait_ms") or 0) + int(tick.get("play_ms") or 0)
+        if advanced <= 0:
+            advanced = min(remain, 50)
+            try:
+                page.wait_for_timeout(advanced)
+            except Exception:
+                pass
+        # Never overrun the caller's pause budget.
+        advanced = min(advanced, remain)
+        spent += advanced
+        virtual_now += float(advanced)
+    return int(spent)
+
+
 # Default hang band before ctx.close: ~60–180s lognormal (geometric mean ~104s).
 HANG_BEFORE_CLOSE_LO_MS = 60_000
 HANG_BEFORE_CLOSE_HI_MS = 180_000
@@ -515,7 +1015,7 @@ def hang_before_close(
 
     Samples lognormal clamped to [lo_ms, hi_ms] (default 60–180s) unless
     CLOAKCLI_HANG_BEFORE_CLOSE_MS is set (use 0 in unit tests to skip).
-    During the hang: ambient mouse drift + quiet waits (not pure sleep).
+    During the hang: idle ambient mouse wander (small + occasional large) + quiet waits.
     """
     if mouse is None:
         mouse = session_mouse()
@@ -527,34 +1027,20 @@ def hang_before_close(
     emit({"status": "hang_before_close", "ms": target})
     if target <= 0:
         return 0
+    # Ambient idle wander (small + occasional large) for the hang budget.
+    state = IdleWanderState(rng=rng)
     t0 = time.monotonic()
-    spent = 0
-    while spent < target:
-        remain = target - spent
-        drift_budget = min(
-            remain,
-            sample_lognormal_ms(250, 900, mu=-0.8, sigma=0.4, rng=rng),
-        )
-        try:
-            play_ambient_drift(page, mouse, rng=rng, budget_ms=int(drift_budget))
-        except Exception:
+    try:
+        idle_wander_fill(page, mouse, state, budget_ms=target, rng=rng, log_fn=emit)
+    except Exception:
+        # Fallback: quiet wait so hang still approximately honors target.
+        remain = max(0, target - int((time.monotonic() - t0) * 1000.0))
+        if remain > 0:
             try:
-                page.wait_for_timeout(int(drift_budget))
+                page.wait_for_timeout(int(remain))
             except Exception:
                 pass
-        spent += int(drift_budget)
-        if spent >= target:
-            break
-        quiet = min(
-            target - spent,
-            sample_lognormal_ms(400, 1800, mu=-0.2, sigma=0.35, rng=rng),
-        )
-        try:
-            page.wait_for_timeout(int(quiet))
-        except Exception:
-            pass
-        spent += int(quiet)
-    elapsed = int(max(spent, (time.monotonic() - t0) * 1000.0))
+    elapsed = int(max(target, (time.monotonic() - t0) * 1000.0))
     emit({"status": "hang_before_close_done", "ms": target, "elapsed_ms": elapsed})
     return elapsed
 

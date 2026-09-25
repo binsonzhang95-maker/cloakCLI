@@ -1,0 +1,270 @@
+"""Nurture 0.2.5 P0 — BehaviorProfile persistence, split RNG, idle-off, budgets."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import random
+import statistics
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "python"))
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from cloakcli_worker.behavior_profile import (  # noqa: E402
+    GENERATOR_VERSION,
+    BehaviorProfile,
+    ProfileSessionLock,
+    SessionBudget,
+    bump_session_seq,
+    effective_params_hash,
+    ensure_behavior_profile,
+    idle_wander_enabled,
+    make_behavior_streams,
+    resolve_behavior_config,
+)
+
+
+def _load(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod  # required before @dataclass exec
+    spec.loader.exec_module(mod)
+    return mod
+
+
+bh = _load(ROOT / "scripts" / "pinterest_nurture_behavior.py", "pinterest_nurture_behavior_025")
+
+
+class BehaviorProfilePersistenceTests(unittest.TestCase):
+    def test_ensure_stable_across_restart(self) -> None:
+        td = Path(tempfile.mkdtemp(prefix="bp_stable_"))
+        meta = td / "profile.json"
+        meta.write_text(
+            json.dumps({"name": "a", "fingerprint_seed": 42424, "notes": "keep"}) + "\n",
+            encoding="utf-8",
+        )
+        p1 = ensure_behavior_profile(meta)
+        p2 = ensure_behavior_profile(meta)
+        self.assertEqual(p1, p2)
+        self.assertEqual(p1.behavior_seed, p2.behavior_seed)
+        self.assertEqual(effective_params_hash(p1), effective_params_hash(p2))
+        data = json.loads(meta.read_text(encoding="utf-8"))
+        self.assertEqual(data["fingerprint_seed"], 42424)
+        self.assertEqual(data["notes"], "keep")
+        self.assertIn("behavior_profile", data)
+
+    def test_two_profiles_can_differ_fingerprint_unchanged(self) -> None:
+        td = Path(tempfile.mkdtemp(prefix="bp_two_"))
+        a = td / "a" / "profile.json"
+        b = td / "b" / "profile.json"
+        a.parent.mkdir(); b.parent.mkdir()
+        a.write_text(json.dumps({"name": "a", "fingerprint_seed": 11111}) + "\n", encoding="utf-8")
+        b.write_text(json.dumps({"name": "b", "fingerprint_seed": 11111}) + "\n", encoding="utf-8")
+        pa = ensure_behavior_profile(a, rng=random.Random(1))
+        pb = ensure_behavior_profile(b, rng=random.Random(2))
+        self.assertEqual(json.loads(a.read_text())["fingerprint_seed"], 11111)
+        self.assertEqual(json.loads(b.read_text())["fingerprint_seed"], 11111)
+        # Different mint rng => different behavior seeds/params (almost surely)
+        self.assertTrue(
+            pa.behavior_seed != pb.behavior_seed
+            or effective_params_hash(pa) != effective_params_hash(pb)
+        )
+
+    def test_effective_hash_ignores_session_seq(self) -> None:
+        td = Path(tempfile.mkdtemp(prefix="bp_hash_"))
+        meta = td / "profile.json"
+        meta.write_text(json.dumps({"name": "h"}) + "\n", encoding="utf-8")
+        p0 = ensure_behavior_profile(meta, rng=random.Random(9))
+        h0 = effective_params_hash(p0)
+        p1 = bump_session_seq(meta)
+        self.assertEqual(p1.session_seq, p0.session_seq + 1)
+        self.assertEqual(effective_params_hash(p1), h0)
+
+
+class SplitRngTests(unittest.TestCase):
+    def test_profile_a_actions_do_not_affect_b(self) -> None:
+        sa = make_behavior_streams(101, 1)
+        sb = make_behavior_streams(202, 1)
+        # Drain A heavily
+        for _ in range(50):
+            sa.pause_rng.random()
+            sa.session_rng.random()
+        b_before = [sb.pause_rng.random() for _ in range(10)]
+        sb2 = make_behavior_streams(202, 1)
+        b_fresh = [sb2.pause_rng.random() for _ in range(10)]
+        self.assertEqual(b_before, b_fresh)
+
+    def test_session_seq_changes_prefix(self) -> None:
+        s0 = make_behavior_streams(55, 0)
+        s1 = make_behavior_streams(55, 1)
+        a = [s0.pause_rng.random() for _ in range(8)]
+        b = [s1.pause_rng.random() for _ in range(8)]
+        self.assertNotEqual(a, b)
+
+    def test_pause_and_scroll_streams_independent(self) -> None:
+        s = make_behavior_streams(7, 3)
+        # Same number of draws from each — sequences differ (different streams)
+        p = [s.pause_rng.random() for _ in range(20)]
+        s2 = make_behavior_streams(7, 3)
+        sc = [s2.scroll_rng.random() for _ in range(20)]
+        self.assertNotEqual(p, sc)
+
+
+class ParamScaleTests(unittest.TestCase):
+    def test_pause_scale_shifts_samples(self) -> None:
+        from dataclasses import dataclass
+
+        @dataclass
+        class Cfg:
+            pause_scale: float
+            pause_dispersion: float = 1.0
+            scroll_step_scale: float = 1.0
+            scroll_decay: float = 1.0
+
+            def optional_weight(self, key: str, default: float = 1.0) -> float:
+                return default
+
+        bh.set_behavior_context(None)
+        base = [
+            bh.sample_pause_ms(400, 6000, rng=random.Random(i)) for i in range(60)
+        ]
+        bh.set_behavior_context(
+            bh.BehaviorContext(config=Cfg(pause_scale=1.35), idle_wander_enabled=False)
+        )
+        scaled = [
+            bh.sample_pause_ms(400, 6000, rng=random.Random(i)) for i in range(60)
+        ]
+        bh.set_behavior_context(None)
+        self.assertGreater(statistics.mean(scaled), statistics.mean(base) * 1.05)
+
+    def test_scroll_step_scale_shifts_plan_magnitude(self) -> None:
+        from dataclasses import dataclass
+
+        @dataclass
+        class Cfg:
+            pause_scale: float = 1.0
+            pause_dispersion: float = 1.0
+            scroll_step_scale: float = 1.0
+            scroll_decay: float = 1.0
+
+            def optional_weight(self, key: str, default: float = 1.0) -> float:
+                return default
+
+        def mag(plan):
+            return sum(abs(dy) for dy, _w in plan if dy)
+
+        bh.set_behavior_context(bh.BehaviorContext(config=Cfg(scroll_step_scale=1.0)))
+        base = [
+            mag(bh.inertial_scroll_plan(rng=random.Random(i), direction=1))
+            for i in range(40)
+        ]
+        bh.set_behavior_context(bh.BehaviorContext(config=Cfg(scroll_step_scale=1.25)))
+        big = [
+            mag(bh.inertial_scroll_plan(rng=random.Random(i), direction=1))
+            for i in range(40)
+        ]
+        bh.set_behavior_context(None)
+        self.assertGreater(statistics.mean(big), statistics.mean(base) * 1.05)
+
+
+class IdleDefaultOffTests(unittest.TestCase):
+    def test_env_and_flag_default_off(self) -> None:
+        prev = os.environ.pop("CLOAKCLI_IDLE_WANDER", None)
+        try:
+            self.assertFalse(idle_wander_enabled())
+            self.assertFalse(idle_wander_enabled(flag=False))
+            self.assertTrue(idle_wander_enabled(flag=True))
+            self.assertTrue(idle_wander_enabled(env={"CLOAKCLI_IDLE_WANDER": "1"}))
+        finally:
+            if prev is not None:
+                os.environ["CLOAKCLI_IDLE_WANDER"] = prev
+
+    def test_idle_fill_is_quiet_when_disabled(self) -> None:
+        class Page:
+            def __init__(self) -> None:
+                self.waits: list[int] = []
+                self.mouse = type("M", (), {"move": lambda *a, **k: None})()
+
+            def wait_for_timeout(self, ms: int) -> None:
+                self.waits.append(int(ms))
+
+        bh.set_behavior_context(bh.BehaviorContext(idle_wander_enabled=False))
+        page = Page()
+        mouse = {"x": 10.0, "y": 20.0}
+        st = bh.IdleWanderState(rng=random.Random(1))
+        spent = bh.idle_wander_fill(page, mouse, st, budget_ms=1500, rng=random.Random(1))
+        bh.set_behavior_context(None)
+        self.assertEqual(spent, 1500)
+        self.assertEqual(sum(page.waits), 1500)
+        self.assertEqual(st.small_count + st.large_count, 0)
+
+
+class BudgetTerminateTests(unittest.TestCase):
+    def test_max_actions_sets_end_reason(self) -> None:
+        budget = SessionBudget(
+            max_session_elapsed_sec=9999, max_actions=3, max_state_visits=100
+        )
+        self.assertIsNone(budget.check())
+        self.assertIsNone(budget.record_action())
+        self.assertIsNone(budget.record_action())
+        self.assertEqual(budget.record_action(), "budget_actions")
+        self.assertEqual(budget.end_reason, "budget_actions")
+
+    def test_elapsed_budget(self) -> None:
+        budget = SessionBudget(
+            max_session_elapsed_sec=0.01, max_actions=100, max_state_visits=100
+        )
+        time.sleep(0.03)
+        self.assertEqual(budget.check(), "budget_elapsed")
+
+    def test_profile_lock_mutual_exclusion(self) -> None:
+        td = Path(tempfile.mkdtemp(prefix="bp_lock_"))
+        meta = td / "profile.json"
+        meta.write_text("{}\n", encoding="utf-8")
+        lock1 = ProfileSessionLock(meta)
+        lock2 = ProfileSessionLock(meta)
+        self.assertTrue(lock1.acquire(blocking=False))
+        self.assertFalse(lock2.acquire(blocking=False))
+        lock1.release()
+        self.assertTrue(lock2.acquire(blocking=False))
+        lock2.release()
+
+
+class VersionAndMirrorTests(unittest.TestCase):
+    def test_runner_version_0_2_5(self) -> None:
+        runner = _load(
+            ROOT / "scripts" / "run_pinterest_nurture_browse.py",
+            "run_pinterest_nurture_browse_025",
+        )
+        self.assertEqual(runner.VERSION, "0.2.5")
+        ns = runner.build_arg_parser().parse_args(["--profile", "geo46"])
+        self.assertFalse(getattr(ns, "idle_wander", True))
+        ns2 = runner.build_arg_parser().parse_args(
+            ["--profile", "geo46", "--idle-wander"]
+        )
+        self.assertTrue(ns2.idle_wander)
+
+    def test_skill_mirror_and_manifest(self) -> None:
+        skill = ROOT / "skills" / "pinterest-nurture-browse"
+        self.assertEqual(
+            (ROOT / "scripts" / "run_pinterest_nurture_browse.py").read_bytes(),
+            (skill / "scripts" / "run_pinterest_nurture_browse.py").read_bytes(),
+        )
+        self.assertEqual(
+            (ROOT / "scripts" / "pinterest_nurture_behavior.py").read_bytes(),
+            (skill / "scripts" / "pinterest_nurture_behavior.py").read_bytes(),
+        )
+        manifest = json.loads((skill / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["version"], "0.2.5")
+        self.assertEqual(GENERATOR_VERSION, "0.2.5")
+
+
+if __name__ == "__main__":
+    unittest.main()

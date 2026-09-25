@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Pinterest nurture browse (0.2.3).
+"""Pinterest nurture browse (0.2.5).
 
 Logged-in feed browse with behavior hardening (Gemini 2026-09-21 + 2026-09-23):
 default headed, continuous randomized mouse trails, inertial scroll, session
 personas (browse_only / light_like / deep_browse / bounce_early),
 log-normal/gamma pauses (independently re-sampled at every site), quiet window
 after load, longer pin linger, visibility keepalive, occasional micro reverse
-scroll, mixed close paths, zero-pin feed bounce + browsed_ok gate.
+scroll, mixed close paths, zero-pin feed bounce + browsed_ok gate, idle ambient mouse
+wander (frequent small hops + occasional large loops) during dwell — DEFAULT OFF in 0.2.5 (enable via --idle-wander / CLOAKCLI_IDLE_WANDER=1). 0.2.5 P0: BehaviorProfile persistence, split RNG streams, session budgets, same-profile lock (engineering de-homology; not an anti-detect claim).
 CloakBrowser persistent context; one account ↔ one geo/proxy. Does NOT change
 fingerprint/launch knobs.
 
@@ -37,18 +38,51 @@ else:
 if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
+# cloakcli_worker lives under python/
+_PY_ROOT = ROOT / "python"
+if _PY_ROOT.is_dir() and str(_PY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PY_ROOT))
+
+try:
+    from cloakcli_worker.behavior_profile import (  # noqa: E402
+        ProfileSessionLock,
+        SessionBudget,
+        bump_session_seq,
+        ensure_behavior_profile,
+        idle_wander_enabled as bp_idle_wander_enabled,
+        make_behavior_streams,
+        resolve_behavior_config,
+        effective_params_hash,
+    )
+except Exception:  # pragma: no cover - allow skill-only checkout without worker pkg
+    ProfileSessionLock = None  # type: ignore
+    SessionBudget = None  # type: ignore
+    bump_session_seq = None  # type: ignore
+    ensure_behavior_profile = None  # type: ignore
+    bp_idle_wander_enabled = lambda **k: False  # type: ignore
+    make_behavior_streams = None  # type: ignore
+    resolve_behavior_config = None  # type: ignore
+    effective_params_hash = None  # type: ignore
+
 from pinterest_nurture_behavior import (  # noqa: E402
     PERSONA_NAMES,
+    BehaviorContext,
+    IdleWanderState,
     browsed_ok,
+    budget_allows,
     choose_close_path,
     close_path_fallback_order,
     ensure_page_visible,
+    get_behavior_context,
     human_click_locator,
     human_move_to,
     human_type_text,
+    idle_wander_fill,
     inertial_scroll,
     hang_before_close,
+    is_idle_wander_enabled,
     maybe_micro_reverse_scroll,
+    optional_action_weight,
     plan_nurture_session,
     plan_pin_linger,
     play_ambient_drift,
@@ -60,10 +94,11 @@ from pinterest_nurture_behavior import (  # noqa: E402
     sample_quiet_window_ms,
     scroll_plan_down_magnitude,
     session_mouse,
+    set_behavior_context,
 )
 
 ART = ROOT / "artifacts/pinterest/nurture-browse"
-VERSION = "0.2.3"
+VERSION = "0.2.5"
 
 # Draft selectors — refine after a healthy logged-in probe
 PIN_LINK = 'a[href*="/pin/"]'
@@ -106,38 +141,71 @@ ACCT_SELS = (
     '[data-test-id="header-profile"]'
 )
 
+# Session-scoped idle ambient wander (frequent small + occasional large).
+_IDLE_WANDER = IdleWanderState()
+
+
+def reset_idle_wander(*, rng=None) -> IdleWanderState:
+    """Reset idle scheduler at session start (after mouse reset)."""
+    global _IDLE_WANDER
+    _IDLE_WANDER = IdleWanderState(rng=rng)
+    return _IDLE_WANDER
+
 
 def log(obj: dict) -> None:
     print(json.dumps(obj, ensure_ascii=False), flush=True)
 
 
+def _session_rng():
+    """Session RNG from behavior context; fresh Random if unset (never process-global)."""
+    ctx = get_behavior_context()
+    if ctx is not None and ctx.streams is not None:
+        return ctx.streams.session_rng
+    return random.Random()
+
+
 def pause(page, lo_ms: int, hi_ms: int, label: str = "", *, ambient: bool = False) -> int:
-    """Heavy-tailed pause (log-normal). Optional ambient mouse drift while reading.
+    """Heavy-tailed pause (log-normal). Optional idle ambient mouse wander while reading.
 
     Every call re-samples duration independently (no fixed chains across steps).
     Long pauses may soft-check page visibility (orthogonal to hang/cookies).
+    When ambient=True AND idle wander enabled (0.2.5 default OFF), spends the dwell
+    in IdleWanderState ticks; otherwise plain wait.
     """
     if hi_ms < lo_ms:
         lo_ms, hi_ms = hi_ms, lo_ms
     lo_ms = max(0, int(lo_ms))
     hi_ms = max(lo_ms, int(hi_ms))
-    ms = sample_pause_ms(lo_ms, hi_ms)
+    rng = _session_rng()
+    ms = sample_pause_ms(lo_ms, hi_ms, rng=rng)
     log({"pause_ms": ms, "label": label})
     # Periodic soft visibility check during long pauses (independent of hang).
-    if ms >= 2500 and random.random() < 0.45:
+    if ms >= 2500 and rng.random() < 0.45:
         try:
-            ensure_page_visible(page, log_fn=log)
+            ensure_page_visible(page, log_fn=log, rng=rng)
         except Exception:
             pass
-    if ambient and ms >= 500 and random.random() < 0.6:
-        budget = min(ms // 3, 900)
+    # 0.2.5: idle ambient wander is opt-in (feature flag / env), not a fixed ritual.
+    if ambient and ms >= 500 and is_idle_wander_enabled():
         try:
-            play_ambient_drift(page, session_mouse(), budget_ms=budget)
+            idle_wander_fill(
+                page,
+                session_mouse(),
+                _IDLE_WANDER,
+                budget_ms=ms,
+                rng=rng,
+                log_fn=log,
+            )
         except Exception:
-            pass
-        remain = ms - budget
-        if remain > 0:
-            page.wait_for_timeout(remain)
+            # Fallback: legacy ambient drift slice then quiet remainder.
+            try:
+                budget = min(ms // 3, 900)
+                play_ambient_drift(page, session_mouse(), budget_ms=budget, rng=rng)
+                remain = ms - budget
+                if remain > 0:
+                    page.wait_for_timeout(remain)
+            except Exception:
+                page.wait_for_timeout(ms)
     else:
         page.wait_for_timeout(ms)
     return ms
@@ -145,19 +213,51 @@ def pause(page, lo_ms: int, hi_ms: int, label: str = "", *, ambient: bool = Fals
 
 def quiet_window(page) -> int:
     """No pointer/key events until TTI quiet window elapses."""
-    ms = sample_quiet_window_ms()
+    ms = sample_quiet_window_ms(rng=_session_rng())
     log({"pause_ms": ms, "label": "quiet_window"})
     page.wait_for_timeout(ms)
     return ms
 
 
 def _hclick(page, loc) -> dict:
-    result = human_click_locator(page, loc, session_mouse())
+    """Intentional click: mark idle wander busy so ambient ticks skip."""
+    _IDLE_WANDER.mark_busy()
+    try:
+        result = human_click_locator(page, loc, session_mouse())
+    finally:
+        _IDLE_WANDER.mark_idle()
     if result.get("hover_ms"):
         log({"pause_ms": result["hover_ms"], "label": "hover_before_click"})
     if not result.get("ok"):
         log({"human_click": result})
     return result
+
+
+def _iscroll(page, *, direction: int = 1):
+    """Intentional inertial scroll with idle wander paused."""
+    _IDLE_WANDER.mark_busy()
+    try:
+        return inertial_scroll(page, direction=direction)
+    finally:
+        _IDLE_WANDER.mark_idle()
+
+
+def _htype(page, loc, text: str) -> dict:
+    """Intentional typing with idle wander paused (NUX name only here)."""
+    _IDLE_WANDER.mark_busy()
+    try:
+        return human_type_text(page, loc, text, mouse=session_mouse())
+    finally:
+        _IDLE_WANDER.mark_idle()
+
+
+def _micro_reverse(page, down_mag, **kwargs):
+    """Intentional micro reverse scroll with idle wander paused."""
+    _IDLE_WANDER.mark_busy()
+    try:
+        return maybe_micro_reverse_scroll(page, down_mag, **kwargs)
+    finally:
+        _IDLE_WANDER.mark_idle()
 
 
 def body_text(page, n: int = 2500) -> str:
@@ -257,7 +357,7 @@ _FIRST_NAMES = (
 
 
 def _random_display_name() -> str:
-    return random.choice(_FIRST_NAMES)
+    return _session_rng().choice(_FIRST_NAMES)
 
 
 def name_onboarding_visible(page) -> bool:
@@ -333,7 +433,7 @@ def complete_name_onboarding(page, run_art: Path | None = None) -> dict:
             or (len(cur) > 12 and " " not in cur and cur == cur.lower())
         )
         if looks_bad:
-            typed = human_type_text(page, name_loc, display, mouse=session_mouse())
+            typed = _htype(page, name_loc, display)
             out["filled"] = True
             out["name_len"] = len(display)
             out["typed"] = typed
@@ -575,7 +675,7 @@ def complete_gender_onboarding(page, run_art: Path | None = None) -> dict:
         available = {label: _gender_button(page, label) for label in GENDER_CHOICES}
         preferred = [label for label in ("Female", "Male") if available[label] is not None]
         if preferred:
-            choice = random.choice(preferred)
+            choice = _session_rng().choice(preferred)
         elif available["Other"] is not None:
             choice = "Other"
         else:
@@ -682,9 +782,9 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
         tiles = page.locator(USE_CASE_TILE)
         n = tiles.count()
         # pick 3–5 distinct tiles with human pacing
-        want = min(max(3, random.randint(3, 5)), n if n else 3)
+        want = min(max(3, _session_rng().randint(3, 5)), n if n else 3)
         idxs = list(range(n))
-        random.shuffle(idxs)
+        _session_rng().shuffle(idxs)
         chosen = []
         for i in idxs:
             if len(chosen) >= want:
@@ -758,7 +858,7 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
                     break
             except Exception:
                 pass
-            inertial_scroll(page, direction=1)
+            _iscroll(page, direction=1)
             pause(page, 700, 1400, "use_case_wait_feed")
         if run_art is not None:
             try:
@@ -794,9 +894,9 @@ def collect_pin_ids(page, want: int = 3, pool: int = 24) -> list[str]:
     if not pool_ids:
         return []
     if len(pool_ids) <= want:
-        random.shuffle(pool_ids)
+        _session_rng().shuffle(pool_ids)
         return pool_ids
-    return random.sample(pool_ids, want)
+    return _session_rng().sample(pool_ids, want)
 
 
 def _close_still_on_pin(page) -> bool:
@@ -989,8 +1089,8 @@ def like_pin(page) -> str | None:
             }"""
         )
         if isinstance(box, dict) and box.get("width"):
-            tx = float(box["x"]) + float(box["width"]) * random.uniform(0.22, 0.78)
-            ty = float(box["y"]) + float(box["height"]) * random.uniform(0.22, 0.78)
+            tx = float(box["x"]) + float(box["width"]) * _session_rng().uniform(0.22, 0.78)
+            ty = float(box["y"]) + float(box["height"]) * _session_rng().uniform(0.22, 0.78)
             human_move_to(page, tx, ty, session_mouse())
             hover = sample_lognormal_ms(450, 1300, mu=-0.15, sigma=0.4)
             log({"pause_ms": hover, "label": "hover_before_like_fuzzy"})
@@ -1015,21 +1115,113 @@ def run_nurture_session(
     max_sec: int = 180,
     navigate: bool = True,
     persona: str | None = None,
+    idle_wander: bool | None = None,
+    meta_path: Path | None = None,
 ) -> dict:
     """Run nurture browse on an existing Playwright page (keep browser open).
 
     Returns a dict with at least: status, elapsed_sec, liked, pins_opened.
     Does not close the page/context — caller owns lifecycle.
     pins<=0 means the persona chooses 0–12 (incl. feed-only bounce). 0 likes OK.
+
+    0.2.5: loads/ensures BehaviorProfile, splits RNG streams, enforces session
+    budgets, idle wander DEFAULT OFF.
     """
     worked: dict = {}
     t0 = time.time()
     run_art.mkdir(parents=True, exist_ok=True)
+    end_reason: str | None = None
+    # --- BehaviorProfile + streams + budget (0.2.5 P0) ---
+    bp = None
+    cfg = None
+    streams = None
+    budget = None
+    lock = None
+    resolved_meta = Path(meta_path) if meta_path is not None else (ROOT / "profiles" / profile / "profile.json")
+    try:
+        if ensure_behavior_profile is not None and resolved_meta.is_file():
+            if ProfileSessionLock is not None:
+                lock = ProfileSessionLock(resolved_meta)
+                if not lock.acquire(blocking=False):
+                    return _finish({
+                        "status": "like_failed",
+                        "profile": profile,
+                        "error": "profile_session_busy",
+                        "end_reason": "profile_busy",
+                        "elapsed_sec": 0,
+                        "liked": False,
+                        "pins_opened": 0,
+                        "version": VERSION,
+                    })
+            bp = bump_session_seq(resolved_meta) if bump_session_seq else ensure_behavior_profile(resolved_meta)
+            cfg = resolve_behavior_config(bp, idle_wander=idle_wander)
+            streams = make_behavior_streams(bp.behavior_seed, bp.session_seq)
+            budget = SessionBudget(
+                max_session_elapsed_sec=cfg.max_session_elapsed_sec,
+                max_actions=cfg.max_actions,
+                max_state_visits=cfg.max_state_visits,
+            )
+            set_behavior_context(
+                BehaviorContext(
+                    config=cfg,
+                    streams=streams,
+                    budget=budget,
+                    idle_wander_enabled=bool(cfg.idle_wander_enabled),
+                )
+            )
+            worked["behavior_profile"] = {
+                "behavior_seed": bp.behavior_seed,
+                "session_seq": bp.session_seq,
+                "params_hash": effective_params_hash(bp) if effective_params_hash else None,
+                "idle_wander": bool(cfg.idle_wander_enabled),
+                "pause_scale": cfg.pause_scale,
+                "scroll_step_scale": cfg.scroll_step_scale,
+            }
+            log({"behavior_profile": worked["behavior_profile"]})
+        else:
+            # No profile.json — still isolate RNG from process-global.
+            enable_idle = bool(bp_idle_wander_enabled(flag=idle_wander))
+            streams = None
+            set_behavior_context(
+                BehaviorContext(
+                    config=None,
+                    streams=None,
+                    budget=None,
+                    idle_wander_enabled=enable_idle,
+                )
+            )
+    except Exception as e:
+        log({"behavior_profile_error": type(e).__name__})
+        set_behavior_context(
+            BehaviorContext(idle_wander_enabled=bool(bp_idle_wander_enabled(flag=idle_wander)))
+        )
+
     reset_session_mouse()
+    reset_idle_wander(rng=_session_rng())
     plan = plan_nurture_session(
-        persona=persona, pins=pins, min_sec=min_sec, max_sec=max_sec
+        persona=persona, pins=pins, min_sec=min_sec, max_sec=max_sec, rng=_session_rng()
     )
     worked["plan"] = plan
+
+    def _finish(payload: dict) -> dict:
+        if end_reason and "end_reason" not in payload:
+            payload["end_reason"] = end_reason
+        elif budget is not None and budget.end_reason and "end_reason" not in payload:
+            payload["end_reason"] = budget.end_reason
+        ctx = get_behavior_context()
+        if ctx is not None and ctx.end_reason and "end_reason" not in payload:
+            payload["end_reason"] = ctx.end_reason
+        payload.setdefault("version", VERSION)
+        try:
+            set_behavior_context(None)
+        except Exception:
+            pass
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
+        return payload
     log({"nurture_plan": plan})
     n_pins = int(plan["pins"])
     like_p = float(plan["like_prob"])
@@ -1066,7 +1258,7 @@ def run_nurture_session(
         log({"session_keepalive_probe": probe})
         gate = probe.get("gate") or detect_login_state(page)
         if gate != "ok":
-            return {
+            return _finish({
                 "status": gate,
                 "profile": profile,
                 "url": page.url,
@@ -1075,7 +1267,7 @@ def run_nurture_session(
                 "pins_opened": 0,
                 "persona": plan["persona"],
                 "session_keepalive_probe": probe,
-            }
+            })
 
         name_nux = complete_name_onboarding(page, run_art)
         log({"name_onboarding": name_nux})
@@ -1108,19 +1300,23 @@ def run_nurture_session(
         if feed_only and int(plan.get("feed_scroll_screens") or 0) > 0:
             scroll_rounds = int(plan["feed_scroll_screens"])
         elif plan["bounce"]:
-            scroll_rounds = random.randint(1, 3)
+            scroll_rounds = _session_rng().randint(1, 3)
         else:
-            scroll_rounds = random.randint(3, 7)
+            scroll_rounds = _session_rng().randint(3, 7)
 
         for i in range(scroll_rounds):
+            if not budget_allows(action=True, state="feed_scroll", state_cap=12):
+                end_reason = (get_behavior_context().end_reason if get_behavior_context() else None) or "budget"
+                log({"end_reason": end_reason, "at": "feed_scroll"})
+                break
             try:
-                ensure_page_visible(page, log_fn=log)
+                ensure_page_visible(page, log_fn=log, rng=_session_rng())
             except Exception:
                 pass
-            plan_steps = inertial_scroll(page, direction=1)
+            plan_steps = _iscroll(page, direction=1)
             down_mag = scroll_plan_down_magnitude(plan_steps)
             scroll_distance_px += int(down_mag)
-            rev = maybe_micro_reverse_scroll(
+            rev = _micro_reverse(
                 page,
                 down_mag,
                 persona=plan.get("persona"),
@@ -1131,16 +1327,18 @@ def run_nurture_session(
                 scroll_distance_px += int(rev.get("reverse_px") or 0)  # distance traveled
                 last_flip_mono = rev.get("last_flip_mono") or last_flip_mono
             pause(page, 3500, 9000, f"feed_scroll_{i}", ambient=True)
-            # Optional hover-without-click on zero-pin / feed phases (~35%).
-            if feed_only and random.random() < 0.35:
+            # Optional hover-without-click on zero-pin / feed phases (profile-weighted; default ~35%).
+            # 0.2.5: conditional optional step with state visit cap — no side-effect clicks.
+            _hover_w = optional_action_weight("feed_hover", 1.0)
+            if feed_only and budget_allows(state="feed_hover", state_cap=4) and _session_rng().random() < (0.35 * _hover_w):
                 try:
                     nlinks = page.locator(PIN_LINK).count()
                     if nlinks > 0:
-                        loc = page.locator(PIN_LINK).nth(random.randrange(min(nlinks, 12)))
+                        loc = page.locator(PIN_LINK).nth(_session_rng().randrange(min(nlinks, 12)))
                         box = loc.bounding_box()
                         if box and box.get("width"):
-                            tx = float(box["x"]) + float(box["width"]) * random.uniform(0.25, 0.75)
-                            ty = float(box["y"]) + float(box["height"]) * random.uniform(0.25, 0.75)
+                            tx = float(box["x"]) + float(box["width"]) * _session_rng().uniform(0.25, 0.75)
+                            ty = float(box["y"]) + float(box["height"]) * _session_rng().uniform(0.25, 0.75)
                             human_move_to(page, tx, ty, session_mouse())
                             pause(page, 1000, 2500, f"feed_hover_{i}", ambient=True)
                 except Exception:
@@ -1160,11 +1358,11 @@ def run_nurture_session(
                     ensure_page_visible(page, log_fn=log)
                 except Exception:
                     pass
-                if random.random() < 0.55:
-                    plan_steps = inertial_scroll(page, direction=1)
+                if _session_rng().random() < 0.55:
+                    plan_steps = _iscroll(page, direction=1)
                     down_mag = scroll_plan_down_magnitude(plan_steps)
                     scroll_distance_px += int(down_mag)
-                    rev = maybe_micro_reverse_scroll(
+                    rev = _micro_reverse(
                         page,
                         down_mag,
                         persona=plan.get("persona"),
@@ -1204,14 +1402,14 @@ def run_nurture_session(
             for _ in range(6):
                 if page.locator(PIN_LINK).count() >= max(n_pins, 3):
                     break
-                plan_steps = inertial_scroll(page, direction=1)
+                plan_steps = _iscroll(page, direction=1)
                 scroll_distance_px += scroll_plan_down_magnitude(plan_steps)
                 pause(page, 900, 2000, "load_more_pins", ambient=True)
 
             pin_ids = collect_pin_ids(page, want=n_pins, pool=max(n_pins * 4, 16))
             log({"pin_ids_n": len(pin_ids), "pin_ids": pin_ids})
             if not pin_ids:
-                return {
+                return _finish({
                     "status": "like_failed",
                     "profile": profile,
                     "error": "no_pin_links",
@@ -1223,10 +1421,15 @@ def run_nurture_session(
                     "scroll_distance_px": int(scroll_distance_px),
                     "persona": plan["persona"],
                     "worked": worked,
-                }
+                })
 
             for pi, pid in enumerate(pin_ids):
                 if time.time() - t0 > plan["max_sec"] - 15:
+                    end_reason = end_reason or "max_sec"
+                    break
+                if not budget_allows(action=True, state="pin_open", state_cap=16):
+                    end_reason = (get_behavior_context().end_reason if get_behavior_context() else None) or "budget"
+                    log({"end_reason": end_reason, "at": "pin_open"})
                     break
                 pause(page, 2500, 7500, f"before_open_{pi}", ambient=True)
                 try:
@@ -1246,7 +1449,7 @@ def run_nurture_session(
                         nlinks = page.locator(PIN_LINK).count()
                         if nlinks <= 0:
                             continue
-                        alt = page.locator(PIN_LINK).nth(random.randrange(min(nlinks, 20)))
+                        alt = page.locator(PIN_LINK).nth(_session_rng().randrange(min(nlinks, 20)))
                         clk = _hclick(page, alt)
                         if not clk.get("ok"):
                             continue
@@ -1281,7 +1484,7 @@ def run_nurture_session(
                         remain = float(linger["peek_px"])
                         steps = 0
                         while remain > 20 and steps < 10:
-                            chunk = max(20.0, remain * random.uniform(0.2, 0.45))
+                            chunk = max(20.0, remain * _session_rng().uniform(0.2, 0.45))
                             page.mouse.wheel(0, int(chunk))
                             page.wait_for_timeout(
                                 sample_gamma_ms(12, 50, alpha=2.2, beta=10.0)
@@ -1289,12 +1492,12 @@ def run_nurture_session(
                             remain -= chunk
                             steps += 1
                         # Re-sample peek settle independently (optional beat).
-                        if random.random() < 0.85:
+                        if _session_rng().random() < 0.85:
                             pause(page, 350, 1200, f"pin_peek_{pi}", ambient=True)
                     except Exception:
                         pass
 
-                want_like = random.random() < like_p
+                want_like = _session_rng().random() < like_p
                 if want_like or pi == 0:
                     probe = dump_closeup_selectors(page)
                     log({"closeup_probe": probe})
@@ -1353,15 +1556,15 @@ def run_nurture_session(
 
                 worked["close"] = close_pin(page)
                 pause(page, 1800, 5500, f"after_close_{pi}", ambient=True)
-                if pi < len(pin_ids) - 1 and random.random() < 0.7:
+                if pi < len(pin_ids) - 1 and _session_rng().random() < 0.7:
                     try:
                         ensure_page_visible(page, log_fn=log)
                     except Exception:
                         pass
-                    plan_steps = inertial_scroll(page, direction=1)
+                    plan_steps = _iscroll(page, direction=1)
                     down_mag = scroll_plan_down_magnitude(plan_steps)
                     scroll_distance_px += int(down_mag)
-                    rev = maybe_micro_reverse_scroll(
+                    rev = _micro_reverse(
                         page,
                         down_mag,
                         persona=plan.get("persona"),
@@ -1384,10 +1587,10 @@ def run_nurture_session(
                 ensure_page_visible(page, log_fn=log)
             except Exception:
                 pass
-            plan_steps = inertial_scroll(page, direction=1)
+            plan_steps = _iscroll(page, direction=1)
             down_mag = scroll_plan_down_magnitude(plan_steps)
             scroll_distance_px += int(down_mag)
-            rev = maybe_micro_reverse_scroll(
+            rev = _micro_reverse(
                 page,
                 down_mag,
                 persona=plan.get("persona"),
@@ -1433,10 +1636,10 @@ def run_nurture_session(
             feed_dwell_sec=feed_dwell_sec,
             scroll_distance_px=scroll_distance_px,
         ):
-            return {"status": "browsed_ok", **payload}
-        return {"status": "like_failed", "like_done": liked, **payload}
+            return _finish({"status": "browsed_ok", **payload})
+        return _finish({"status": "like_failed", "like_done": liked, **payload})
     except Exception as e:
-        return {
+        return _finish({
             "status": "like_failed",
             "profile": profile,
             "error": type(e).__name__,
@@ -1445,7 +1648,20 @@ def run_nurture_session(
             "liked": False,
             "pins_opened": 0,
             "persona": plan.get("persona"),
-        }
+        })
+    finally:
+        # Always drop context + lock even on early returns that forgot _finish
+        # (early returns below still call _finish; this is belt-and-suspenders).
+        try:
+            if get_behavior_context() is not None:
+                set_behavior_context(None)
+        except Exception:
+            pass
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
 
 
 
@@ -1480,6 +1696,7 @@ def run_nurture_reopen(
     min_sec: int = 120,
     max_sec: int = 180,
     persona: str | None = None,
+    idle_wander: bool | None = None,
 ) -> dict:
     """Launch persistent context for profile and run nurture (reopen path)."""
     meta_path = ROOT / "profiles" / profile / "profile.json"
@@ -1547,10 +1764,13 @@ def run_nurture_reopen(
             max_sec=max_sec,
             navigate=True,
             persona=persona,
+            idle_wander=idle_wander,
+            meta_path=meta_path,
         )
     finally:
         try:
-            hang_before_close(page, session_mouse())
+            # Hang uses quiet wait unless idle wander explicitly enabled for this process.
+            hang_before_close(page, session_mouse(), rng=random.Random())
         except Exception:
             pass
         try:
@@ -1589,6 +1809,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--max-sec", type=int, default=180, help="Soft cap for pacing (default 180)"
     )
+    ap.add_argument(
+        "--idle-wander",
+        action="store_true",
+        help="Opt-in idle ambient mouse wander during dwell (0.2.5 default OFF; or CLOAKCLI_IDLE_WANDER=1)",
+    )
     return ap
 
 
@@ -1605,6 +1830,7 @@ def main(argv: list[str] | None = None) -> int:
         min_sec=args.min_sec,
         max_sec=args.max_sec,
         persona=persona,
+        idle_wander=True if args.idle_wander else None,
     )
     status = result.get("status") or "like_failed"
     payload = {k: v for k, v in result.items() if k != "worked"}

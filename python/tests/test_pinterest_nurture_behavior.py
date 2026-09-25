@@ -1,4 +1,4 @@
-"""Nurture 0.2.3 behavior helpers: linger, reverse scroll, close paths, browsed_ok."""
+"""Nurture behavior helpers tests (0.2.5 P0 de-homology + prior linger/reverse/close/browsed_ok)."""
 from __future__ import annotations
 
 import importlib.util
@@ -18,6 +18,7 @@ def load_mod(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod  # required before @dataclass exec
     spec.loader.exec_module(mod)
     return mod
 
@@ -328,7 +329,7 @@ class RunnerCliTests(unittest.TestCase):
         cls.runner = load_mod(RUNNER, "run_pinterest_nurture_browse")
 
     def test_default_headed_and_persona_pins(self) -> None:
-        self.assertEqual(self.runner.VERSION, "0.2.3")
+        self.assertEqual(self.runner.VERSION, "0.2.5")
         ns = self.runner.build_arg_parser().parse_args(["--profile", "geo46"])
         self.assertFalse(ns.headless)
         self.assertEqual(ns.pins, 0)
@@ -355,7 +356,7 @@ class RunnerCliTests(unittest.TestCase):
         manifest = json.loads(
             (ROOT / "skills/pinterest-nurture-browse/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["version"], "0.2.3")
+        self.assertEqual(manifest["version"], "0.2.5")
         self.assertEqual(manifest["entry"]["path"], "scripts/run_pinterest_nurture_browse.py")
         behavior_src = (ROOT / "scripts/pinterest_nurture_behavior.py").read_text(encoding="utf-8")
         click_fn = behavior_src.split("def human_click_locator", 1)[1].split("\ndef ", 1)[0]
@@ -416,7 +417,12 @@ class HangBeforeCloseTests(unittest.TestCase):
             page = FakePage()
             mouse = {"x": 40.0, "y": 50.0}
             logs: list[dict] = []
-            spent = bh.hang_before_close(page, mouse, rng=random.Random(9), log_fn=logs.append)
+            # 0.2.5: idle wander default OFF — opt in for this ambient-motion assertion.
+            bh.set_behavior_context(bh.BehaviorContext(idle_wander_enabled=True))
+            try:
+                spent = bh.hang_before_close(page, mouse, rng=random.Random(9), log_fn=logs.append)
+            finally:
+                bh.set_behavior_context(None)
             self.assertGreaterEqual(spent, 1000)
             self.assertLessEqual(spent, 2000)
             self.assertTrue(any(e[0] == "move" for e in page.mouse.events))
