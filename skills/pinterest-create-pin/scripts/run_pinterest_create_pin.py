@@ -1265,10 +1265,6 @@ def run_live(args: argparse.Namespace, root: Path, out: Path, result: dict[str, 
             profile_meta_path=meta_path,
         )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        try:
-            page.set_viewport_size({"width": 1440, "height": 960})
-        except Exception:
-            pass
         return run_publish(page, args, out, result)
     except Exception as e:
         result["status"] = "ui_unknown_park"

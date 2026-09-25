@@ -33,12 +33,23 @@ Round 2 cleared the placeholder, created the board, and clicked
 
 ```python
 from cloakbrowser import launch_persistent_context
+from cloakcli_worker.fingerprint import apply_to_launch_kwargs
 kwargs = {"user_data_dir": str(ud), "headless": not headed}
 if proxy:
     kwargs["proxy"] = proxy
+apply_to_launch_kwargs(
+    kwargs,
+    seed=fp_seed,
+    proxy=proxy,
+    headed=headed,
+    profile_meta_path=meta_path,
+    require_geo=False,
+)
 ctx = launch_persistent_context(**kwargs)
-page.set_viewport_size({"width": 1440, "height": 960})
 ```
+
+Do not call `set_viewport_size` after launch. Headless viewport comes from the
+persona (`viewport_width` / `viewport_height` via `apply_to_launch_kwargs`).
 
 No system Chrome. Use persisted fingerprint_seed from profile.json; do not randomize per launch. Do not log the proxy.
 Reuse `scripts/pinterest_nurture_behavior.py`: `human_click_locator`,

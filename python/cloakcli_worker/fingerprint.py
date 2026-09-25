@@ -49,7 +49,7 @@ _PERSONA_FIELD = "fingerprint_persona"
 _GEO_FIELD = "geo_cache"
 _LANGUAGE_FIELD = "language"
 
-PERSONA_SCHEMA = 2
+PERSONA_SCHEMA = 3
 GEO_CACHE_SCHEMA = 1
 GEO_CACHE_TTL = timedelta(days=30)
 
@@ -298,6 +298,7 @@ def mint_fingerprint_persona(seed: int) -> dict[str, Any]:
     vw, vh, aw, ah = _screen_inner(sw, sh, taskbar, chrome_ui)
     return {
         "schema": PERSONA_SCHEMA,
+        "derived_from_seed": int(seed),
         "brand": brand,
         "brand_version": brand_version,
         "chromium_compatible": chromium_compatible,
@@ -358,10 +359,23 @@ def _screen_coherent(persona: dict[str, Any]) -> bool:
     return (vw, vh, aw, ah) == (evw, evh, eaw, eah)
 
 
+def persona_derived_from_seed(persona: Any, seed: int) -> bool:
+    """True when persona was minted from this seed (binding field + identity)."""
+    if not isinstance(persona, dict):
+        return False
+    stored = coerce_fingerprint_seed(persona.get("derived_from_seed"))
+    if stored != int(seed):
+        return False
+    minted = mint_fingerprint_persona(int(seed))
+    return all(persona.get(key) == value for key, value in minted.items())
+
+
 def is_whitelisted_persona(persona: Any) -> bool:
     if not isinstance(persona, dict):
         return False
     if persona.get("schema") not in (PERSONA_SCHEMA, None):
+        return False
+    if coerce_fingerprint_seed(persona.get("derived_from_seed")) is None:
         return False
     if persona_brand_tuple(persona) not in verified_brand_tuples():
         return False
@@ -501,16 +515,29 @@ def ensure_fingerprint_persona(
     *,
     regenerate: bool = False,
 ) -> dict[str, Any]:
-    """Load or mint a whitelist persona for this seed; persist on profile.json."""
+    """Load or mint a whitelist persona bound to this seed; persist on profile.json.
+
+    A whitelist-valid persona minted for a *different* fingerprint_seed is
+    reminted (same path as a schema bump). Same profile + same seed is stable.
+    """
     meta_path = Path(meta_path)
     data = _read_profile_meta(meta_path)
     existing = data.get(_PERSONA_FIELD)
-    if not regenerate and is_whitelisted_persona(existing):
+    if (
+        not regenerate
+        and is_whitelisted_persona(existing)
+        and persona_derived_from_seed(existing, seed)
+    ):
         assert isinstance(existing, dict)
         return existing
     if existing is not None and not is_whitelisted_persona(existing):
         sys.stderr.write(
             "[fingerprint] rejected non-whitelist persona; reminting from seed\n"
+        )
+        sys.stderr.flush()
+    elif existing is not None:
+        sys.stderr.write(
+            "[fingerprint] persona not bound to current fingerprint_seed; reminting\n"
         )
         sys.stderr.flush()
     persona = mint_fingerprint_persona(seed)

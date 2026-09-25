@@ -1,10 +1,51 @@
 # Fingerprint persona + geoip alignment
 
 **Branch:** `feat/fingerprint-persona-geoip`  
-**SHA:** f333ef100a65629f9fd13ed1505252bda7d6bc19  
-**Astra plan verdict:** `astra-ua-geoip-plan-verdict.md` — 有条件通过; this is the implementation, not a restore of registration.
+**SHA:** PENDING  
+**Astra plan verdict:** `astra-ua-geoip-plan-verdict.md` — 有条件通过; this is the implementation, not a restore of registration.  
+**Astra code R1:** `astra-ua-geoip-code-verdict.md` / `astra-ua-geoip-code-verdict-r1-summary.md` — **打回**. Round 2 lands the two 必改 blockers.
 
-## Round 1 (this landing): WebGL / GPU vendor diversity
+## Round 2: Astra R1 打回 fixes
+
+Registration path, Chrome/Windows whitelist, and geo fail-closed stay as landed.
+
+### 必改 1 — create-pin no longer stomps persona viewport
+
+`skills/pinterest-create-pin/scripts/run_pinterest_create_pin.py` deleted the post-launch
+
+```python
+page.set_viewport_size({"width": 1440, "height": 960})
+```
+
+`launch_cloakbrowser` already calls `apply_to_launch_kwargs`, which sets Playwright `viewport` from persona `viewport_width` / `viewport_height` when headless. Headed launches leave the OS window alone (no Playwright viewport). PLAYBOOK + skill.json no longer document 1440×960.
+
+Scan of register / nurture / create-pin Python: the only `set_viewport_size` was that create-pin line. Register `DryRunPage.viewport_size = {1280, 720}` is a stub attribute, not a Playwright override.
+
+### 必改 2 — persona bound to current `fingerprint_seed`
+
+`mint_fingerprint_persona(seed)` now persists `derived_from_seed`. `PERSONA_SCHEMA` **2 → 3** so schema-2 personas remint (same GPU/hw from the same seed, plus the binding field).
+
+`ensure_fingerprint_persona()` reuses the stored persona only when it is whitelist-valid **and** `persona_derived_from_seed(existing, seed)`:
+
+- stored `derived_from_seed` equals the current seed
+- every minted identity field matches `mint_fingerprint_persona(seed)` (gpu / hw / screen / brand)
+
+Whitelist-valid persona minted for a **different** seed → remint from the current seed and persist (same path as schema bump). Same profile + same seed → stable, no reshuffle.
+
+### Tests (Round 2)
+
+- `test_ensure_same_seed_twice_is_stable` — same seed twice → identical persona including gpu/hw
+- `test_ensure_seed_change_remints_to_new_seed` — seed change remints and matches the new seed
+- `test_whitelist_persona_from_other_seed_is_not_reused` — the R1 bug: foreign whitelist persona is not reused
+- `test_three_seeds_diverge_hw_or_gpu` — ≥3 seeds diverge on hw/mem **or** gpu_vendor
+
+```
+PYTHONPATH=python python3 -m unittest discover -s python/tests
+```
+
+**274 tests, OK.**
+
+## Round 1: WebGL / GPU vendor diversity
 
 Binary auto-GPU from `--fingerprint=<seed>` was homogenized: 12/12 probes landed in `Google Inc. (NVIDIA)` (different RTX SKUs, same vendor cluster). Explicit `--fingerprint-gpu-vendor` / `--fingerprint-gpu-renderer` apply exactly on Chromium **146.0.7680.177.5**.
 
@@ -55,7 +96,7 @@ Consistency-first Chrome identity on the deployed **146.0.7680.177.5** binary, p
 
 | Path | Change |
 |---|---|
-| `python/cloakcli_worker/fingerprint.py` | Persona whitelist, mint/persist, geo cache, launch kwargs |
+| `python/cloakcli_worker/fingerprint.py` | Persona whitelist, mint/persist, geo cache, launch kwargs; R2 `derived_from_seed` + schema 3 |
 | `python/cloakcli_worker/browser.py` | `launch_context` wires persona + geoip; drops Playwright UA when seed/persona present |
 | `python/cloakcli_worker/runner.py` | Pass skill name/path so register skills fail-close on geo |
 | `python/tests/test_fingerprint.py` | Persona / geo cache / launch-kwargs tests |
@@ -65,7 +106,9 @@ Consistency-first Chrome identity on the deployed **146.0.7680.177.5** binary, p
 | `skills/pinterest-register-visual/scripts/run_pinterest_register_visual_mm.py` | Same |
 | `skills/pinterest-nurture-browse/scripts/run_pinterest_nurture_browse.py` | One-line `apply_to_launch_kwargs` |
 | `scripts/run_pinterest_nurture_browse.py` | Same |
-| `skills/pinterest-create-pin/scripts/run_pinterest_create_pin.py` | Persona/geo kwargs (`require_geo=False`) |
+| `skills/pinterest-create-pin/scripts/run_pinterest_create_pin.py` | Persona/geo kwargs (`require_geo=False`); R2 removed 1440×960 viewport stomp |
+| `skills/pinterest-create-pin/PLAYBOOK.md` | Launch snippet uses `apply_to_launch_kwargs`; no `set_viewport_size` |
+| `skills/pinterest-create-pin/skill.json` | Drop hard-coded Viewport 1440x960 |
 | `scripts/run_pinterest_settings_email_verify.py` | Same |
 
 No GeoLite DB, proxy URLs, or secrets committed.
@@ -76,10 +119,10 @@ No GeoLite DB, proxy URLs, or secrets committed.
 PYTHONPATH=python python3 -m unittest discover -s python/tests
 ```
 
-- Full suite: **270 tests, OK** (includes GPU mint/whitelist/launch tests).
+- Full suite: **274 tests, OK** (GPU mint/whitelist/launch + R2 seed-binding + viewport).
 - Cargo: not run (no Rust changes).
 
-Covered: persona mint determinism from seed (including gpu_vendor/renderer); ≥3 seeds not all the same GPU vendor; hw/mem paired to GPU SKU; whitelist rejection (Opera/Vivaldi and garbage GPU strings); schema v1 without GPU remints from the same seed; geo cache hit / invalidate on exit_ip and DB version; launch args include brand/hw/gpu/screen/tz/lang/webrtc; fail-closed when geo required; Playwright `user_agent` not forwarded when persona is set.
+Covered: persona mint determinism from seed (including gpu_vendor/renderer and `derived_from_seed`); same seed twice via `ensure_fingerprint_persona` is stable; seed change remints and matches the new seed; whitelist persona from another seed is not reused; ≥3 seeds diverge on hw/mem or gpu_vendor; hw/mem paired to GPU SKU; whitelist rejection (Opera/Vivaldi and garbage GPU strings); schema v1 without GPU remints from the same seed; geo cache hit / invalidate on exit_ip and DB version; launch args include brand/hw/gpu/screen/tz/lang/webrtc; fail-closed when geo required; Playwright `user_agent` not forwarded when persona is set.
 
 ## Live probe (headless, Chromium 146.0.7680.177.5)
 

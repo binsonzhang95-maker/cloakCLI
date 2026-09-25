@@ -28,7 +28,7 @@
     },
     {
       "action": "note",
-      "text": "START: goto https://www.pinterest.com/ → quiet window → assert logged-in (header-profile / feed, no unauth CTA). Park login_required | captcha_parked | oops_park | account_deactivated | parked_risk immediately. Viewport 1440x960."
+      "text": "START: goto https://www.pinterest.com/ → quiet window → assert logged-in (header-profile / feed, no unauth CTA). Park login_required | captcha_parked | oops_park | account_deactivated | parked_risk immediately. Viewport is the profile persona (do not hard-code 1440x960)."
     },
     {
       "action": "note",

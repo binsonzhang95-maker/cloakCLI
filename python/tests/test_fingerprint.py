@@ -27,6 +27,7 @@ from cloakcli_worker.fingerprint import (
     mint_fingerprint_persona,
     mint_fingerprint_seed,
     persona_brand_tuple,
+    persona_derived_from_seed,
     persona_gpu_tuple,
     proxy_session_identity,
     resolve_fingerprint_seed,
@@ -180,6 +181,9 @@ class PersonaMintTests(unittest.TestCase):
         self.assertEqual(a["brand"], "Chrome")
         self.assertEqual(a["platform"], "windows")
         self.assertEqual(a["schema"], PERSONA_SCHEMA)
+        self.assertEqual(a["derived_from_seed"], 42424)
+        self.assertTrue(persona_derived_from_seed(a, 42424))
+        self.assertFalse(persona_derived_from_seed(a, 11111))
         self.assertEqual(a["device_scale_factor"], 1)
         self.assertEqual(
             a["viewport_height"],
@@ -337,6 +341,73 @@ class PersonaMintTests(unittest.TestCase):
         reminted = ensure_fingerprint_persona(meta, 42424)
         self.assertEqual(reminted["brand"], "Chrome")
         self.assertEqual(reminted, mint_fingerprint_persona(42424))
+
+    def test_ensure_same_seed_twice_is_stable(self):
+        root = Path(tempfile.mkdtemp(prefix="fp_seed_stable_"))
+        meta = root / "profile.json"
+        meta.write_text(json.dumps({"name": "x", "fingerprint_seed": 42424}) + "\n", encoding="utf-8")
+        first = ensure_fingerprint_persona(meta, 42424)
+        second = ensure_fingerprint_persona(meta, 42424)
+        minted = mint_fingerprint_persona(42424)
+        self.assertEqual(first, second)
+        self.assertEqual(first, minted)
+        self.assertEqual(first["gpu_vendor"], minted["gpu_vendor"])
+        self.assertEqual(first["gpu_renderer"], minted["gpu_renderer"])
+        self.assertEqual(first["hardware_concurrency"], minted["hardware_concurrency"])
+        self.assertEqual(first["device_memory"], minted["device_memory"])
+        self.assertEqual(first["derived_from_seed"], 42424)
+        data = json.loads(meta.read_text(encoding="utf-8"))
+        self.assertEqual(data["fingerprint_persona"], first)
+        self.assertEqual(data["fingerprint_seed"], 42424)
+
+    def test_ensure_seed_change_remints_to_new_seed(self):
+        root = Path(tempfile.mkdtemp(prefix="fp_seed_change_"))
+        meta = root / "profile.json"
+        meta.write_text(json.dumps({"name": "x", "fingerprint_seed": 42424}) + "\n", encoding="utf-8")
+        first = ensure_fingerprint_persona(meta, 42424)
+        self.assertEqual(first, mint_fingerprint_persona(42424))
+        self.assertTrue(is_whitelisted_persona(first))
+        reminted = ensure_fingerprint_persona(meta, 11111)
+        self.assertEqual(reminted, mint_fingerprint_persona(11111))
+        self.assertEqual(reminted["derived_from_seed"], 11111)
+        self.assertTrue(persona_derived_from_seed(reminted, 11111))
+        self.assertFalse(persona_derived_from_seed(reminted, 42424))
+        self.assertNotEqual(reminted, first)
+        data = json.loads(meta.read_text(encoding="utf-8"))
+        self.assertEqual(data["fingerprint_persona"], reminted)
+        self.assertEqual(data["fingerprint_seed"], 11111)
+
+    def test_whitelist_persona_from_other_seed_is_not_reused(self):
+        root = Path(tempfile.mkdtemp(prefix="fp_seed_bind_"))
+        meta = root / "profile.json"
+        foreign = mint_fingerprint_persona(42424)
+        self.assertTrue(is_whitelisted_persona(foreign))
+        meta.write_text(
+            json.dumps(
+                {
+                    "name": "x",
+                    "fingerprint_seed": 11111,
+                    "fingerprint_persona": foreign,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        bound = ensure_fingerprint_persona(meta, 11111)
+        self.assertEqual(bound, mint_fingerprint_persona(11111))
+        self.assertNotEqual(bound, foreign)
+        self.assertEqual(bound["derived_from_seed"], 11111)
+
+    def test_three_seeds_diverge_hw_or_gpu(self):
+        seeds = (10000, 22222, 33333, 44444, 55555)
+        personas = [mint_fingerprint_persona(s) for s in seeds]
+        self.assertGreaterEqual(len(seeds), 3)
+        hw_mem = {(p["hardware_concurrency"], p["device_memory"]) for p in personas}
+        vendors = {p["gpu_vendor"] for p in personas}
+        self.assertTrue(len(hw_mem) > 1 or len(vendors) > 1)
+        for seed, persona in zip(seeds, personas):
+            self.assertEqual(persona["derived_from_seed"], seed)
+            self.assertTrue(persona_derived_from_seed(persona, seed))
 
 
 class GeoCacheTests(unittest.TestCase):
