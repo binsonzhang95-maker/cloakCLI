@@ -27,7 +27,8 @@ from cloakcli_worker.fingerprint import (  # noqa: E402
 )
 
 
-SEEDS = (11111, 42424, 99887)
+# Intel UHD 620, Intel HD 620, AMD APU iGPU, NVIDIA RTX 3070.
+SEEDS = (11111, 42424, 99887, 10004)
 
 
 def probe_flags() -> list[dict]:
@@ -54,6 +55,8 @@ def probe_flags() -> list[dict]:
                 "platform_version": persona["platform_version"],
                 "hardware_concurrency": persona["hardware_concurrency"],
                 "device_memory": persona["device_memory"],
+                "gpu_vendor": persona["gpu_vendor"],
+                "gpu_renderer": persona["gpu_renderer"],
                 "screen": f"{persona['screen_width']}x{persona['screen_height']}",
                 "viewport": f"{persona['viewport_width']}x{persona['viewport_height']}",
                 "available": f"{persona['available_width']}x{persona['available_height']}",
@@ -98,6 +101,11 @@ def probe_live() -> list[dict]:
                         'uaFullVersion','fullVersionList','wow64'
                       ]);
                     }
+                    const canvas = document.createElement('canvas');
+                    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                    const dbg = gl ? gl.getExtension('WEBGL_debug_renderer_info') : null;
+                    const gpuVendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : null;
+                    const gpuRenderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null;
                     return {
                       ua,
                       brands: d ? d.brands : null,
@@ -109,6 +117,8 @@ def probe_live() -> list[dict]:
                       timezone: tz,
                       hardwareConcurrency: navigator.hardwareConcurrency,
                       deviceMemory: navigator.deviceMemory,
+                      gpuVendor,
+                      gpuRenderer,
                       screen: {width: screen.width, height: screen.height,
                                availWidth: screen.availWidth, availHeight: screen.availHeight}
                     };
@@ -124,6 +134,8 @@ def probe_live() -> list[dict]:
                         "platform_version": persona["platform_version"],
                         "hardware_concurrency": persona["hardware_concurrency"],
                         "device_memory": persona["device_memory"],
+                        "gpu_vendor": persona["gpu_vendor"],
+                        "gpu_renderer": persona["gpu_renderer"],
                     },
                     "observed": info,
                     "args": kwargs.get("args"),

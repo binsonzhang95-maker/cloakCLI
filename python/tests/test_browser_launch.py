@@ -48,13 +48,15 @@ class LaunchContextTests(unittest.TestCase):
         args = kwargs["args"]
         self.assertIn("--fingerprint=42424", args)
         self.assertIn("--fingerprint-brand=Chrome", args)
+        persona = mint_fingerprint_persona(42424)
+        self.assertIn(f"--fingerprint-gpu-vendor={persona['gpu_vendor']}", args)
+        self.assertIn(f"--fingerprint-gpu-renderer={persona['gpu_renderer']}", args)
         self.assertIn("--fingerprint-timezone=America/New_York", args)
         self.assertIn("--fingerprint-webrtc-ip=8.8.8.8", args)
         self.assertIn("--lang=en-US", args)
         self.assertTrue(kwargs.get("geoip"))
         self.assertEqual(kwargs.get("timezone"), "America/New_York")
         self.assertNotIn("user_agent", kwargs)
-        persona = mint_fingerprint_persona(42424)
         self.assertEqual(
             kwargs["viewport"],
             {"width": persona["viewport_width"], "height": persona["viewport_height"]},

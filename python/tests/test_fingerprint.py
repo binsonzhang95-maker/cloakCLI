@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from cloakcli_worker.fingerprint import (
+    PERSONA_SCHEMA,
     SEED_MAX,
     SEED_MIN,
     GeoResolutionError,
@@ -19,17 +20,20 @@ from cloakcli_worker.fingerprint import (
     ensure_language_preference,
     fingerprint_chrome_args,
     geo_cache_valid,
+    gpu_hw_memory_pool,
     is_register_launch,
     is_valid_fingerprint_seed,
     is_whitelisted_persona,
     mint_fingerprint_persona,
     mint_fingerprint_seed,
     persona_brand_tuple,
+    persona_gpu_tuple,
     proxy_session_identity,
     resolve_fingerprint_seed,
     resolve_geo_for_launch,
     validate_persona,
     verified_brand_tuples,
+    verified_gpu_tuples,
 )
 
 
@@ -43,6 +47,8 @@ class FingerprintSeedTests(unittest.TestCase):
         args = fingerprint_chrome_args(12345)
         self.assertIn("--fingerprint=12345", args)
         self.assertTrue(any(a.startswith("--fingerprint-brand=") for a in args))
+        self.assertTrue(any(a.startswith("--fingerprint-gpu-vendor=") for a in args))
+        self.assertTrue(any(a.startswith("--fingerprint-gpu-renderer=") for a in args))
         with self.assertRaises(ValueError):
             fingerprint_chrome_args(999)
         with self.assertRaises(ValueError):
@@ -161,6 +167,8 @@ class FingerprintSeedTests(unittest.TestCase):
         self.assertEqual(merged["--fingerprint"], "--fingerprint=99887")
         self.assertEqual(merged["--fingerprint-platform"], "--fingerprint-platform=windows")
         self.assertEqual(merged["--fingerprint-brand"], "--fingerprint-brand=Chrome")
+        self.assertTrue(merged["--fingerprint-gpu-vendor"].startswith("--fingerprint-gpu-vendor="))
+        self.assertTrue(merged["--fingerprint-gpu-renderer"].startswith("--fingerprint-gpu-renderer="))
 
 
 class PersonaMintTests(unittest.TestCase):
@@ -171,6 +179,7 @@ class PersonaMintTests(unittest.TestCase):
         self.assertTrue(is_whitelisted_persona(a))
         self.assertEqual(a["brand"], "Chrome")
         self.assertEqual(a["platform"], "windows")
+        self.assertEqual(a["schema"], PERSONA_SCHEMA)
         self.assertEqual(a["device_scale_factor"], 1)
         self.assertEqual(
             a["viewport_height"],
@@ -178,9 +187,16 @@ class PersonaMintTests(unittest.TestCase):
         )
         self.assertEqual(a["available_height"], a["screen_height"] - a["taskbar_height"])
         self.assertEqual(a["viewport_width"], a["screen_width"])
+        self.assertEqual(a["gpu_vendor"], b["gpu_vendor"])
+        self.assertEqual(a["gpu_renderer"], b["gpu_renderer"])
+        self.assertIn(persona_gpu_tuple(a), verified_gpu_tuples())
+        pool = gpu_hw_memory_pool(a["gpu_vendor"], a["gpu_renderer"])
+        self.assertIsNotNone(pool)
+        self.assertIn((a["hardware_concurrency"], a["device_memory"]), pool)
 
     def test_different_seeds_vary_non_brand_fields(self):
         seen = set()
+        vendors = set()
         for seed in (10000, 22222, 33333, 44444, 55555, 66666, 77777, 88888, 99999):
             p = mint_fingerprint_persona(seed)
             seen.add(
@@ -188,11 +204,16 @@ class PersonaMintTests(unittest.TestCase):
                     p["platform_version"],
                     p["hardware_concurrency"],
                     p["device_memory"],
+                    p["gpu_vendor"],
+                    p["gpu_renderer"],
                     p["screen_width"],
                     p["screen_height"],
                 )
             )
+            vendors.add(p["gpu_vendor"])
         self.assertGreater(len(seen), 1)
+        self.assertGreater(len(vendors), 1)
+        self.assertTrue(any("Intel" in v or "AMD" in v for v in vendors))
 
     def test_whitelist_only_chrome_windows(self):
         for tup in verified_brand_tuples():
@@ -219,6 +240,90 @@ class PersonaMintTests(unittest.TestCase):
         }
         self.assertGreater(len(combos), 1)
         self.assertTrue(any(c != (8, 8) for c in combos))
+
+    def test_gpu_vendor_diversity_across_seeds(self):
+        vendors = set()
+        renderers = set()
+        for seed in range(10000, 10150):
+            p = mint_fingerprint_persona(seed)
+            vendors.add(p["gpu_vendor"])
+            renderers.add(p["gpu_renderer"])
+            pool = gpu_hw_memory_pool(p["gpu_vendor"], p["gpu_renderer"])
+            self.assertIsNotNone(pool)
+            self.assertIn((p["hardware_concurrency"], p["device_memory"]), pool)
+        self.assertGreaterEqual(len(vendors), 2)
+        self.assertTrue(any("Intel" in v for v in vendors) or any("AMD" in v for v in vendors))
+        self.assertGreater(len(renderers), 1)
+        families = {v.split("(")[-1].rstrip(")") for v in vendors}
+        self.assertNotEqual(families, {"NVIDIA"})
+
+    def test_gpu_whitelist_covers_intel_amd_nvidia(self):
+        vendors = {v for v, _r in verified_gpu_tuples()}
+        self.assertIn("Google Inc. (Intel)", vendors)
+        self.assertIn("Google Inc. (AMD)", vendors)
+        self.assertIn("Google Inc. (NVIDIA)", vendors)
+        for vendor, renderer in verified_gpu_tuples():
+            self.assertTrue(vendor.startswith("Google Inc. ("))
+            self.assertTrue(renderer.startswith("ANGLE ("))
+            self.assertIn("Direct3D11 vs_5_0 ps_5_0, D3D11)", renderer)
+            self.assertGreaterEqual(len(gpu_hw_memory_pool(vendor, renderer) or ()), 1)
+
+    def test_whitelist_rejection_garbage_gpu(self):
+        bad = dict(mint_fingerprint_persona(12345))
+        bad["gpu_vendor"] = "Acme GPU Corp"
+        bad["gpu_renderer"] = "SwiftShader Device"
+        self.assertFalse(is_whitelisted_persona(bad))
+        with self.assertRaises(PersonaWhitelistError):
+            validate_persona(bad)
+        with self.assertRaises(PersonaWhitelistError):
+            fingerprint_chrome_args(12345, bad)
+
+    def test_whitelist_rejection_mismatched_gpu_tuple(self):
+        bad = dict(mint_fingerprint_persona(12345))
+        bad["gpu_vendor"] = "Google Inc. (Intel)"
+        bad["gpu_renderer"] = (
+            "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+        )
+        self.assertFalse(is_whitelisted_persona(bad))
+        with self.assertRaises(PersonaWhitelistError):
+            validate_persona(bad)
+
+    def test_whitelist_rejection_incoherent_gpu_hw_pair(self):
+        vendor = "Google Inc. (Intel)"
+        renderer = "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+        bad = dict(mint_fingerprint_persona(12345))
+        bad["gpu_vendor"] = vendor
+        bad["gpu_renderer"] = renderer
+        bad["hardware_concurrency"] = 16
+        bad["device_memory"] = 8
+        self.assertNotIn((16, 8), gpu_hw_memory_pool(vendor, renderer) or ())
+        self.assertFalse(is_whitelisted_persona(bad))
+        with self.assertRaises(PersonaWhitelistError):
+            validate_persona(bad)
+
+    def test_schema_v1_without_gpu_remints(self):
+        root = Path(tempfile.mkdtemp(prefix="fp_schema_"))
+        meta = root / "profile.json"
+        stale = dict(mint_fingerprint_persona(42424))
+        stale["schema"] = 1
+        stale.pop("gpu_vendor", None)
+        stale.pop("gpu_renderer", None)
+        meta.write_text(
+            json.dumps(
+                {
+                    "name": "x",
+                    "fingerprint_seed": 42424,
+                    "fingerprint_persona": stale,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        reminted = ensure_fingerprint_persona(meta, 42424)
+        self.assertEqual(reminted["schema"], PERSONA_SCHEMA)
+        self.assertIn("gpu_vendor", reminted)
+        self.assertIn("gpu_renderer", reminted)
+        self.assertEqual(reminted, mint_fingerprint_persona(42424))
 
     def test_persist_and_reject_then_remint(self):
         root = Path(tempfile.mkdtemp(prefix="fp_persona_"))
@@ -428,7 +533,12 @@ class LaunchKwargsTests(unittest.TestCase):
         self.assertTrue(any(a.startswith("--fingerprint-platform-version=") for a in args))
         self.assertTrue(any(a.startswith("--fingerprint-hardware-concurrency=") for a in args))
         self.assertTrue(any(a.startswith("--fingerprint-device-memory=") for a in args))
+        self.assertTrue(any(a.startswith("--fingerprint-gpu-vendor=") for a in args))
+        self.assertTrue(any(a.startswith("--fingerprint-gpu-renderer=") for a in args))
         self.assertTrue(any(a.startswith("--fingerprint-screen-width=") for a in args))
+        persona = mint_fingerprint_persona(42424)
+        self.assertIn(f"--fingerprint-gpu-vendor={persona['gpu_vendor']}", args)
+        self.assertIn(f"--fingerprint-gpu-renderer={persona['gpu_renderer']}", args)
         self.assertIn("--fingerprint-timezone=America/New_York", args)
         self.assertIn("--lang=en-US", args)
         self.assertIn("--fingerprint-locale=en-US", args)
@@ -438,7 +548,6 @@ class LaunchKwargsTests(unittest.TestCase):
         self.assertEqual(kwargs.get("locale"), "en-US")
         self.assertIn("viewport", kwargs)
         self.assertNotIn("user_agent", kwargs)
-        persona = mint_fingerprint_persona(42424)
         self.assertEqual(
             kwargs["viewport"],
             {"width": persona["viewport_width"], "height": persona["viewport_height"]},

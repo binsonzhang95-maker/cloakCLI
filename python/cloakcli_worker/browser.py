@@ -39,7 +39,7 @@ def launch_context(
     When a fingerprint_seed is known (explicit, profile_meta_path, or best-effort
     match of user_data_dir under profiles_root), pass binary fingerprint flags
     so cloakbrowser build_args overrides the per-launch random default. Persona
-    (Chrome brand + platform_version + hw/screen) is minted from the seed.
+    (Chrome brand + platform_version + hw/screen/GPU) is minted from the seed.
     With a proxy, geoip is resolved against the echo-verified exit IP and
     timezone/locale/WebRTC flags are set; register paths fail closed on geo
     failure (no host timezone fallback). Playwright user_agent is not used for

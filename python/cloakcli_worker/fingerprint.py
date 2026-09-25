@@ -7,7 +7,7 @@ persist it in profiles/<name>/profile.json as fingerprint_seed, and pass
 args=["--fingerprint=<seed>"] so cloakbrowser build_args dedupes by flag key
 and overrides the random default (platform=windows stealth stays).
 
-Persona flags (brand / platform_version / hardware / screen) are minted
+Persona flags (brand / platform_version / hardware / screen / GPU) are minted
 deterministically from that seed against a verified whitelist. GeoIP timezone
 is resolved from the proxy exit IP (City DB IANA) with a cache that invalidates
 when the exit IP, proxy session identity, or GeoLite DB version changes.
@@ -49,7 +49,7 @@ _PERSONA_FIELD = "fingerprint_persona"
 _GEO_FIELD = "geo_cache"
 _LANGUAGE_FIELD = "language"
 
-PERSONA_SCHEMA = 1
+PERSONA_SCHEMA = 2
 GEO_CACHE_SCHEMA = 1
 GEO_CACHE_TTL = timedelta(days=30)
 
@@ -60,7 +60,8 @@ _PLATFORM_VERSIONS_WINDOWS = ("10.0.0", "15.0.0")
 
 # Reasonable Windows desktop pairs. deviceMemory is the Device Memory API
 # bucket (0.25/0.5/1/2/4/8); 8 is the public Chrome cap. hardwareConcurrency
-# varies so the fleet is not stuck at 8/8.
+# varies so the fleet is not stuck at 8/8. GPU profiles below pick a subset
+# of these so iGPU SKUs do not land on high-core discrete desktops.
 HW_MEMORY_COMBOS: tuple[tuple[int, int], ...] = (
     (4, 4),
     (4, 8),
@@ -68,6 +69,78 @@ HW_MEMORY_COMBOS: tuple[tuple[int, int], ...] = (
     (8, 8),
     (12, 8),
     (16, 8),
+)
+
+# Verified Chrome-on-Windows WebGL unmasked ANGLE tuples.
+# (gpu_vendor, gpu_renderer, compatible (hardwareConcurrency, deviceMemory)).
+# Strings match Chromium 146 UNMASKED_VENDOR / UNMASKED_RENDERER on Windows D3D11.
+WINDOWS_ANGLE_GPUS: tuple[tuple[str, str, tuple[tuple[int, int], ...]], ...] = (
+    # Intel UHD 620 — 7th/8th-gen U-series laptops.
+    (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((4, 4), (4, 8), (8, 8)),
+    ),
+    # Intel HD 620 — 7th-gen Kaby Lake U.
+    (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Intel(R) HD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((4, 4), (4, 8), (8, 8)),
+    ),
+    # Intel UHD 630 — 8th/9th-gen desktop iGPU.
+    (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((4, 8), (6, 8), (8, 8)),
+    ),
+    # Intel Iris Xe — 11th-gen+ U-series.
+    (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((4, 8), (6, 8), (8, 8), (12, 8)),
+    ),
+    # AMD 5000/6000-series APU iGPU.
+    (
+        "Google Inc. (AMD)",
+        "ANGLE (AMD, AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((4, 8), (6, 8), (8, 8)),
+    ),
+    # AMD RX 580 — 2017 mid discrete.
+    (
+        "Google Inc. (AMD)",
+        "ANGLE (AMD, AMD Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((6, 8), (8, 8), (12, 8)),
+    ),
+    # AMD RX 6600 — 2021 1080p discrete.
+    (
+        "Google Inc. (AMD)",
+        "ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((6, 8), (8, 8), (12, 8), (16, 8)),
+    ),
+    # NVIDIA GTX 1650 — entry discrete / laptop.
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((4, 8), (6, 8), (8, 8)),
+    ),
+    # NVIDIA GTX 1660 SUPER — 2019 mid discrete.
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((6, 8), (8, 8), (12, 8)),
+    ),
+    # NVIDIA RTX 3060 — 2021 mid-high discrete.
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((8, 8), (12, 8), (16, 8)),
+    ),
+    # NVIDIA RTX 3070 — 2020 high discrete.
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ((8, 8), (12, 8), (16, 8)),
+    ),
 )
 
 # Screen presets: (width, height, taskbar_px, chrome_ui_px).
@@ -144,7 +217,8 @@ def verified_brand_tuples() -> tuple[tuple[str, str, str, str, str], ...]:
 
     Opera/Vivaldi-on-146 are not enabled: product version is not the Chromium
     kernel, and CH/UA coherence is unverified on this binary. Edge is omitted
-    for the same reason. Diversity comes from platform_version / hw / screen / geo.
+    for the same reason. Diversity comes from platform_version / hw / screen /
+    Windows ANGLE GPU vendor / geo.
     """
     compatible = deployed_chromium_version()
     # brand_version is the public Chromium version (e.g. 146.0.7680.177).
@@ -199,6 +273,18 @@ def _screen_inner(width: int, height: int, taskbar: int, chrome_ui: int) -> tupl
     return width, inner_h, width, avail_h
 
 
+def verified_gpu_tuples() -> tuple[tuple[str, str], ...]:
+    """Verified coherent (gpu_vendor, gpu_renderer) Windows ANGLE pairs."""
+    return tuple((vendor, renderer) for vendor, renderer, _pool in WINDOWS_ANGLE_GPUS)
+
+
+def gpu_hw_memory_pool(vendor: str, renderer: str) -> tuple[tuple[int, int], ...] | None:
+    for v, r, pool in WINDOWS_ANGLE_GPUS:
+        if v == vendor and r == renderer:
+            return pool
+    return None
+
+
 def mint_fingerprint_persona(seed: int) -> dict[str, Any]:
     """Deterministic persona from seed, drawn only from the verified whitelist."""
     if not is_valid_fingerprint_seed(seed):
@@ -206,7 +292,8 @@ def mint_fingerprint_persona(seed: int) -> dict[str, Any]:
     rng = random.Random(int(seed))
     tuples = verified_brand_tuples()
     brand, brand_version, chromium_compatible, platform, platform_version = rng.choice(tuples)
-    hw, mem = rng.choice(HW_MEMORY_COMBOS)
+    gpu_vendor, gpu_renderer, hw_pool = rng.choice(WINDOWS_ANGLE_GPUS)
+    hw, mem = rng.choice(hw_pool)
     sw, sh, taskbar, chrome_ui = rng.choice(SCREEN_PRESETS)
     vw, vh, aw, ah = _screen_inner(sw, sh, taskbar, chrome_ui)
     return {
@@ -218,6 +305,8 @@ def mint_fingerprint_persona(seed: int) -> dict[str, Any]:
         "platform_version": platform_version,
         "hardware_concurrency": hw,
         "device_memory": mem,
+        "gpu_vendor": gpu_vendor,
+        "gpu_renderer": gpu_renderer,
         "screen_width": sw,
         "screen_height": sh,
         "device_scale_factor": 1,
@@ -237,6 +326,13 @@ def persona_brand_tuple(persona: dict[str, Any]) -> tuple[str, str, str, str, st
         str(persona.get("chromium_compatible") or ""),
         str(persona.get("platform") or ""),
         str(persona.get("platform_version") or ""),
+    )
+
+
+def persona_gpu_tuple(persona: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(persona.get("gpu_vendor") or ""),
+        str(persona.get("gpu_renderer") or ""),
     )
 
 
@@ -269,6 +365,10 @@ def is_whitelisted_persona(persona: Any) -> bool:
         return False
     if persona_brand_tuple(persona) not in verified_brand_tuples():
         return False
+    gpu = persona_gpu_tuple(persona)
+    hw_pool = gpu_hw_memory_pool(gpu[0], gpu[1])
+    if hw_pool is None:
+        return False
     try:
         hw = int(persona["hardware_concurrency"])
         mem = int(persona["device_memory"])
@@ -279,6 +379,8 @@ def is_whitelisted_persona(persona: Any) -> bool:
     except (KeyError, TypeError, ValueError):
         return False
     if (hw, mem) not in HW_MEMORY_COMBOS:
+        return False
+    if (hw, mem) not in hw_pool:
         return False
     if (sw, sh, taskbar, chrome_ui) not in SCREEN_PRESETS:
         return False
@@ -321,6 +423,8 @@ def fingerprint_chrome_args(
         f"--fingerprint-brand-version={persona['brand_version']}",
         f"--fingerprint-hardware-concurrency={persona['hardware_concurrency']}",
         f"--fingerprint-device-memory={persona['device_memory']}",
+        f"--fingerprint-gpu-vendor={persona['gpu_vendor']}",
+        f"--fingerprint-gpu-renderer={persona['gpu_renderer']}",
         f"--fingerprint-screen-width={persona['screen_width']}",
         f"--fingerprint-screen-height={persona['screen_height']}",
         f"--fingerprint-taskbar-height={persona['taskbar_height']}",
@@ -560,6 +664,7 @@ def log_fingerprint_persona(persona: dict[str, Any]) -> None:
         f"brand={persona.get('brand')}/{persona.get('brand_version')} "
         f"platform={persona.get('platform')}/{persona.get('platform_version')} "
         f"hw={persona.get('hardware_concurrency')}/{persona.get('device_memory')} "
+        f"gpu={persona.get('gpu_vendor')} "
         f"screen={persona.get('screen_width')}x{persona.get('screen_height')}\n"
     )
     sys.stderr.flush()
