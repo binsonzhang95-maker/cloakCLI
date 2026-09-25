@@ -1,7 +1,7 @@
 # Fingerprint persona + geoip alignment
 
 **Branch:** `feat/fingerprint-persona-geoip`  
-**SHA:** 6b3868914c396179dc07405a874be6192b5697c7  
+**SHA:** f333ef100a65629f9fd13ed1505252bda7d6bc19  
 **Astra plan verdict:** `astra-ua-geoip-plan-verdict.md` — 有条件通过; this is the implementation, not a restore of registration.
 
 ## Round 1 (this landing): WebGL / GPU vendor diversity
