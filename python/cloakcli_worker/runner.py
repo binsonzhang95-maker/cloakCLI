@@ -155,12 +155,15 @@ def run_skill(
         candidate = profiles_root / profile_name / "profile.json"
         if candidate.is_file():
             meta_path = candidate
+    skill_name = skill.get("name") if isinstance(skill.get("name"), str) else None
     ctx = launch_context(
         user_data_dir=str(user_data_safe),
         headed=headed,
         proxy=proxy,
         profile_meta_path=meta_path,
         profiles_root=profiles_root,
+        skill_name=skill_name,
+        skill_path=str(skill_path_safe),
     )
     cookie_meta = None
     if cookie_file:

@@ -318,8 +318,8 @@ def main() -> int:
 
     from cloakbrowser import launch_persistent_context
     from cloakcli_worker.fingerprint import (
+        apply_to_launch_kwargs,
         ensure_fingerprint_seed,
-        fingerprint_chrome_args,
         log_fingerprint_seed,
     )
 
@@ -335,10 +335,17 @@ def main() -> int:
     kwargs = {
         "user_data_dir": str(ud),
         "headless": not headed,
-        "args": fingerprint_chrome_args(seed),
     }
     if meta.get("proxy"):
         kwargs["proxy"] = meta["proxy"]
+    apply_to_launch_kwargs(
+        kwargs,
+        seed=seed,
+        proxy=meta.get("proxy"),
+        headed=headed,
+        profile_meta_path=meta_path,
+        require_geo=False,
+    )
     ctx = launch_persistent_context(**kwargs)
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
 

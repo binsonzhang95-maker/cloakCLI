@@ -30,21 +30,30 @@ def launch_context(
     fingerprint_seed: int | None = None,
     profile_meta_path: str | Path | None = None,
     profiles_root: str | Path | None = None,
+    require_geo: bool | None = None,
+    skill_name: str | None = None,
+    skill_path: str | None = None,
 ) -> Any:
     """Launch persistent stealth Chromium via cloakbrowser.
 
     When a fingerprint_seed is known (explicit, profile_meta_path, or best-effort
-    match of user_data_dir under profiles_root), pass args=["--fingerprint=N"] so
-    cloakbrowser build_args overrides the per-launch random default. Platform
-    stealth args are unchanged. If no profile.json can be resolved, launch still
-    proceeds (cloakbrowser picks a random seed for that launch only).
+    match of user_data_dir under profiles_root), pass binary fingerprint flags
+    so cloakbrowser build_args overrides the per-launch random default. Persona
+    (Chrome brand + platform_version + hw/screen) is minted from the seed.
+    With a proxy, geoip is resolved against the echo-verified exit IP and
+    timezone/locale/WebRTC flags are set; register paths fail closed on geo
+    failure (no host timezone fallback). Playwright user_agent is not used for
+    persona (it desyncs HTTP UA / Client Hints / JS userAgentData).
     """
     from cloakbrowser import launch_persistent_context
 
     from .fingerprint import (
-        fingerprint_chrome_args,
+        apply_to_launch_kwargs,
+        env_require_geo,
+        is_register_launch,
         log_fingerprint_seed,
         resolve_fingerprint_seed,
+        resolve_profile_meta_path,
     )
 
     kwargs: dict[str, Any] = {
@@ -53,8 +62,9 @@ def launch_context(
     }
     if proxy:
         kwargs["proxy"] = proxy
-    if user_agent:
-        kwargs["user_agent"] = user_agent
+    # Do not apply Playwright user_agent for fingerprint identity. Forwarding
+    # a caller override still desyncs CH, so it is only kept when no seed/persona
+    # will be attached (handled below after seed resolve).
     if extension_paths:
         kwargs["extension_paths"] = list(extension_paths)
 
@@ -64,9 +74,31 @@ def launch_context(
         profiles_root=profiles_root,
         user_data_dir=user_data_dir,
     )
+    meta = resolve_profile_meta_path(
+        profile_meta_path=profile_meta_path,
+        profiles_root=profiles_root,
+        user_data_dir=user_data_dir,
+    )
+    if require_geo is None:
+        env_geo = env_require_geo()
+        if env_geo is not None:
+            require_geo = env_geo
+        else:
+            require_geo = is_register_launch(skill_name, skill_path)
+
+    if seed is not None or proxy:
+        apply_to_launch_kwargs(
+            kwargs,
+            seed=seed,
+            proxy=proxy,
+            headed=headed,
+            profile_meta_path=meta,
+            require_geo=require_geo,
+        )
     if seed is not None:
-        kwargs["args"] = fingerprint_chrome_args(seed)
         log_fingerprint_seed(seed)
+    if user_agent and seed is None:
+        kwargs["user_agent"] = user_agent
 
     return launch_persistent_context(**kwargs)
 

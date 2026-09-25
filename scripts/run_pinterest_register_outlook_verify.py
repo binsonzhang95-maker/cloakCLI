@@ -777,8 +777,8 @@ def main() -> int:
 
     from cloakbrowser import launch_persistent_context
     from cloakcli_worker.fingerprint import (  # noqa: E402
+        apply_to_launch_kwargs,
         ensure_fingerprint_seed,
-        fingerprint_chrome_args,
         log_fingerprint_seed,
     )
 
@@ -813,10 +813,17 @@ def main() -> int:
     kwargs = {
         "user_data_dir": str(ud),
         "headless": not headed,
-        "args": fingerprint_chrome_args(seed),
     }
     if proxy:
         kwargs["proxy"] = proxy
+    apply_to_launch_kwargs(
+        kwargs,
+        seed=seed,
+        proxy=proxy,
+        headed=headed,
+        profile_meta_path=meta_path,
+        require_geo=True,
+    )
     ctx = launch_persistent_context(**kwargs)
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     art = ROOT / "artifacts/pinterest"

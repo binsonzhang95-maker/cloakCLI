@@ -2621,19 +2621,30 @@ def launch_cloakbrowser(
     proxy: str | None,
     *,
     fingerprint_seed: int | None = None,
+    profile_meta_path: Path | str | None = None,
+    require_geo: bool = True,
 ) -> Any:
     """Persistent CloakBrowser only. Never system Chrome.
 
     Use persisted fingerprint_seed from profile.json; do not randomize per launch.
+    Register path fail-closes when proxy geo cannot be resolved.
     """
     from cloakbrowser import launch_persistent_context
-    from cloakcli_worker.fingerprint import fingerprint_chrome_args, log_fingerprint_seed
+    from cloakcli_worker.fingerprint import apply_to_launch_kwargs, log_fingerprint_seed
 
     kwargs: dict[str, Any] = {"user_data_dir": str(ud), "headless": not headed}
     if proxy:
         kwargs["proxy"] = proxy
+    if fingerprint_seed is not None or proxy:
+        apply_to_launch_kwargs(
+            kwargs,
+            seed=fingerprint_seed,
+            proxy=proxy,
+            headed=headed,
+            profile_meta_path=profile_meta_path,
+            require_geo=require_geo,
+        )
     if fingerprint_seed is not None:
-        kwargs["args"] = fingerprint_chrome_args(fingerprint_seed)
         log_fingerprint_seed(fingerprint_seed)
     return launch_persistent_context(**kwargs)
 
@@ -2895,7 +2906,14 @@ def main(argv: list[str] | None = None, stdin_payload: dict[str, Any] | None = N
             injected_key = True
         headed = not args.headless
         try:
-            ctx = launch_cloakbrowser(ud, headed=headed, proxy=proxy, fingerprint_seed=fp_seed)
+            ctx = launch_cloakbrowser(
+                ud,
+                headed=headed,
+                proxy=proxy,
+                fingerprint_seed=fp_seed,
+                profile_meta_path=profile_path,
+                require_geo=True,
+            )
         except Exception as e:
             report = {
                 "skill_id": SKILL_ID,
