@@ -1,7 +1,7 @@
 # Fingerprint persona + geoip alignment
 
 **Branch:** `feat/fingerprint-persona-geoip`  
-**SHA:** PENDING  
+**SHA:** bdf7d8b36b3ddd28c29c85ad6afff87af8180c26  
 **Astra plan verdict:** `astra-ua-geoip-plan-verdict.md` — 有条件通过; this is the implementation, not a restore of registration.  
 **Astra code R1:** `astra-ua-geoip-code-verdict.md` / `astra-ua-geoip-code-verdict-r1-summary.md` — **打回**. Round 2 lands the two 必改 blockers.
 
