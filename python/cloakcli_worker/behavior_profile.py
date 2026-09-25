@@ -51,6 +51,31 @@ ENV_MAX_ACTIONS = "CLOAKCLI_NURTURE_MAX_ACTIONS"
 ENV_MAX_STATE_VISITS = "CLOAKCLI_NURTURE_MAX_STATE_VISITS"
 
 
+class BehaviorProfileError(RuntimeError):
+    """Existing profile.json is corrupt/unreadable/non-object. File left untouched."""
+
+
+def _read_profile_json(meta_path: Path) -> dict[str, Any] | None:
+    """Load profile.json object.
+
+    Returns None if the file does not exist.
+    Raises BehaviorProfileError if the file exists but is unreadable, invalid JSON,
+    or not a JSON object — callers must not overwrite the file in that case.
+    """
+    meta_path = Path(meta_path)
+    if not meta_path.is_file():
+        return None
+    try:
+        loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BehaviorProfileError(
+            f"profile_json_unreadable:{meta_path.name}:{type(exc).__name__}"
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise BehaviorProfileError(f"profile_json_not_object:{meta_path.name}")
+    return loaded
+
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(float(lo), min(float(hi), float(v)))
 
@@ -383,16 +408,14 @@ def ensure_behavior_profile(
 
     Restart-stable: existing valid block is returned unchanged (unless regenerate).
     Preserves fingerprint_seed and all other fields.
+
+    Distinguishes missing file (mint OK) from corrupt/unreadable/non-object
+    existing file (raises BehaviorProfileError; file left untouched).
     """
     meta_path = Path(meta_path)
-    data: dict[str, Any] = {}
-    if meta_path.is_file():
-        try:
-            loaded = json.loads(meta_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except (OSError, json.JSONDecodeError):
-            data = {}
+    data = _read_profile_json(meta_path)
+    if data is None:
+        data = {}
 
     existing_raw = data.get(_FIELD)
     if isinstance(existing_raw, dict) and not regenerate:
@@ -418,17 +441,29 @@ def ensure_behavior_profile(
 
 
 def bump_session_seq(meta_path: Path) -> BehaviorProfile:
-    """Atomically increment session_seq so restarts do not replay the same prefix."""
+    """Increment session_seq so restarts do not replay the same prefix.
+
+    Caller MUST hold ProfileSessionLock for this profile (same-profile mutex).
+    Corrupt/unreadable profile raises BehaviorProfileError; file left untouched.
+    """
     meta_path = Path(meta_path)
-    profile = ensure_behavior_profile(meta_path)
-    data: dict[str, Any] = {}
-    if meta_path.is_file():
-        try:
-            loaded = json.loads(meta_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except (OSError, json.JSONDecodeError):
-            data = {}
+    data = _read_profile_json(meta_path)
+    if data is None:
+        # Missing file: mint then bump under the same write.
+        profile = ensure_behavior_profile(meta_path)
+        data = _read_profile_json(meta_path)
+        if data is None:
+            raise BehaviorProfileError(f"profile_json_missing_after_mint:{meta_path.name}")
+    else:
+        existing_raw = data.get(_FIELD)
+        profile = None
+        if isinstance(existing_raw, dict):
+            profile = BehaviorProfile.from_dict(existing_raw)
+        if profile is None:
+            profile = ensure_behavior_profile(meta_path)
+            data = _read_profile_json(meta_path)
+            if data is None:
+                raise BehaviorProfileError(f"profile_json_missing_after_mint:{meta_path.name}")
     updated = BehaviorProfile(
         schema_version=profile.schema_version,
         generator_version=profile.generator_version,
@@ -464,6 +499,13 @@ class SessionBudget:
     def elapsed_sec(self) -> float:
         return float(self._clock()) - float(self.t0)
 
+    def remaining_sec(self) -> float:
+        """Seconds left before max_session_elapsed (0 if exhausted/elapsed)."""
+        return max(0.0, float(self.max_session_elapsed_sec) - self.elapsed_sec())
+
+    def remaining_ms(self) -> int:
+        return int(self.remaining_sec() * 1000.0)
+
     def exhausted(self) -> bool:
         return self.end_reason is not None
 
@@ -483,20 +525,38 @@ class SessionBudget:
         return None
 
     def record_action(self) -> str | None:
+        """Permit one execution if actions < max_actions.
+
+        Allows the Nth action when max_actions=N; rejects N+1.
+        Returns end_reason iff the action is NOT allowed (does not consume).
+        """
+        reason = self.check()
+        if reason:
+            return reason
+        # actions is count of already-executed; permit while actions < max.
+        if self.actions >= int(self.max_actions):
+            self.end_reason = "budget_actions"
+            return self.end_reason
         self.actions += 1
-        return self.check()
+        return None
 
     def visit_state(self, name: str, *, cap: int | None = None) -> bool:
-        """Return True if visit allowed; False if state/global cap hit."""
+        """Return True if visit allowed and consume one; False if rejected (no consume).
+
+        Allows the Nth visit when max_state_visits/cap = N; rejects N+1.
+        Rejected attempts do not increment counters.
+        """
         if self.check():
             return False
         key = str(name)
         n = int(self.state_visits.get(key, 0))
         if cap is not None and n >= int(cap):
             return False
-        self.state_visits[key] = n + 1
-        if self.check():
+        total = sum(self.state_visits.values())
+        if total >= int(self.max_state_visits):
+            self.end_reason = "budget_state_visits"
             return False
+        self.state_visits[key] = n + 1
         return True
 
 

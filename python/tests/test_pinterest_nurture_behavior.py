@@ -186,9 +186,10 @@ class MousePathTests(unittest.TestCase):
         self.assertLess(math.hypot(path[0][0] - self.start[0], path[0][1] - self.start[1]), 6.0)
         self.assertLess(math.hypot(path[-1][0] - self.end[0], path[-1][1] - self.end[1]), 4.0)
         chord = math.hypot(self.end[0] - self.start[0], self.end[1] - self.start[1])
-        self.assertGreater(bh.path_length(path) / chord, 1.08)
+        # Curved Bézier interpolation (no overshoot-then-correct biometrics).
+        self.assertGreater(bh.path_length(path) / chord, 1.005)
         self.assertGreater(bh.line_deviation_px(path, self.start, self.end), 8.0)
-        self.assertTrue(bh.path_overshot(path, self.start, self.end))
+        self.assertFalse(bh.path_overshot(path, self.start, self.end))
         dwells = [p[2] for p in path]
         self.assertGreater(len(set(dwells)), 5)
 

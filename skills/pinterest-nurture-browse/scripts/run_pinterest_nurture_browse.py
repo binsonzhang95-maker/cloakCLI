@@ -45,6 +45,7 @@ if _PY_ROOT.is_dir() and str(_PY_ROOT) not in sys.path:
 
 try:
     from cloakcli_worker.behavior_profile import (  # noqa: E402
+        BehaviorProfileError,
         ProfileSessionLock,
         SessionBudget,
         bump_session_seq,
@@ -55,6 +56,7 @@ try:
         effective_params_hash,
     )
 except Exception:  # pragma: no cover - allow skill-only checkout without worker pkg
+    BehaviorProfileError = RuntimeError  # type: ignore
     ProfileSessionLock = None  # type: ignore
     SessionBudget = None  # type: ignore
     bump_session_seq = None  # type: ignore
@@ -80,6 +82,8 @@ from pinterest_nurture_behavior import (  # noqa: E402
     idle_wander_fill,
     inertial_scroll,
     hang_before_close,
+    clip_wait_to_session_ms,
+    session_remaining_ms,
     is_idle_wander_enabled,
     maybe_micro_reverse_scroll,
     optional_action_weight,
@@ -164,6 +168,14 @@ def _session_rng():
     return random.Random()
 
 
+def _optional_rng():
+    """Optional/idle substream — never the session stream."""
+    ctx = get_behavior_context()
+    if ctx is not None and ctx.streams is not None:
+        return ctx.streams.optional_rng
+    return random.Random()
+
+
 def pause(page, lo_ms: int, hi_ms: int, label: str = "", *, ambient: bool = False) -> int:
     """Heavy-tailed pause (log-normal). Optional idle ambient mouse wander while reading.
 
@@ -188,26 +200,30 @@ def pause(page, lo_ms: int, hi_ms: int, label: str = "", *, ambient: bool = Fals
     # 0.2.5: idle ambient wander is opt-in (feature flag / env), not a fixed ritual.
     if ambient and ms >= 500 and is_idle_wander_enabled():
         try:
+            # Clip dwell to remaining session elapsed; idle uses optional substream only.
+            idle_budget = clip_wait_to_session_ms(ms)
+            if idle_budget <= 0:
+                return ms
             idle_wander_fill(
                 page,
                 session_mouse(),
                 _IDLE_WANDER,
-                budget_ms=ms,
-                rng=rng,
+                budget_ms=idle_budget,
+                rng=_optional_rng(),
                 log_fn=log,
             )
         except Exception:
-            # Fallback: legacy ambient drift slice then quiet remainder.
+            # Fallback: quiet wait clipped to session remaining (no session-RNG idle).
             try:
-                budget = min(ms // 3, 900)
-                play_ambient_drift(page, session_mouse(), budget_ms=budget, rng=rng)
-                remain = ms - budget
+                remain = clip_wait_to_session_ms(ms)
                 if remain > 0:
                     page.wait_for_timeout(remain)
             except Exception:
-                page.wait_for_timeout(ms)
+                pass
     else:
-        page.wait_for_timeout(ms)
+        wait_ms = clip_wait_to_session_ms(ms)
+        if wait_ms > 0:
+            page.wait_for_timeout(wait_ms)
     return ms
 
 
@@ -1137,7 +1153,39 @@ def run_nurture_session(
     streams = None
     budget = None
     lock = None
+    hang_done = False
+    allow_hang = False  # set True only after successful behavior init + browse start
     resolved_meta = Path(meta_path) if meta_path is not None else (ROOT / "profiles" / profile / "profile.json")
+
+    def _finish(payload: dict) -> dict:
+        nonlocal hang_done
+        if end_reason and "end_reason" not in payload:
+            payload["end_reason"] = end_reason
+        elif budget is not None and budget.end_reason and "end_reason" not in payload:
+            payload["end_reason"] = budget.end_reason
+        ctx = get_behavior_context()
+        if ctx is not None and ctx.end_reason and "end_reason" not in payload:
+            payload["end_reason"] = ctx.end_reason
+        payload.setdefault("version", VERSION)
+        # Nonessential hang while budget/context still live; clipped to remaining.
+        # Skip on init-failure early exits (no browse ran).
+        if allow_hang and not hang_done and page is not None:
+            hang_done = True
+            try:
+                hang_before_close(page, session_mouse(), rng=_optional_rng(), log_fn=log)
+            except Exception:
+                pass
+        try:
+            set_behavior_context(None)
+        except Exception:
+            pass
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
+        return payload
+
     try:
         if ensure_behavior_profile is not None and resolved_meta.is_file():
             if ProfileSessionLock is not None:
@@ -1153,6 +1201,7 @@ def run_nurture_session(
                         "pins_opened": 0,
                         "version": VERSION,
                     })
+            # bump under same-profile lock (held above)
             bp = bump_session_seq(resolved_meta) if bump_session_seq else ensure_behavior_profile(resolved_meta)
             cfg = resolve_behavior_config(bp, idle_wander=idle_wander)
             streams = make_behavior_streams(bp.behavior_seed, bp.session_seq)
@@ -1179,7 +1228,19 @@ def run_nurture_session(
             }
             log({"behavior_profile": worked["behavior_profile"]})
         else:
-            # No profile.json — still isolate RNG from process-global.
+            # No profile.json — still isolate RNG from process-global; no silent
+            # "has config" path when worker helpers are missing for an existing file.
+            if resolved_meta.is_file() and ensure_behavior_profile is None:
+                return _finish({
+                    "status": "like_failed",
+                    "profile": profile,
+                    "error": "behavior_profile_unavailable",
+                    "end_reason": "behavior_init_failed",
+                    "elapsed_sec": 0,
+                    "liked": False,
+                    "pins_opened": 0,
+                    "version": VERSION,
+                })
             enable_idle = bool(bp_idle_wander_enabled(flag=idle_wander))
             streams = None
             set_behavior_context(
@@ -1190,38 +1251,40 @@ def run_nurture_session(
                     idle_wander_enabled=enable_idle,
                 )
             )
+    except BehaviorProfileError as e:
+        log({"behavior_profile_error": type(e).__name__, "detail": str(e)[:160]})
+        return _finish({
+            "status": "like_failed",
+            "profile": profile,
+            "error": "behavior_profile_corrupt",
+            "end_reason": "behavior_init_failed",
+            "elapsed_sec": 0,
+            "liked": False,
+            "pins_opened": 0,
+            "version": VERSION,
+        })
     except Exception as e:
-        log({"behavior_profile_error": type(e).__name__})
-        set_behavior_context(
-            BehaviorContext(idle_wander_enabled=bool(bp_idle_wander_enabled(flag=idle_wander)))
-        )
+        # Init failure must not silently continue without config/budget.
+        log({"behavior_profile_error": type(e).__name__, "detail": str(e)[:160]})
+        return _finish({
+            "status": "like_failed",
+            "profile": profile,
+            "error": "behavior_profile_init_failed",
+            "end_reason": "behavior_init_failed",
+            "elapsed_sec": 0,
+            "liked": False,
+            "pins_opened": 0,
+            "version": VERSION,
+        })
 
     reset_session_mouse()
-    reset_idle_wander(rng=_session_rng())
+    # Idle scheduler uses optional substream only (must not drain session RNG).
+    reset_idle_wander(rng=_optional_rng())
     plan = plan_nurture_session(
         persona=persona, pins=pins, min_sec=min_sec, max_sec=max_sec, rng=_session_rng()
     )
     worked["plan"] = plan
-
-    def _finish(payload: dict) -> dict:
-        if end_reason and "end_reason" not in payload:
-            payload["end_reason"] = end_reason
-        elif budget is not None and budget.end_reason and "end_reason" not in payload:
-            payload["end_reason"] = budget.end_reason
-        ctx = get_behavior_context()
-        if ctx is not None and ctx.end_reason and "end_reason" not in payload:
-            payload["end_reason"] = ctx.end_reason
-        payload.setdefault("version", VERSION)
-        try:
-            set_behavior_context(None)
-        except Exception:
-            pass
-        if lock is not None:
-            try:
-                lock.release()
-            except Exception:
-                pass
-        return payload
+    allow_hang = True
     log({"nurture_plan": plan})
     n_pins = int(plan["pins"])
     like_p = float(plan["like_prob"])
@@ -1330,7 +1393,7 @@ def run_nurture_session(
             # Optional hover-without-click on zero-pin / feed phases (profile-weighted; default ~35%).
             # 0.2.5: conditional optional step with state visit cap — no side-effect clicks.
             _hover_w = optional_action_weight("feed_hover", 1.0)
-            if feed_only and budget_allows(state="feed_hover", state_cap=4) and _session_rng().random() < (0.35 * _hover_w):
+            if feed_only and budget_allows(state="feed_hover", state_cap=4) and _optional_rng().random() < (0.35 * _hover_w):
                 try:
                     nlinks = page.locator(PIN_LINK).count()
                     if nlinks > 0:
@@ -1477,8 +1540,10 @@ def run_nurture_session(
                 else:
                     pause(page, 2500, 5500, f"pin_gaze_{pi}", ambient=True)
 
-                # 2) Optional ~50% light inertial peek scroll inside closeup
-                if linger.get("do_peek") and int(linger.get("peek_px") or 0) > 0:
+                # 2) Optional peek scroll — conditional + visit cap (0.2.5)
+                _peek_w = optional_action_weight("peek_scroll", 1.0)
+                do_peek = bool(linger.get("do_peek")) and int(linger.get("peek_px") or 0) > 0
+                if do_peek and budget_allows(state="peek_scroll", state_cap=8) and _optional_rng().random() < (1.0 * _peek_w):
                     try:
                         ensure_page_visible(page, log_fn=log)
                         remain = float(linger["peek_px"])
@@ -1556,7 +1621,12 @@ def run_nurture_session(
 
                 worked["close"] = close_pin(page)
                 pause(page, 1800, 5500, f"after_close_{pi}", ambient=True)
-                if pi < len(pin_ids) - 1 and _session_rng().random() < 0.7:
+                _bps_w = optional_action_weight("between_pin_scroll", 1.0)
+                if (
+                    pi < len(pin_ids) - 1
+                    and budget_allows(state="between_pin_scroll", state_cap=10)
+                    and _optional_rng().random() < (0.7 * _bps_w)
+                ):
                     try:
                         ensure_page_visible(page, log_fn=log)
                     except Exception:
@@ -1768,11 +1838,9 @@ def run_nurture_reopen(
             meta_path=meta_path,
         )
     finally:
-        try:
-            # Hang uses quiet wait unless idle wander explicitly enabled for this process.
-            hang_before_close(page, session_mouse(), rng=random.Random())
-        except Exception:
-            pass
+        # Hang is performed inside run_nurture_session._finish while SessionBudget
+        # is still live (clipped to remaining). Do not invent a fresh RNG here.
+        # Keep flush + close as the only necessary teardown in this wrapper.
         try:
             flush_storage_before_close(ctx, ud, page)
         except Exception:

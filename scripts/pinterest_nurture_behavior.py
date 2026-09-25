@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Pure Pinterest human-behavior helpers (no CloakBrowser fingerprint knobs).
 
-Continuous randomized mouse trails, inertial scroll, log-normal/gamma pauses,
-session personas, pin linger planning, visibility keepalive, micro reverse
-scroll, mixed close-path weights, and idle ambient mouse wander (nurture 0.2.4; DEFAULT OFF in 0.2.5). 0.2.5 P0: BehaviorProfile params + split RNG streams + session budgets (engineering de-homology, not an anti-detect claim).
+Continuous randomized mouse trails (Bézier interpolation, no tremor/overshoot
+biometrics), inertial scroll, log-normal/gamma pauses, session personas, pin
+linger planning, visibility keepalive, micro reverse scroll, mixed close-path
+weights. Idle ambient wander is DEFAULT OFF (opt-in only). 0.2.5 P0:
+BehaviorProfile params + split RNG streams + session budgets (engineering
+de-homology, not an anti-detect claim).
 Used by nurture browse and register runners. Stdlib only. Every pause site must
 re-sample independently (no fixed identical timing chains across steps/runs).
 """
@@ -167,7 +170,11 @@ def is_idle_wander_enabled() -> bool:
 
 
 def budget_allows(*, action: bool = False, state: str | None = None, state_cap: int | None = None) -> bool:
-    """Return False when session budget says stop (and set ctx.end_reason)."""
+    """Return False when session budget says stop (and set ctx.end_reason).
+
+    Permit semantics: max_actions=N allows N executions; visit caps allow N visits.
+    Counters only advance when the call returns True.
+    """
     ctx = _BEHAVIOR_CTX
     if ctx is None or ctx.budget is None:
         return True
@@ -185,6 +192,36 @@ def budget_allows(*, action: bool = False, state: str | None = None, state_cap: 
             ctx.end_reason = reason
             return False
     return True
+
+
+def session_remaining_ms() -> int | None:
+    """Remaining session elapsed budget in ms, or None if no SessionBudget attached."""
+    ctx = _BEHAVIOR_CTX
+    if ctx is None or ctx.budget is None:
+        return None
+    # check() may set budget_elapsed
+    ctx.budget.check()
+    if ctx.budget.end_reason == "budget_elapsed":
+        ctx.end_reason = ctx.end_reason or "budget_elapsed"
+        return 0
+    try:
+        return max(0, int(ctx.budget.remaining_ms()))
+    except Exception:
+        return max(0, int(float(ctx.budget.remaining_sec()) * 1000.0))
+
+
+def clip_wait_to_session_ms(requested_ms: int) -> int:
+    """Clip a wait to remaining session time. 0 means skip nonessential wait."""
+    req = max(0, int(requested_ms))
+    rem = session_remaining_ms()
+    if rem is None:
+        return req
+    if rem <= 0:
+        ctx = _BEHAVIOR_CTX
+        if ctx is not None:
+            ctx.end_reason = ctx.end_reason or "budget_elapsed"
+        return 0
+    return min(req, rem)
 
 
 
@@ -386,10 +423,11 @@ def build_mouse_path(
     *,
     rng: Any = None,
 ) -> list[tuple[float, float, int]]:
-    """Many small steps: multi-segment bezier, jitter, wander, overshoot+correct.
+    """Many small steps: multi-segment cubic Bézier interpolation to the target.
 
-    Not a single straight line or one simple Bézier to the target center.
-    Returns [(x, y, dwell_ms), ...]. Dwell is gamma/log-normal so speed varies.
+    Ordinary path interpolation only — no physiological tremor and no
+    overshoot-then-correct biometrics. Returns [(x, y, dwell_ms), ...].
+    Dwell is gamma/log-normal so speed varies along the curve.
     """
     rng = _as_rng(rng)
     x0, y0 = float(start[0]), float(start[1])
@@ -398,11 +436,11 @@ def build_mouse_path(
     dist = math.hypot(dx, dy)
     if dist < 2.0:
         pts = [(x0, y0, sample_gamma_ms(6, 28, alpha=2.0, beta=8.0, rng=rng))]
-        for _ in range(int(rng.randint(4, 8))):
+        for _ in range(int(rng.randint(2, 5))):
             pts.append(
                 (
-                    x1 + rng.uniform(-1.2, 1.2),
-                    y1 + rng.uniform(-1.2, 1.2),
+                    x1 + rng.uniform(-0.8, 0.8),
+                    y1 + rng.uniform(-0.8, 0.8),
                     sample_gamma_ms(6, 24, alpha=2.0, beta=7.0, rng=rng),
                 )
             )
@@ -424,11 +462,6 @@ def build_mouse_path(
                 y0 + dy * t + py * lat + uy * wander,
             )
         )
-    overshoot_px = rng.uniform(10.0, 28.0) + 0.02 * dist
-    ang = rng.uniform(-0.7, 0.7)
-    ox = x1 + (ux * math.cos(ang) - uy * math.sin(ang)) * overshoot_px
-    oy = y1 + (ux * math.sin(ang) + uy * math.cos(ang)) * overshoot_px
-    waypoints.append((ox, oy))
     waypoints.append((x1, y1))
 
     points: list[tuple[float, float, int]] = [
@@ -453,12 +486,6 @@ def build_mouse_path(
         for k in range(1, n_steps + 1):
             t = k / n_steps
             bx, by = cubic_bezier(a, p1, p2, b, t)
-            jamp = rng.uniform(0.6, 1.8)
-            jx = rng.gauss(0.0, jamp)
-            jy = rng.gauss(0.0, jamp)
-            if rng.random() < 0.12:
-                jx += rng.uniform(-3.5, 3.5)
-                jy += rng.uniform(-3.5, 3.5)
             ease = 1.55 - math.sin(t * math.pi)
             dwell = sample_gamma_ms(
                 4,
@@ -467,7 +494,7 @@ def build_mouse_path(
                 beta=max(6.0, 14.0 * ease),
                 rng=rng,
             )
-            points.append((bx + jx, by + jy, dwell))
+            points.append((bx, by, dwell))
     points.append((x1, y1, sample_gamma_ms(12, 40, alpha=2.5, beta=10.0, rng=rng)))
     return points
 
@@ -649,24 +676,42 @@ IDLE_SMALL_MAX_PLAY_MS = 700
 IDLE_LARGE_MAX_PLAY_MS = 2_800
 
 
+def _idle_rng(rng: Any = None) -> Any:
+    """Idle/optional substream only. Never consume session RNG.
+
+    Preference: explicit rng → context optional_rng → ephemeral Random.
+    """
+    if rng is not None:
+        return rng
+    ctx = _BEHAVIOR_CTX
+    if ctx is not None:
+        try:
+            return ctx.optional_rng()
+        except Exception:
+            pass
+    return random.Random()
+
+
 class IdleWanderState:
     """Tracks next small/large due times and intentional-action busy flag."""
 
     def __init__(self, *, rng: Any = None, now_ms: float | None = None) -> None:
-        self.rng = _as_rng(rng)
+        # Dedicated idle/optional stream if injected; never fall back to session RNG here.
+        self.rng = rng
         self.busy = False
         self.small_count = 0
         self.large_count = 0
         t0 = float(now_ms) if now_ms is not None else time.monotonic() * 1000.0
+        sched = _idle_rng(self.rng)
         # First small soon (0–1.2s) so short dwells/hangs still show motion; later gaps 2–8s.
-        self.next_small_at_ms = t0 + float(self.rng.randint(0, 1200))
+        self.next_small_at_ms = t0 + float(sched.randint(0, 1200))
         self.next_large_at_ms = t0 + float(
             sample_lognormal_ms(
                 IDLE_LARGE_INTERVAL_LO_MS,
                 IDLE_LARGE_INTERVAL_HI_MS,
                 mu=math.log(38.0),
                 sigma=0.30,
-                rng=self.rng,
+                rng=sched,
             )
         )
 
@@ -682,7 +727,7 @@ class IdleWanderState:
             IDLE_SMALL_INTERVAL_HI_MS,
             mu=math.log(4.0),
             sigma=0.35,
-            rng=self.rng,
+            rng=_idle_rng(self.rng),
         )
         self.next_small_at_ms = float(now_ms) + float(gap)
 
@@ -692,7 +737,7 @@ class IdleWanderState:
             IDLE_LARGE_INTERVAL_HI_MS,
             mu=math.log(38.0),
             sigma=0.30,
-            rng=self.rng,
+            rng=_idle_rng(self.rng),
         )
         self.next_large_at_ms = float(now_ms) + float(gap)
 
@@ -719,7 +764,8 @@ def build_idle_circle_wander(
 ) -> list[tuple[float, float, int]]:
     """Larger looping/arc wander (radius 120–280px), one loose lap or half-lap.
 
-    Multi-segment cubic path with tremor; settles near origin. No click.
+    Multi-segment cubic Bézier interpolation; settles near origin. No click.
+    No physiological tremor / overshoot-then-correct biometrics.
     """
     rng = _as_rng(rng)
     ox, oy = float(origin[0]), float(origin[1])
@@ -760,9 +806,6 @@ def build_idle_circle_wander(
         for k in range(1, n_steps + 1):
             tt = k / n_steps
             bx, by = cubic_bezier(cur, p1, p2, wp, tt)
-            jamp = rng.uniform(0.5, 1.6)
-            jx = rng.gauss(0.0, jamp)
-            jy = rng.gauss(0.0, jamp)
             ease = 1.45 - math.sin(tt * math.pi)
             dwell = sample_gamma_ms(
                 5,
@@ -771,14 +814,14 @@ def build_idle_circle_wander(
                 beta=max(5.0, 12.0 * ease),
                 rng=rng,
             )
-            points.append((bx + jx, by + jy, dwell))
+            points.append((bx, by, dwell))
         cur = wp
 
     settle = (
         ox + float(rng.uniform(-18.0, 18.0)),
         oy + float(rng.uniform(-18.0, 18.0)),
     )
-    # Light settle hop via existing path builder (may overshoot slightly — human-like).
+    # Settle via ordinary Bézier interpolation (no overshoot-then-correct).
     settle_path = build_mouse_path(cur, settle, rng=rng)
     if settle_path:
         points.extend(settle_path[1:] if len(settle_path) > 1 else settle_path)
@@ -834,10 +877,10 @@ def idle_wander_tick(
     Returns kind/moves/wait_ms/play_ms so callers can advance a virtual clock
     (important when page.wait_for_timeout is a no-op stub in unit tests).
     """
-    rng = _as_rng(rng if rng is not None else state.rng)
+    rng = _idle_rng(rng if rng is not None else state.rng)
     emit = log_fn if callable(log_fn) else (lambda _payload: None)
     now = float(now_ms) if now_ms is not None else time.monotonic() * 1000.0
-    remain = max(0, int(remain_ms))
+    remain = clip_wait_to_session_ms(max(0, int(remain_ms)))
     out: dict[str, Any] = {
         "kind": "none",
         "moves": 0,
@@ -923,7 +966,7 @@ def idle_wander_fill(
     0.2.5: DEFAULT OFF unless force=True or behavior context idle_wander_enabled.
     When disabled, performs a plain wait (no ambient motion).
     """
-    budget = max(0, int(budget_ms))
+    budget = clip_wait_to_session_ms(max(0, int(budget_ms)))
     if budget <= 0:
         return 0
     enabled = bool(force) or is_idle_wander_enabled()
@@ -933,7 +976,8 @@ def idle_wander_fill(
         except Exception:
             pass
         return budget
-    rng = _ctx_rng(rng if rng is not None else state.rng, kind="optional")
+    # Dedicated idle/optional stream — never the session stream, even if state.rng was session.
+    rng = _idle_rng(rng)
     virtual_now = float(now_ms) if now_ms is not None else time.monotonic() * 1000.0
     # Fast path for very short pauses.
     if budget < 500:
@@ -1019,28 +1063,35 @@ def hang_before_close(
     """
     if mouse is None:
         mouse = session_mouse()
-    rng = _as_rng(rng)
-    target = int(resolve_hang_before_close_ms(lo_ms=lo_ms, hi_ms=hi_ms, rng=rng))
+    rng = _idle_rng(rng)
+    sampled = int(resolve_hang_before_close_ms(lo_ms=lo_ms, hi_ms=hi_ms, rng=rng))
+    target = clip_wait_to_session_ms(sampled)
     emit = log_fn if callable(log_fn) else (
         lambda payload: print(json.dumps(payload, ensure_ascii=False), flush=True)
     )
-    emit({"status": "hang_before_close", "ms": target})
+    emit({"status": "hang_before_close", "ms": target, "sampled_ms": sampled})
     if target <= 0:
+        # Session elapsed exhausted (or env skip) — do not wait; caller still flush/close.
         return 0
     # Ambient idle wander (small + occasional large) for the hang budget.
+    # Isolated idle/optional stream; do not consume session RNG.
     state = IdleWanderState(rng=rng)
     t0 = time.monotonic()
+    filled = 0
     try:
-        idle_wander_fill(page, mouse, state, budget_ms=target, rng=rng, log_fn=emit)
+        filled = int(idle_wander_fill(page, mouse, state, budget_ms=target, rng=rng, log_fn=emit))
     except Exception:
-        # Fallback: quiet wait so hang still approximately honors target.
-        remain = max(0, target - int((time.monotonic() - t0) * 1000.0))
+        # Fallback: quiet wait clipped to remaining session time, not hang remainder.
+        remain = clip_wait_to_session_ms(max(0, target - int((time.monotonic() - t0) * 1000.0)))
         if remain > 0:
             try:
                 page.wait_for_timeout(int(remain))
             except Exception:
                 pass
-    elapsed = int(max(target, (time.monotonic() - t0) * 1000.0))
+            filled = int(remain)
+    wall = int((time.monotonic() - t0) * 1000.0)
+    # Prefer accounted fill ms (unit-test stubs may not sleep wall-clock).
+    elapsed = min(int(target), max(filled, wall))
     emit({"status": "hang_before_close_done", "ms": target, "elapsed_ms": elapsed})
     return elapsed
 

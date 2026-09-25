@@ -13,12 +13,17 @@ pauses, quiet window after load. 0 likes is a valid success.
 - Do **not** change CloakBrowser fingerprint / launch knobs.
 - Use the account’s **bound proxy** from `profile.json`.
 
+
+## 0.2.5 P0 (de-homology engineering)
+
+Per-profile `behavior_profile` in `profile.json` (separate from `fingerprint_seed`), split RNG streams, session budgets (`max_session_elapsed` / `max_actions` / `max_state_visits`), same-profile session lock. Idle wander is **opt-in only**. This is engineering de-homology — **not** an anti-detect guarantee.
+
 ## Behavior hardening (0.2.5)
 
 | Surface | What the runner does |
 |---------|----------------------|
 | Display | Headed by default; `--headless` opt-in; Xvfb OK |
-| Mouse | Many small `mouse.move` steps: randomized multi-segment Bézier, speed (gamma dwell), tremor, curve wander, overshoot then correct. Hover, then `mousedown`/`mouseup`. No teleport click to center. **Idle ambient wander (0.2.5):** frequent small hops (~15–80px every ~2–8s) + occasional large loop/arc (~120–280px every ~25–60s) during dwell; skipped while click/type/scroll busy |
+| Mouse | Many small `mouse.move` steps: randomized multi-segment Bézier interpolation, variable speed (gamma dwell). Hover, then `mousedown`/`mouseup`. No teleport click to center. No physiological tremor / overshoot-then-correct biometrics. **Idle ambient wander (0.2.5): DEFAULT OFF** — enable only via `--idle-wander` / `CLOAKCLI_IDLE_WANDER=1`; then small hops (~15–80px) + occasional large loop/arc during dwell; skipped while click/type/scroll busy |
 | Scroll | Inertial wheel: `v(t)=v0 e^{-kt}`, pause, slight reverse — not a fixed delta square wave |
 | Session | Personas `browse_only` / `light_like` / `deep_browse` / `bounce_early`. Pins **0–12** (or `--pins`; ~15–25% feed-only). Like probability **15–40%** (browse_only / feed-only = 0). **0 likes allowed** |
 | Timing | Log-normal / gamma pauses (not `randint`). Quiet window 1–2s after load before first pointer/key event |
@@ -26,7 +31,7 @@ pauses, quiet window after load. 0 likes is a valid success.
 | Duration | Respects `--min-sec` / `--max-sec` |
 
 - **Hang before close (0.2.2+):** after browse ends, ambient idle hang ~60–180s (lognormal; `CLOAKCLI_HANG_BEFORE_CLOSE_MS=0` skips in tests), then storage_state flush, then `ctx.close`.
-- **Idle ambient mouse wander (0.2.5):** during feed/pin dwell (`pause(..., ambient=True)`), `IdleWanderState` schedules small bezier hops (15–80px, every ~2–8s) and occasional large circle/half-lap (radius 120–280px, every ~25–60s). No click. Intentional click/type/scroll marks busy so idle ticks skip. Hang-before-close uses the same scheduler.
+- **Idle ambient mouse wander (0.2.5): DEFAULT OFF (opt-in only).** Enable with `--idle-wander` or `CLOAKCLI_IDLE_WANDER=1`. When enabled, during feed/pin dwell (`pause(..., ambient=True)`), `IdleWanderState` schedules small Bézier hops (15–80px, every ~2–8s) and occasional large circle/half-lap (radius 120–280px, every ~25–60s). No click. No tremor/overshoot biometrics. Intentional click/type/scroll marks busy so idle ticks skip. Hang-before-close may use the same scheduler and is clipped to the session time budget.
 - **Pin linger (0.2.3 P0):** open → independently sampled gaze 2.5–5.5s → optional ~50% peek scroll 300–600px → like only at 60–85% of planned dwell (never immediate) → pre-exit 1–3s → mixed close. Total ~4.5–22s (bounce ~2–4.5s).
 - **Visibility keepalive (0.2.3 P0):** before key/mouse bursts and during long pauses, soft-check `visibilityState` / `hasFocus`; bring_to_front + focus if needed. Logs `visibility_keepalive` (no secrets).
 - **Micro reverse scroll (0.2.3 P1):** after downward feed scrolls, ~12–18% (persona-weighted) reverse 20–45% of prior down magnitude; pause 1–3s; ≥1.5s between direction flips; net scroll still down.
