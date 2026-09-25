@@ -317,6 +317,97 @@ class BudgetPermitSemanticsTests(unittest.TestCase):
         self.assertEqual(budget.state_visits.get("hover"), 1)
 
 
+class CombinedBudgetAtomicityTests(unittest.TestCase):
+    """budget_allows(action=True, state=...) must check-then-commit atomically."""
+
+    def tearDown(self) -> None:
+        bh.set_behavior_context(None)
+
+    def _run_combined(self, budget: SessionBudget, *, state: str = "feed_scroll", state_cap: int = 12, attempts: int = 8) -> int:
+        bh.set_behavior_context(bh.BehaviorContext(budget=budget))
+        executed = 0
+        for _ in range(attempts):
+            if bh.budget_allows(action=True, state=state, state_cap=state_cap):
+                executed += 1
+            else:
+                break
+        return executed
+
+    def test_combined_max_state_visits_1_and_2(self) -> None:
+        for n in (1, 2):
+            budget = SessionBudget(
+                max_session_elapsed_sec=9999, max_actions=100, max_state_visits=n
+            )
+            executed = self._run_combined(budget, attempts=n + 3)
+            self.assertEqual(executed, n, f"max_state_visits={n}")
+            self.assertEqual(budget.actions, n)
+            self.assertEqual(sum(budget.state_visits.values()), n)
+            self.assertEqual(budget.end_reason, "budget_state_visits")
+
+    def test_combined_max_actions_1_and_2(self) -> None:
+        for n in (1, 2):
+            budget = SessionBudget(
+                max_session_elapsed_sec=9999, max_actions=n, max_state_visits=100
+            )
+            executed = self._run_combined(budget, attempts=n + 3)
+            self.assertEqual(executed, n, f"max_actions={n}")
+            self.assertEqual(budget.actions, n)
+            self.assertEqual(sum(budget.state_visits.values()), n)
+            self.assertEqual(budget.end_reason, "budget_actions")
+
+    def test_combined_both_caps_hit_together(self) -> None:
+        budget = SessionBudget(
+            max_session_elapsed_sec=9999, max_actions=2, max_state_visits=2
+        )
+        executed = self._run_combined(budget, attempts=5)
+        self.assertEqual(executed, 2)
+        self.assertEqual(budget.actions, 2)
+        self.assertEqual(sum(budget.state_visits.values()), 2)
+        self.assertIn(budget.end_reason, ("budget_actions", "budget_state_visits"))
+
+    def test_local_state_cap_reject_leaves_both_counters_unchanged(self) -> None:
+        budget = SessionBudget(
+            max_session_elapsed_sec=9999, max_actions=100, max_state_visits=100
+        )
+        bh.set_behavior_context(bh.BehaviorContext(budget=budget))
+        self.assertTrue(bh.budget_allows(action=True, state="hover", state_cap=1))
+        self.assertEqual(budget.actions, 1)
+        self.assertEqual(budget.state_visits.get("hover"), 1)
+        # Local cap reject must not burn action or another visit.
+        self.assertFalse(bh.budget_allows(action=True, state="hover", state_cap=1))
+        self.assertEqual(budget.actions, 1)
+        self.assertEqual(budget.state_visits.get("hover"), 1)
+        self.assertIsNone(budget.end_reason)
+
+    def test_global_reject_leaves_both_counters_unchanged(self) -> None:
+        budget = SessionBudget(
+            max_session_elapsed_sec=9999, max_actions=1, max_state_visits=100
+        )
+        bh.set_behavior_context(bh.BehaviorContext(budget=budget))
+        self.assertTrue(bh.budget_allows(action=True, state="feed_scroll", state_cap=12))
+        self.assertEqual(budget.actions, 1)
+        self.assertEqual(budget.state_visits.get("feed_scroll"), 1)
+        # Global action reject must not increment state visits either.
+        self.assertFalse(bh.budget_allows(action=True, state="pin_open", state_cap=16))
+        self.assertEqual(budget.actions, 1)
+        self.assertEqual(budget.state_visits.get("feed_scroll"), 1)
+        self.assertNotIn("pin_open", budget.state_visits)
+        self.assertEqual(budget.end_reason, "budget_actions")
+
+        budget2 = SessionBudget(
+            max_session_elapsed_sec=9999, max_actions=100, max_state_visits=1
+        )
+        bh.set_behavior_context(bh.BehaviorContext(budget=budget2))
+        self.assertTrue(bh.budget_allows(action=True, state="a", state_cap=12))
+        self.assertEqual(budget2.actions, 1)
+        self.assertEqual(sum(budget2.state_visits.values()), 1)
+        self.assertFalse(bh.budget_allows(action=True, state="b", state_cap=12))
+        self.assertEqual(budget2.actions, 1)
+        self.assertEqual(sum(budget2.state_visits.values()), 1)
+        self.assertNotIn("b", budget2.state_visits)
+        self.assertEqual(budget2.end_reason, "budget_state_visits")
+
+
 class CorruptProfilePreservedTests(unittest.TestCase):
     def test_corrupt_json_leaves_file_unchanged(self) -> None:
         td = Path(tempfile.mkdtemp(prefix="bp_corrupt_"))

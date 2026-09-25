@@ -524,21 +524,60 @@ class SessionBudget:
             return self.end_reason
         return None
 
+    def permit(
+        self,
+        *,
+        action: bool = False,
+        state: str | None = None,
+        state_cap: int | None = None,
+    ) -> bool:
+        """Atomically check then commit action and/or state visit.
+
+        Pre-checks elapsed, global actions, global visits, and optional local
+        state_cap BEFORE mutating any counters. If all pass, commits every
+        needed increment together; if any check fails, increments nothing.
+
+        Local state_cap rejects return False without setting end_reason.
+        Global rejects set end_reason (budget_elapsed / budget_actions /
+        budget_state_visits).
+        """
+        if self.end_reason:
+            return False
+        if self.elapsed_sec() >= float(self.max_session_elapsed_sec):
+            self.end_reason = "budget_elapsed"
+            return False
+        if self.actions >= int(self.max_actions):
+            self.end_reason = "budget_actions"
+            return False
+        total_visits = sum(self.state_visits.values())
+        if total_visits >= int(self.max_state_visits):
+            self.end_reason = "budget_state_visits"
+            return False
+
+        key: str | None = None
+        n = 0
+        if state is not None:
+            key = str(state)
+            n = int(self.state_visits.get(key, 0))
+            if state_cap is not None and n >= int(state_cap):
+                return False
+
+        # Commit only after every check passed.
+        if key is not None:
+            self.state_visits[key] = n + 1
+        if action:
+            self.actions += 1
+        return True
+
     def record_action(self) -> str | None:
         """Permit one execution if actions < max_actions.
 
         Allows the Nth action when max_actions=N; rejects N+1.
         Returns end_reason iff the action is NOT allowed (does not consume).
         """
-        reason = self.check()
-        if reason:
-            return reason
-        # actions is count of already-executed; permit while actions < max.
-        if self.actions >= int(self.max_actions):
-            self.end_reason = "budget_actions"
-            return self.end_reason
-        self.actions += 1
-        return None
+        if self.permit(action=True):
+            return None
+        return self.end_reason or "budget_actions"
 
     def visit_state(self, name: str, *, cap: int | None = None) -> bool:
         """Return True if visit allowed and consume one; False if rejected (no consume).
@@ -546,18 +585,7 @@ class SessionBudget:
         Allows the Nth visit when max_state_visits/cap = N; rejects N+1.
         Rejected attempts do not increment counters.
         """
-        if self.check():
-            return False
-        key = str(name)
-        n = int(self.state_visits.get(key, 0))
-        if cap is not None and n >= int(cap):
-            return False
-        total = sum(self.state_visits.values())
-        if total >= int(self.max_state_visits):
-            self.end_reason = "budget_state_visits"
-            return False
-        self.state_visits[key] = n + 1
-        return True
+        return self.permit(state=str(name), state_cap=cap)
 
 
 class ProfileSessionLock:

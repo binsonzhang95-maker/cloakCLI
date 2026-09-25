@@ -174,24 +174,18 @@ def budget_allows(*, action: bool = False, state: str | None = None, state_cap: 
 
     Permit semantics: max_actions=N allows N executions; visit caps allow N visits.
     Counters only advance when the call returns True.
+
+    Combined action+state is atomic via SessionBudget.permit: all pre-checks
+    (elapsed, global actions, global visits, local state_cap) run before any
+    counter mutation; on failure nothing is incremented.
     """
     ctx = _BEHAVIOR_CTX
     if ctx is None or ctx.budget is None:
         return True
-    if ctx.budget.check():
+    ok = ctx.budget.permit(action=action, state=state, state_cap=state_cap)
+    if not ok and ctx.budget.end_reason:
         ctx.end_reason = ctx.budget.end_reason
-        return False
-    if state is not None:
-        if not ctx.budget.visit_state(state, cap=state_cap):
-            if ctx.budget.end_reason:
-                ctx.end_reason = ctx.budget.end_reason
-            return False
-    if action:
-        reason = ctx.budget.record_action()
-        if reason:
-            ctx.end_reason = reason
-            return False
-    return True
+    return ok
 
 
 def session_remaining_ms() -> int | None:
@@ -991,7 +985,11 @@ def idle_wander_fill(
     guard = 0
     while spent < budget and guard < 10_000:
         guard += 1
-        remain = budget - spent
+        # Re-clip each iteration to the live session deadline (not just the
+        # initial pause budget snapshot).
+        remain = clip_wait_to_session_ms(budget - spent)
+        if remain <= 0:
+            break
         tick = idle_wander_tick(
             page,
             mouse,
@@ -1003,12 +1001,14 @@ def idle_wander_fill(
         )
         advanced = int(tick.get("wait_ms") or 0) + int(tick.get("play_ms") or 0)
         if advanced <= 0:
-            advanced = min(remain, 50)
+            advanced = clip_wait_to_session_ms(min(remain, 50))
+            if advanced <= 0:
+                break
             try:
                 page.wait_for_timeout(advanced)
             except Exception:
                 pass
-        # Never overrun the caller's pause budget.
+        # Never overrun the caller's pause budget / session remainder.
         advanced = min(advanced, remain)
         spent += advanced
         virtual_now += float(advanced)
