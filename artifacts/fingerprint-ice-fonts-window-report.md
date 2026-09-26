@@ -3,7 +3,8 @@
 **Branch:** `feat/fingerprint-ice-fonts-window`  
 **Base:** `feat/fingerprint-persona-geoip` @ `3d3c8a8`  
 **Astra next-steps:** `artifacts/astra-fingerprint-next-steps-verdict.md` — 有条件通过  
-**Implement brief:** `artifacts/ask-grok-fingerprint-ice-fonts-window.md`
+**Implement brief:** `artifacts/ask-grok-fingerprint-ice-fonts-window.md`  
+**Astra code R1:** 有条件通过 → **R2: 通过** (`artifacts/astra-fingerprint-ice-fonts-window-code-r2-summary.md`)
 
 ## Round 1 (Astra code 有条件通过 nits)
 

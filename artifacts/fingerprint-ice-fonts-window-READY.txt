@@ -1,0 +1,6 @@
+READY — feat/fingerprint-ice-fonts-window
+HEAD: caa28da92688d2a6eb792258494d08f72596a12e
+Astra code: 通过 (R2)
+Tests: 294 OK
+P0: ICE host==exit IP (register auto-gate), font gate (register fail-closed / nurture warn), headed --window-size
+Ops: install licensed Windows minimum fonts before strict register (docs/windows-fonts-linux-ops.md)
