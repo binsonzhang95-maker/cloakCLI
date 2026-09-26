@@ -191,5 +191,23 @@ class DualBinProfileBindingTests(unittest.TestCase):
         self.assertIn("--fingerprint-brand-version=146.0.7680.177", kwargs["args"])
 
 
+    def test_seedless_user_agent_forbidden_under_dual_bin(self):
+        with mock.patch.dict(
+            os.environ,
+            {"CLOAKCLI_DUAL_BIN": "1", "CLOAKCLI_BROWSER_VERSION": "145.0.7632.109.2"},
+        ):
+            with mock.patch("cloakbrowser.launch_persistent_context") as launch:
+                with self.assertRaises(BrowserVersionError) as ctx:
+                    launch_context(
+                        user_data_dir="/tmp/ud",
+                        headed=False,
+                        user_agent="Mozilla/5.0 FakeUA-Chrome/999",
+                        require_geo=False,
+                        browser_version="145.0.7632.109.2",
+                    )
+                self.assertIn("user_agent", str(ctx.exception).lower())
+                launch.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

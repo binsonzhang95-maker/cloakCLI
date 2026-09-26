@@ -56,7 +56,9 @@ def launch_context(
     from cloakbrowser import launch_persistent_context
 
     from .fingerprint import (
+        BrowserVersionError,
         apply_to_launch_kwargs,
+        dual_bin_mode,
         env_require_geo,
         is_register_launch,
         log_fingerprint_seed,
@@ -115,6 +117,13 @@ def launch_context(
     if seed is not None:
         log_fingerprint_seed(seed)
     if user_agent and seed is None:
+        # Dual-bin / pinned launch: never forward Playwright user_agent — it
+        # desyncs CH/JS from the bound binary (fake multi-version). Fail closed.
+        if dual_bin_mode() or kwargs.get("browser_version"):
+            raise BrowserVersionError(
+                "BROWSER_VERSION: Playwright user_agent forbidden under dual-bin "
+                "/ pinned browser_version (UA/CH must follow the bound binary)"
+            )
         kwargs["user_agent"] = user_agent
 
     ctx = launch_persistent_context(**kwargs)
