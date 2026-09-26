@@ -765,6 +765,18 @@ class WebrtcIceAssertTests(unittest.TestCase):
         with self.assertRaises(WebrtcIceLeakError):
             assert_webrtc_host_equals_exit_ip(cands, "8.8.8.8")
 
+
+    def test_assert_normalizes_ipv6(self):
+        # Compressed vs expanded form of the same public address must match.
+        expanded = "2606:4700:4700:0000:0000:0000:0000:1111"
+        cands = [
+            "candidate:1 1 UDP 2122260223 2606:4700:4700::1111 54400 typ host generation 0"
+        ]
+        self.assertEqual(
+            assert_webrtc_host_equals_exit_ip(cands, expanded),
+            ["2606:4700:4700::1111"],
+        )
+
     def test_assert_fail_when_no_host_candidates(self):
         cands = [self._cand("8.8.8.8", "srflx")]
         with self.assertRaises(WebrtcIceLeakError) as ctx:

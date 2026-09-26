@@ -5,6 +5,20 @@
 **Astra next-steps:** `artifacts/astra-fingerprint-next-steps-verdict.md` — 有条件通过  
 **Implement brief:** `artifacts/ask-grok-fingerprint-ice-fonts-window.md`
 
+## Round 1 (Astra code 有条件通过 nits)
+
+SHA after R1: *(see git)*. Cleared clearable nits from R1 有条件通过:
+
+1. **Register ICE auto-gate** — `launch_context` now calls `verify_webrtc_ice_no_leak`
+   when `require_geo` and `--fingerprint-webrtc-ip` are set (opt out:
+   `CLOAKCLI_REQUIRE_WEBRTC_ICE=0`). Closes context on leak.
+2. **IPv6-normalized ICE compare** — `assert_webrtc_host_equals_exit_ip` uses
+   `ipaddress` canonical form.
+3. Remaining residual (docs only): live headed outer/inner WM smoke still ops-run.
+
+**294 tests, OK.**
+
+
 ## What landed (P0 only)
 
 ### 1. WebRTC full ICE assertion
@@ -50,7 +64,7 @@ geo double-echo dedupe.
 ```
 PYTHONPATH=python python3 -m unittest discover -s python/tests
 ```
-**292 tests, OK.**
+**294 tests, OK.**
 
 Offline probe:
 ```
@@ -69,6 +83,6 @@ fail-closed until ops installs licensed pack).
 - P1 HTTP CH / Accept-Language still open.
 
 ## Register ICE wiring note
-`launch_context` does not auto-gather ICE (latency). Strict register should call
-`verify_webrtc_ice_no_leak(page, exit_ip)` after launch when `geo_cache.exit_ip`
-/ `--fingerprint-webrtc-ip` is known. Failure raises `WebrtcIceLeakError`.
+`launch_context` auto-gathers ICE when `require_geo` and `--fingerprint-webrtc-ip`
+are set; failure raises `WebrtcIceLeakError` and closes the context. Opt out with
+`CLOAKCLI_REQUIRE_WEBRTC_ICE=0` (nurture / debug).

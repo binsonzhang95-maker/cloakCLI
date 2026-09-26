@@ -45,9 +45,9 @@ def launch_context(
     failure (no host timezone fallback). Register/strict also fail-closed when
     Windows minimum fonts are missing (nurture warns only; no silent MS font
     install). Headed launches emit --window-size from persona screen (not
-    maximize-only). Post-launch ICE: call
-    cloakcli_worker.fingerprint.verify_webrtc_ice_no_leak(page, exit_ip) so
-    host candidates must equal the echo exit IP. Playwright user_agent is not
+    maximize-only). Post-launch ICE: when require_geo is true and --fingerprint-webrtc-ip is
+    set, launch_context gathers ICE (page/iframe/worker) and fail-closes on
+    host leak (opt out with CLOAKCLI_REQUIRE_WEBRTC_ICE=0). Playwright user_agent is not
     used for persona (it desyncs HTTP UA / Client Hints / JS userAgentData).
     """
     from cloakbrowser import launch_persistent_context
@@ -105,7 +105,43 @@ def launch_context(
     if user_agent and seed is None:
         kwargs["user_agent"] = user_agent
 
-    return launch_persistent_context(**kwargs)
+    ctx = launch_persistent_context(**kwargs)
+
+    # Strict register / require_geo: post-launch ICE host must equal echo exit IP.
+    # Skip when no --fingerprint-webrtc-ip (no proxy geo) or when ops opts out.
+    if require_geo and _env_require_webrtc_ice():
+        exit_ip = _webrtc_ip_from_args(kwargs.get("args") or [])
+        if exit_ip:
+            from .fingerprint import verify_webrtc_ice_no_leak
+
+            page = get_page(ctx)
+            try:
+                verify_webrtc_ice_no_leak(page, exit_ip)
+            except Exception:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+                raise
+
+    return ctx
+
+
+def _webrtc_ip_from_args(args: list[str]) -> str | None:
+    for arg in args:
+        if isinstance(arg, str) and arg.startswith("--fingerprint-webrtc-ip="):
+            ip = arg.split("=", 1)[1].strip()
+            return ip or None
+    return None
+
+
+def _env_require_webrtc_ice() -> bool:
+    """Default ON for strict paths that already set require_geo; allow opt-out."""
+    raw = os.environ.get("CLOAKCLI_REQUIRE_WEBRTC_ICE", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    # empty / unset → enabled when caller already chose require_geo
+    return True
 
 
 def get_page(ctx: Any) -> Any:

@@ -572,6 +572,14 @@ def host_candidate_ips(candidates: list[str] | tuple[str, ...]) -> list[str]:
     return out
 
 
+def _normalize_ip(ip: str) -> str | None:
+    """Canonical IP string for equality (handles IPv6 compression / IPv4)."""
+    try:
+        return str(ipaddress.ip_address(ip.strip()))
+    except ValueError:
+        return None
+
+
 def assert_webrtc_host_equals_exit_ip(
     candidates: list[str] | tuple[str, ...],
     exit_ip: str,
@@ -580,13 +588,15 @@ def assert_webrtc_host_equals_exit_ip(
 
     Also fails when a host candidate is private/loopback/link-local even if it
     somehow matched (defensive). Returns the host IP list on success.
+    Comparison uses ipaddress-normalized forms so IPv6 compression variants match.
     """
     if not isinstance(exit_ip, str) or not exit_ip.strip():
         raise WebrtcIceLeakError("WEBRTC_ICE: missing echo exit IP for assertion")
-    expected = exit_ip.strip()
-    if not _is_public_ip(expected):
+    expected_raw = exit_ip.strip()
+    expected = _normalize_ip(expected_raw)
+    if expected is None or not _is_public_ip(expected):
         raise WebrtcIceLeakError(
-            f"WEBRTC_ICE: exit IP is not public; refusing assert ({expected!r})"
+            f"WEBRTC_ICE: exit IP is not public; refusing assert ({expected_raw!r})"
         )
     hosts = host_candidate_ips(candidates)
     if not hosts:
@@ -595,9 +605,8 @@ def assert_webrtc_host_equals_exit_ip(
         )
     bad: list[str] = []
     for ip in hosts:
-        if ip != expected:
-            bad.append(ip)
-        elif not _is_public_ip(ip):
+        norm = _normalize_ip(ip)
+        if norm is None or norm != expected or not _is_public_ip(norm):
             bad.append(ip)
     if bad:
         # Never claim "machine IP" in logs beyond the leaked address itself.
