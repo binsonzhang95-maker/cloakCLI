@@ -2,7 +2,7 @@
 
 **To:** Pi's Astra (`codex exec -m gpt-6-astra`)  
 **Repo:** `/workspace/CloakCLI`  
-**Branch:** `feat/fingerprint-ice-fonts-window`  
+**Branch / SHA:** `feat/fingerprint-ice-fonts-window` @ `93fc63d4bccf4977e24117b72b525e37419a58f2`  
 **R1:** `artifacts/astra-fingerprint-ice-fonts-window-code-verdict.md` — **有条件通过**, blockers 无; nits listed below.  
 **Do NOT implement. Code review only. 中文。半页内。**
 
