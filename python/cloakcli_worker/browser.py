@@ -42,8 +42,13 @@ def launch_context(
     (Chrome brand + platform_version + hw/screen/GPU) is minted from the seed.
     With a proxy, geoip is resolved against the echo-verified exit IP and
     timezone/locale/WebRTC flags are set; register paths fail closed on geo
-    failure (no host timezone fallback). Playwright user_agent is not used for
-    persona (it desyncs HTTP UA / Client Hints / JS userAgentData).
+    failure (no host timezone fallback). Register/strict also fail-closed when
+    Windows minimum fonts are missing (nurture warns only; no silent MS font
+    install). Headed launches emit --window-size from persona screen (not
+    maximize-only). Post-launch ICE: call
+    cloakcli_worker.fingerprint.verify_webrtc_ice_no_leak(page, exit_ip) so
+    host candidates must equal the echo exit IP. Playwright user_agent is not
+    used for persona (it desyncs HTTP UA / Client Hints / JS userAgentData).
     """
     from cloakbrowser import launch_persistent_context
 

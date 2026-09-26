@@ -35,14 +35,18 @@ class LaunchContextTests(unittest.TestCase):
                 "cloakcli_worker.fingerprint.resolve_geo_for_launch",
                 return_value=geo,
             ):
-                launch_context(
-                    user_data_dir=str(root / "ud"),
-                    headed=False,
-                    proxy="http://sess:pw@127.0.0.1:9",
-                    fingerprint_seed=42424,
-                    profile_meta_path=meta,
-                    require_geo=True,
-                )
+                with mock.patch(
+                    "cloakcli_worker.fingerprint.enforce_windows_font_gate",
+                    return_value=[],
+                ):
+                    launch_context(
+                        user_data_dir=str(root / "ud"),
+                        headed=False,
+                        proxy="http://sess:pw@127.0.0.1:9",
+                        fingerprint_seed=42424,
+                        profile_meta_path=meta,
+                        require_geo=True,
+                    )
         self.assertTrue(launch.called)
         kwargs = launch.call_args.kwargs
         args = kwargs["args"]
@@ -65,29 +69,57 @@ class LaunchContextTests(unittest.TestCase):
     def test_register_path_fail_closed(self):
         with mock.patch("cloakbrowser.launch_persistent_context") as launch:
             with mock.patch(
-                "cloakcli_worker.fingerprint.resolve_geo_for_launch",
-                side_effect=GeoResolutionError("GEO_DB_MISSING: GeoLite2-City database unavailable"),
+                "cloakcli_worker.fingerprint.enforce_windows_font_gate",
+                return_value=[],
             ):
-                with self.assertRaises(GeoResolutionError):
-                    launch_context(
-                        user_data_dir="/tmp/ud",
-                        headed=False,
-                        proxy="http://sess:pw@127.0.0.1:9",
-                        fingerprint_seed=42424,
-                        skill_name="pinterest-register-visual",
-                        skill_path="skills/pinterest-register-visual/skill.json",
-                    )
+                with mock.patch(
+                    "cloakcli_worker.fingerprint.resolve_geo_for_launch",
+                    side_effect=GeoResolutionError("GEO_DB_MISSING: GeoLite2-City database unavailable"),
+                ):
+                    with self.assertRaises(GeoResolutionError):
+                        launch_context(
+                            user_data_dir="/tmp/ud",
+                            headed=False,
+                            proxy="http://sess:pw@127.0.0.1:9",
+                            fingerprint_seed=42424,
+                            skill_name="pinterest-register-visual",
+                            skill_path="skills/pinterest-register-visual/skill.json",
+                        )
         launch.assert_not_called()
+
+    def test_headed_emits_window_size(self):
+        persona = mint_fingerprint_persona(42424)
+        with mock.patch("cloakbrowser.launch_persistent_context") as launch:
+            with mock.patch(
+                "cloakcli_worker.fingerprint.enforce_windows_font_gate",
+                return_value=[],
+            ):
+                launch_context(
+                    user_data_dir="/tmp/ud",
+                    headed=True,
+                    fingerprint_seed=42424,
+                    require_geo=False,
+                )
+        kwargs = launch.call_args.kwargs
+        self.assertIn(
+            f"--window-size={persona['screen_width']},{persona['screen_height']}",
+            kwargs["args"],
+        )
+        self.assertNotIn("viewport", kwargs)
 
     def test_no_playwright_user_agent_when_persona_present(self):
         with mock.patch("cloakbrowser.launch_persistent_context") as launch:
-            launch_context(
-                user_data_dir="/tmp/ud",
-                headed=True,
-                fingerprint_seed=42424,
-                user_agent="Mozilla/5.0 FakeUA",
-                require_geo=False,
-            )
+            with mock.patch(
+                "cloakcli_worker.fingerprint.enforce_windows_font_gate",
+                return_value=[],
+            ):
+                launch_context(
+                    user_data_dir="/tmp/ud",
+                    headed=True,
+                    fingerprint_seed=42424,
+                    user_agent="Mozilla/5.0 FakeUA",
+                    require_geo=False,
+                )
         kwargs = launch.call_args.kwargs
         self.assertNotIn("user_agent", kwargs)
         self.assertIn("--fingerprint-brand=Chrome", kwargs["args"])

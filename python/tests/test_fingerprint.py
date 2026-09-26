@@ -12,23 +12,33 @@ from cloakcli_worker.fingerprint import (
     PERSONA_SCHEMA,
     SEED_MAX,
     SEED_MIN,
+    WINDOWS_MINIMUM_FONTS,
+    FontAvailabilityError,
     GeoResolutionError,
     PersonaWhitelistError,
+    WebrtcIceLeakError,
     apply_to_launch_kwargs,
+    assert_webrtc_host_equals_exit_ip,
     ensure_fingerprint_persona,
     ensure_fingerprint_seed,
     ensure_language_preference,
+    enforce_windows_font_gate,
     fingerprint_chrome_args,
     geo_cache_valid,
     gpu_hw_memory_pool,
+    headed_window_size_arg,
+    host_candidate_ips,
     is_register_launch,
     is_valid_fingerprint_seed,
     is_whitelisted_persona,
     mint_fingerprint_persona,
     mint_fingerprint_seed,
+    missing_windows_minimum_fonts,
+    parse_ice_candidate_ip,
     persona_brand_tuple,
     persona_derived_from_seed,
     persona_gpu_tuple,
+    persona_window_geometry,
     proxy_session_identity,
     resolve_fingerprint_seed,
     resolve_geo_for_launch,
@@ -36,6 +46,9 @@ from cloakcli_worker.fingerprint import (
     verified_brand_tuples,
     verified_gpu_tuples,
 )
+
+# Synthetic fc-list blob with the full Windows minimum set (unit tests only).
+_FULL_FONT_LISTING = "\n".join(f"/usr/share/fonts/x/{f}.ttf: {f}:style=Regular" for f in WINDOWS_MINIMUM_FONTS).lower()
 
 
 class FingerprintSeedTests(unittest.TestCase):
@@ -590,6 +603,7 @@ class LaunchKwargsTests(unittest.TestCase):
             headed=False,
             profile_meta_path=meta,
             require_geo=True,
+            font_listing=_FULL_FONT_LISTING,
             resolve_exit_ip=lambda p: "8.8.8.8",
             lookup_city=lambda ip: {
                 "timezone": "America/New_York",
@@ -633,6 +647,7 @@ class LaunchKwargsTests(unittest.TestCase):
                 proxy="http://sess:pw@127.0.0.1:9",
                 headed=False,
                 require_geo=True,
+                font_listing=_FULL_FONT_LISTING,
                 resolve_exit_ip=lambda p: (_ for _ in ()).throw(
                     GeoResolutionError("GEO_DB_MISSING: GeoLite2-City database unavailable")
                 ),
@@ -647,6 +662,157 @@ class LaunchKwargsTests(unittest.TestCase):
         self.assertTrue(is_register_launch("pinterest-register-visual", None))
         self.assertTrue(is_register_launch(None, "skills/pinterest-register-visual/skill.json"))
         self.assertFalse(is_register_launch("pinterest-nurture-browse", "skills/pinterest-nurture-browse/skill.json"))
+
+
+
+class FontGateTests(unittest.TestCase):
+    def test_missing_detects_absent_families(self):
+        listing = "arial: Arial\nconsolas: Consolas\n"
+        missing = missing_windows_minimum_fonts(listing=listing)
+        self.assertIsNotNone(missing)
+        self.assertIn("Segoe UI", missing)
+        self.assertIn("Calibri", missing)
+        self.assertNotIn("Consolas", missing)
+
+    def test_full_listing_empty_missing(self):
+        self.assertEqual(missing_windows_minimum_fonts(listing=_FULL_FONT_LISTING), [])
+
+    def test_unknown_listing_is_none(self):
+        with mock.patch(
+            "cloakcli_worker.fingerprint._fc_list_blob",
+            return_value=None,
+        ):
+            self.assertIsNone(missing_windows_minimum_fonts())
+
+    def test_fail_closed_raises(self):
+        with self.assertRaises(FontAvailabilityError) as ctx:
+            enforce_windows_font_gate(fail_closed=True, listing="arial only\n")
+        self.assertIn("FONT_GATE_MISSING", str(ctx.exception))
+
+    def test_warn_only_returns_missing(self):
+        missing = enforce_windows_font_gate(fail_closed=False, listing="arial only\n")
+        self.assertTrue(missing)
+        self.assertIn("Segoe UI", missing)
+
+    def test_register_launch_fail_closed_on_fonts(self):
+        kwargs: dict = {"user_data_dir": "/tmp/ud", "headless": True}
+        with self.assertRaises(FontAvailabilityError):
+            apply_to_launch_kwargs(
+                kwargs,
+                seed=42424,
+                headed=False,
+                require_geo=False,
+                require_fonts=True,
+                font_listing="nope\n",
+            )
+
+    def test_nurture_warns_and_continues(self):
+        kwargs: dict = {"user_data_dir": "/tmp/ud", "headless": True}
+        apply_to_launch_kwargs(
+            kwargs,
+            seed=42424,
+            headed=False,
+            require_geo=False,
+            require_fonts=False,
+            font_listing="nope\n",
+        )
+        self.assertIn("--fingerprint=42424", kwargs["args"])
+
+    def test_chrome_args_omit_font_metrics(self):
+        args = fingerprint_chrome_args(42424)
+        self.assertFalse(any("fingerprint-windows-font-metrics" in a for a in args))
+
+
+class WebrtcIceAssertTests(unittest.TestCase):
+    def _cand(self, ip: str, typ: str = "host") -> str:
+        return (
+            f"candidate:1 1 UDP 2122260223 {ip} 54400 typ {typ} generation 0"
+        )
+
+    def test_parse_host_and_srflx(self):
+        self.assertEqual(
+            parse_ice_candidate_ip(self._cand("203.0.113.10")),
+            ("203.0.113.10", "host"),
+        )
+        self.assertEqual(
+            parse_ice_candidate_ip("a=" + self._cand("198.51.100.1", "srflx")),
+            ("198.51.100.1", "srflx"),
+        )
+
+    def test_host_ips_ignore_srflx(self):
+        cands = [
+            self._cand("8.8.8.8"),
+            self._cand("10.0.0.5", "srflx"),
+            self._cand("8.8.8.8"),
+        ]
+        self.assertEqual(host_candidate_ips(cands), ["8.8.8.8"])
+
+    def test_assert_pass_when_host_equals_exit(self):
+        cands = [self._cand("8.8.8.8"), self._cand("8.8.4.4", "srflx")]
+        self.assertEqual(
+            assert_webrtc_host_equals_exit_ip(cands, "8.8.8.8"),
+            ["8.8.8.8"],
+        )
+
+    def test_assert_fail_on_private_host_leak(self):
+        cands = [self._cand("192.168.1.20"), self._cand("8.8.8.8")]
+        with self.assertRaises(WebrtcIceLeakError) as ctx:
+            assert_webrtc_host_equals_exit_ip(cands, "8.8.8.8")
+        self.assertIn("WEBRTC_ICE_LEAK", str(ctx.exception))
+
+    def test_assert_fail_on_wrong_public_host(self):
+        cands = [self._cand("1.1.1.1")]
+        with self.assertRaises(WebrtcIceLeakError):
+            assert_webrtc_host_equals_exit_ip(cands, "8.8.8.8")
+
+    def test_assert_fail_when_no_host_candidates(self):
+        cands = [self._cand("8.8.8.8", "srflx")]
+        with self.assertRaises(WebrtcIceLeakError) as ctx:
+            assert_webrtc_host_equals_exit_ip(cands, "8.8.8.8")
+        self.assertIn("no host candidates", str(ctx.exception))
+
+
+class HeadedWindowTests(unittest.TestCase):
+    def test_window_size_arg_matches_screen(self):
+        persona = mint_fingerprint_persona(42424)
+        self.assertEqual(
+            headed_window_size_arg(persona),
+            f"--window-size={persona['screen_width']},{persona['screen_height']}",
+        )
+
+    def test_headed_launch_emits_window_size_not_maximize(self):
+        kwargs: dict = {"user_data_dir": "/tmp/ud", "headless": False}
+        apply_to_launch_kwargs(
+            kwargs,
+            seed=42424,
+            headed=True,
+            require_geo=False,
+            require_fonts=False,
+            font_listing=_FULL_FONT_LISTING,
+        )
+        persona = mint_fingerprint_persona(42424)
+        self.assertIn(
+            f"--window-size={persona['screen_width']},{persona['screen_height']}",
+            kwargs["args"],
+        )
+        self.assertFalse(any(a == "--start-maximized" or a.startswith("--start-maximized") for a in kwargs["args"]))
+        self.assertNotIn("viewport", kwargs)
+        self.assertFalse(any("fingerprint-windows-font-metrics" in a for a in kwargs["args"]))
+
+    def test_geometry_relations(self):
+        persona = mint_fingerprint_persona(11111)
+        geo = persona_window_geometry(persona)
+        self.assertEqual(
+            geo["available_height"],
+            geo["screen_height"] - geo["taskbar_height"],
+        )
+        self.assertEqual(
+            geo["viewport_height"],
+            geo["available_height"] - geo["chrome_ui_height"],
+        )
+        self.assertEqual(geo["window_width"], geo["screen_width"])
+        self.assertEqual(geo["window_height"], geo["screen_height"])
+
 
 
 if __name__ == "__main__":

@@ -16,14 +16,18 @@ Never log proxy URLs, passwords, emails, or cookie values.
 Never set Playwright user_agent — that desyncs HTTP UA / Client Hints /
 JS userAgentData. Brand identity is binary flags only.
 
-WebRTC ICE verification (follow-up test; not asserted here):
-  Launch with proxy, then in the page:
-    const pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-    pc.createDataChannel('x');
-    pc.onicecandidate = e => console.log(e.candidate && e.candidate.candidate);
-    pc.createOffer().then(o => pc.setLocalDescription(o));
-  Host ICE candidates should carry --fingerprint-webrtc-ip (the echo-verified
-  exit IP). A host candidate with the machine's real IP is a leak.
+WebRTC ICE assertion (P0):
+  Host candidates from RTCPeerConnection must equal the echo-verified exit IP
+  passed as --fingerprint-webrtc-ip. Use assert_webrtc_host_equals_exit_ip /
+  gather_webrtc_ice_candidates (page probe). A host candidate with a private,
+  loopback, or non-exit public IP is a leak and fails strict register / CI.
+
+Font gate (P0): detect Windows minimum font set via fc-list only — never
+silently install Microsoft fonts. Register/strict fail-closed; nurture warns.
+Omit --fingerprint-windows-font-metrics on Chromium 146 (no-op).
+
+Headed window (P0): emit --window-size=<screen_w>,<screen_h> from persona;
+do not rely on --start-maximized alone.
 """
 
 from __future__ import annotations
@@ -155,12 +159,37 @@ SCREEN_PRESETS: tuple[tuple[int, int, int, int], ...] = (
     (1920, 1200, 48, 85),
 )
 
+# Keep in sync with cloakbrowser.browser._WINDOWS_FONT_TELLS (issue #395).
+# Detect-only; ops installs a licensed pack — see docs/windows-fonts-linux-ops.md.
+WINDOWS_MINIMUM_FONTS: tuple[str, ...] = (
+    "Segoe UI",
+    "Segoe UI Light",
+    "Calibri",
+    "Marlett",
+    "MS UI Gothic",
+    "Franklin Gothic",
+    "Consolas",
+    "Courier New",
+)
+
+# Chromium major where --fingerprint-windows-font-metrics is documented effective.
+# On 146 it is a no-op; never emit it from CloakCLI on this binary.
+WINDOWS_FONT_METRICS_MIN_MAJOR = 148
+
 class PersonaWhitelistError(ValueError):
     """Persona is not on the verified (brand, version, chromium, platform) list."""
 
 
 class GeoResolutionError(RuntimeError):
     """Fail-closed geo lookup — do not launch with the host timezone."""
+
+
+class FontAvailabilityError(RuntimeError):
+    """Fail-closed Windows font gate — register/strict only; nurture warns."""
+
+
+class WebrtcIceLeakError(RuntimeError):
+    """Host ICE candidates leaked a non-exit IP (or none matched exit IP)."""
 
 
 def mint_fingerprint_seed() -> int:
@@ -410,17 +439,316 @@ def validate_persona(persona: Any) -> dict[str, Any]:
     return persona
 
 
+
+def env_require_fonts() -> bool | None:
+    raw = os.environ.get("CLOAKCLI_REQUIRE_FONTS", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _fc_list_blob() -> str | None:
+    """Return lowercased fc-list stdout, or None if unavailable."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["fc-list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").lower()
+
+
+def missing_windows_minimum_fonts(
+    *,
+    listing: str | None = None,
+    fonts: tuple[str, ...] = WINDOWS_MINIMUM_FONTS,
+) -> list[str] | None:
+    """Return missing font family names, or None when presence cannot be determined.
+
+    None means unknown (fc-list missing/errored) — callers must not treat that
+    as an empty missing list. An empty list means the full minimum set is present.
+    """
+    blob = listing if listing is not None else _fc_list_blob()
+    if blob is None:
+        return None
+    missing: list[str] = []
+    for font in fonts:
+        if font.lower() not in blob:
+            missing.append(font)
+    return missing
+
+
+def enforce_windows_font_gate(
+    *,
+    fail_closed: bool,
+    listing: str | None = None,
+) -> list[str]:
+    """Check Windows minimum fonts. Fail-closed for register/strict; warn otherwise.
+
+    Never downloads or installs fonts. Returns the missing list (possibly empty).
+    When fc-list is unavailable: fail-closed raises; warn path logs and returns [].
+    `listing` injects an fc-list blob for tests (None = run fc-list).
+    """
+    missing = missing_windows_minimum_fonts(listing=listing)
+    if missing is None:
+        msg = (
+            "FONT_GATE_UNKNOWN: fc-list unavailable; cannot verify Windows minimum fonts. "
+            "See docs/windows-fonts-linux-ops.md"
+        )
+        if fail_closed:
+            raise FontAvailabilityError(msg)
+        sys.stderr.write(f"[fonts] warn: {msg}\n")
+        sys.stderr.flush()
+        return []
+    if not missing:
+        return []
+    detail = ", ".join(missing)
+    msg = (
+        f"FONT_GATE_MISSING: Windows minimum fonts not installed: {detail}. "
+        "Ops must install a licensed pack — docs/windows-fonts-linux-ops.md "
+        "(CLI never silent-installs Microsoft fonts)."
+    )
+    if fail_closed:
+        raise FontAvailabilityError(msg)
+    sys.stderr.write(f"[fonts] warn missing={detail}\n")
+    sys.stderr.flush()
+    return missing
+
+
+def parse_ice_candidate_ip(candidate_line: str) -> tuple[str, str] | None:
+    """Parse (ip, typ) from an ICE candidate line. typ is host/srflx/relay/prflx.
+
+    Accepts raw `candidate:...` or `a=candidate:...` SDP forms.
+    """
+    if not isinstance(candidate_line, str) or not candidate_line.strip():
+        return None
+    line = candidate_line.strip()
+    if line.startswith("a="):
+        line = line[2:].strip()
+    if line.lower().startswith("candidate:"):
+        body = line.split(":", 1)[1]
+    else:
+        body = line
+    parts = body.split()
+    # foundation component protocol priority ip port typ <type>
+    if len(parts) < 8:
+        return None
+    try:
+        typ_idx = parts.index("typ")
+    except ValueError:
+        return None
+    if typ_idx < 5 or typ_idx + 1 >= len(parts):
+        return None
+    ip = parts[4]
+    cand_type = parts[typ_idx + 1].lower()
+    return ip, cand_type
+
+
+def host_candidate_ips(candidates: list[str] | tuple[str, ...]) -> list[str]:
+    """Ordered unique host-type candidate IPs (IPv4/IPv6 as written)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in candidates:
+        parsed = parse_ice_candidate_ip(raw)
+        if parsed is None:
+            continue
+        ip, typ = parsed
+        if typ != "host":
+            continue
+        if ip in seen:
+            continue
+        seen.add(ip)
+        out.append(ip)
+    return out
+
+
+def assert_webrtc_host_equals_exit_ip(
+    candidates: list[str] | tuple[str, ...],
+    exit_ip: str,
+) -> list[str]:
+    """Fail if any host ICE IP != echo exit IP, or if no host candidates appear.
+
+    Also fails when a host candidate is private/loopback/link-local even if it
+    somehow matched (defensive). Returns the host IP list on success.
+    """
+    if not isinstance(exit_ip, str) or not exit_ip.strip():
+        raise WebrtcIceLeakError("WEBRTC_ICE: missing echo exit IP for assertion")
+    expected = exit_ip.strip()
+    if not _is_public_ip(expected):
+        raise WebrtcIceLeakError(
+            f"WEBRTC_ICE: exit IP is not public; refusing assert ({expected!r})"
+        )
+    hosts = host_candidate_ips(candidates)
+    if not hosts:
+        raise WebrtcIceLeakError(
+            "WEBRTC_ICE: no host candidates gathered; cannot verify exit IP spoof"
+        )
+    bad: list[str] = []
+    for ip in hosts:
+        if ip != expected:
+            bad.append(ip)
+        elif not _is_public_ip(ip):
+            bad.append(ip)
+    if bad:
+        # Never claim "machine IP" in logs beyond the leaked address itself.
+        raise WebrtcIceLeakError(
+            "WEBRTC_ICE_LEAK: host candidates must equal echo exit IP "
+            f"{expected}; got host={hosts}"
+        )
+    return hosts
+
+
+# Playwright page.evaluate snippet: gather ICE candidates (page context).
+WEBRTC_ICE_GATHER_JS = """
+async ({ stunUrls, timeoutMs }) => {
+  const urls = (stunUrls && stunUrls.length)
+    ? stunUrls
+    : ['stun:stun.l.google.com:19302'];
+  const candidates = [];
+  const pc = new RTCPeerConnection({
+    iceServers: urls.map((u) => ({ urls: u })),
+  });
+  try {
+    pc.createDataChannel('cloakcli-ice');
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(null), timeoutMs || 8000);
+      pc.onicecandidate = (ev) => {
+        if (!ev.candidate) {
+          clearTimeout(timer);
+          resolve(null);
+          return;
+        }
+        if (ev.candidate.candidate) {
+          candidates.push(ev.candidate.candidate);
+        }
+      };
+      pc.onicecandidateerror = () => {};
+      pc.createOffer()
+        .then((offer) => pc.setLocalDescription(offer))
+        .catch((err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+    });
+  } finally {
+    try { pc.close(); } catch (e) {}
+  }
+  return candidates;
+}
+"""
+
+
+WEBRTC_ICE_GATHER_WORKER_JS = """
+async ({ stunUrls, timeoutMs }) => {
+  const urls = (stunUrls && stunUrls.length)
+    ? stunUrls
+    : ['stun:stun.l.google.com:19302'];
+  const src = `
+    self.onmessage = async (ev) => {
+      const { urls, timeoutMs } = ev.data;
+      const candidates = [];
+      const pc = new RTCPeerConnection({
+        iceServers: urls.map((u) => ({ urls: u })),
+      });
+      try {
+        pc.createDataChannel('cloakcli-ice-worker');
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => resolve(null), timeoutMs || 8000);
+          pc.onicecandidate = (e) => {
+            if (!e.candidate) { clearTimeout(timer); resolve(null); return; }
+            if (e.candidate.candidate) candidates.push(e.candidate.candidate);
+          };
+          pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => resolve(null));
+        });
+      } finally {
+        try { pc.close(); } catch (e) {}
+      }
+      self.postMessage(candidates);
+    };
+  `;
+  const blob = new Blob([src], { type: 'application/javascript' });
+  const url = URL.createObjectURL(blob);
+  try {
+    return await new Promise((resolve, reject) => {
+      const worker = new Worker(url);
+      const timer = setTimeout(() => {
+        try { worker.terminate(); } catch (e) {}
+        reject(new Error('worker ICE gather timeout'));
+      }, (timeoutMs || 8000) + 2000);
+      worker.onmessage = (ev) => {
+        clearTimeout(timer);
+        try { worker.terminate(); } catch (e) {}
+        resolve(ev.data || []);
+      };
+      worker.onerror = (err) => {
+        clearTimeout(timer);
+        try { worker.terminate(); } catch (e) {}
+        reject(err);
+      };
+      worker.postMessage({ urls, timeoutMs: timeoutMs || 8000 });
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+"""
+
+
+def headed_window_size_arg(persona: dict[str, Any]) -> str:
+    """Return --window-size=W,H for persona screen (outer target)."""
+    return (
+        f"--window-size={int(persona['screen_width'])},"
+        f"{int(persona['screen_height'])}"
+    )
+
+
+def persona_window_geometry(persona: dict[str, Any]) -> dict[str, int]:
+    """Explicit outer/inner/available relationships for headed probes."""
+    sw = int(persona["screen_width"])
+    sh = int(persona["screen_height"])
+    taskbar = int(persona["taskbar_height"])
+    chrome_ui = int(persona["chrome_ui_height"])
+    return {
+        "screen_width": sw,
+        "screen_height": sh,
+        "window_width": sw,
+        "window_height": sh,
+        "available_width": int(persona["available_width"]),
+        "available_height": int(persona["available_height"]),
+        "viewport_width": int(persona["viewport_width"]),
+        "viewport_height": int(persona["viewport_height"]),
+        "taskbar_height": taskbar,
+        "chrome_ui_height": chrome_ui,
+        # expected: available_height == screen_height - taskbar
+        # expected: viewport_height == available_height - chrome_ui
+    }
+
+
 def fingerprint_chrome_args(
     seed: int,
     persona: dict[str, Any] | None = None,
     *,
     geo: dict[str, Any] | None = None,
     language: str | None = None,
+    headed: bool = False,
 ) -> list[str]:
     """Chrome args that override cloakbrowser's random --fingerprint default.
 
     Always includes the verified persona flags so HTTP UA / CH / JS stay on
     the same Chrome identity. Playwright user_agent is never emitted.
+
+    Headed launches add --window-size matching persona screen (not maximize-only).
+    Never emits --fingerprint-windows-font-metrics on Chromium < 148 (146 no-op).
     """
     if not is_valid_fingerprint_seed(seed):
         raise ValueError(f"fingerprint_seed out of range [{SEED_MIN}, {SEED_MAX}]: {seed!r}")
@@ -443,6 +771,13 @@ def fingerprint_chrome_args(
         f"--fingerprint-screen-height={persona['screen_height']}",
         f"--fingerprint-taskbar-height={persona['taskbar_height']}",
     ]
+    if headed:
+        # Measured geometry from persona screen. Suppresses cloakbrowser's
+        # --start-maximized injection (build_args skips maximize when
+        # --window-size is already present).
+        args.append(
+            f"--window-size={int(persona['screen_width'])},{int(persona['screen_height'])}"
+        )
     lang = language or (geo or {}).get("locale") or (geo or {}).get("locale_from_geo")
     if lang and is_valid_locale(lang):
         lang = normalize_locale(lang)
@@ -454,6 +789,12 @@ def fingerprint_chrome_args(
     exit_ip = (geo or {}).get("exit_ip")
     if exit_ip:
         args.append(f"--fingerprint-webrtc-ip={exit_ip}")
+    # Explicitly never emit font-metrics on 146 (no-op / unproven).
+    major = deployed_chromium_major()
+    if major.isdigit() and int(major) >= WINDOWS_FONT_METRICS_MIN_MAJOR:
+        # Reserved: only enable when ops + binary gate say so. Still omitted
+        # by default so CloakCLI does not claim Windows native metrics.
+        pass
     return args
 
 
@@ -956,6 +1297,8 @@ def apply_to_launch_kwargs(
     headed: bool = False,
     profile_meta_path: str | Path | None = None,
     require_geo: bool | None = None,
+    require_fonts: bool | None = None,
+    font_listing: str | None = None,
     resolve_exit_ip: Callable[[str], str] | None = None,
     lookup_city: Callable[[str], dict[str, Any]] | None = None,
     db_version: str | None = None,
@@ -965,6 +1308,11 @@ def apply_to_launch_kwargs(
 
     Sets binary flags only. Passes geoip=True when a proxy is present and geo
     resolved (cloakbrowser still injects WebRTC if we did not already set it).
+
+    Font gate runs before launch args are finalized: register/strict fail-closed
+    on missing Windows minimum fonts; nurture warns. Headed emits --window-size
+    from persona screen. ICE leak assert is post-launch (see
+    assert_webrtc_host_equals_exit_ip) — call after gather on register paths.
     """
     meta = Path(profile_meta_path) if profile_meta_path is not None else None
     persona: dict[str, Any] | None = None
@@ -978,6 +1326,16 @@ def apply_to_launch_kwargs(
     env_geo = env_require_geo()
     if require_geo is None:
         require_geo = bool(env_geo) if env_geo is not None else False
+
+    env_fonts = env_require_fonts()
+    if require_fonts is None:
+        if env_fonts is not None:
+            require_fonts = bool(env_fonts)
+        else:
+            # Same default as geo: strict when caller marked require_geo
+            # (browser.py maps register skills → require_geo=True).
+            require_fonts = bool(require_geo)
+    enforce_windows_font_gate(fail_closed=bool(require_fonts), listing=font_listing)
 
     geo: dict[str, Any] = {}
     language: str | None = None
@@ -1012,7 +1370,7 @@ def apply_to_launch_kwargs(
 
     if seed is not None:
         kwargs["args"] = fingerprint_chrome_args(
-            seed, persona, geo=geo or None, language=language
+            seed, persona, geo=geo or None, language=language, headed=headed
         )
     elif geo or language:
         extra: list[str] = []
@@ -1025,8 +1383,12 @@ def apply_to_launch_kwargs(
         exit_ip = geo.get("exit_ip")
         if exit_ip:
             extra.append(f"--fingerprint-webrtc-ip={exit_ip}")
+        if headed and persona is not None:
+            extra.append(headed_window_size_arg(persona))
         if extra:
             kwargs["args"] = extra
+    elif headed and persona is not None:
+        kwargs["args"] = [headed_window_size_arg(persona)]
 
     if persona is not None and not headed:
         kwargs["viewport"] = {
@@ -1035,3 +1397,78 @@ def apply_to_launch_kwargs(
         }
 
     return kwargs
+
+def gather_webrtc_ice_candidates(
+    page: Any,
+    *,
+    via: str = "page",
+    stun_urls: list[str] | None = None,
+    timeout_ms: int = 8000,
+) -> list[str]:
+    """Gather ICE candidate lines from a Playwright page (page / iframe / worker).
+
+    `via`:
+      - "page": RTCPeerConnection in the main frame
+      - "iframe": same gather inside a sandboxed about:blank iframe
+      - "worker": DedicatedWorker gather
+    """
+    payload = {"stunUrls": stun_urls or ["stun:stun.l.google.com:19302"], "timeoutMs": timeout_ms}
+    if via == "page":
+        raw = page.evaluate(WEBRTC_ICE_GATHER_JS, payload)
+    elif via == "worker":
+        raw = page.evaluate(WEBRTC_ICE_GATHER_WORKER_JS, payload)
+    elif via == "iframe":
+        frame_handle = page.evaluate_handle(
+            """async () => {
+              const iframe = document.createElement('iframe');
+              iframe.src = 'about:blank';
+              document.body.appendChild(iframe);
+              await new Promise((r) => { iframe.onload = r; });
+              return iframe;
+            }"""
+        )
+        try:
+            content_frame = frame_handle.as_element().content_frame()
+            if content_frame is None:
+                raise WebrtcIceLeakError("WEBRTC_ICE: iframe content_frame unavailable")
+            raw = content_frame.evaluate(WEBRTC_ICE_GATHER_JS, payload)
+        finally:
+            try:
+                page.evaluate(
+                    """() => {
+                      for (const iframe of document.querySelectorAll('iframe')) {
+                        iframe.remove();
+                      }
+                    }"""
+                )
+            except Exception:
+                pass
+    else:
+        raise ValueError(f"unknown ICE gather via={via!r}")
+    if not isinstance(raw, list):
+        return []
+    return [str(c) for c in raw if isinstance(c, str) and c.strip()]
+
+
+def verify_webrtc_ice_no_leak(
+    page: Any,
+    exit_ip: str,
+    *,
+    contexts: tuple[str, ...] = ("page", "iframe", "worker"),
+    stun_urls: list[str] | None = None,
+    timeout_ms: int = 8000,
+) -> dict[str, list[str]]:
+    """Gather ICE in each context and assert host candidates == exit_ip.
+
+    Raises WebrtcIceLeakError on leak/mismatch. Intended for strict register
+    post-launch and CI probes. Returns {context: candidate_lines}.
+    """
+    results: dict[str, list[str]] = {}
+    for via in contexts:
+        cands = gather_webrtc_ice_candidates(
+            page, via=via, stun_urls=stun_urls, timeout_ms=timeout_ms
+        )
+        assert_webrtc_host_equals_exit_ip(cands, exit_ip)
+        results[via] = cands
+    return results
+
