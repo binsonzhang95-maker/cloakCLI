@@ -24,7 +24,13 @@ WebRTC ICE assertion (P0):
 
 Font gate (P0): detect Windows minimum font set via fc-list only — never
 silently install Microsoft fonts. Register/strict fail-closed; nurture warns.
-Omit --fingerprint-windows-font-metrics on Chromium 146 (no-op).
+Omit --fingerprint-windows-font-metrics on Chromium < 148 (145/146 no-op).
+
+Dual free-bin (P0): profile.json persists exact browser_version
+(145.0.7632.109.2 or 146.0.7680.177.5). Launch always passes that pin;
+persona UA/CH derive from the bound binary. New profiles assign via
+seed % 2; legacy profiles without the field bind 146 (no silent remint /
+hot-switch / unpinned launch when dual-bin mode is on).
 
 Headed window (P0): emit --window-size=<screen_w>,<screen_h> from persona;
 do not rely on --start-maximized alone.
@@ -173,8 +179,19 @@ WINDOWS_MINIMUM_FONTS: tuple[str, ...] = (
 )
 
 # Chromium major where --fingerprint-windows-font-metrics is documented effective.
-# On 146 it is a no-op; never emit it from CloakCLI on this binary.
+# On 146/145 it is a no-op; never emit it from CloakCLI on these free binaries.
 WINDOWS_FONT_METRICS_MIN_MAJOR = 148
+
+# Dual free-bin pins (exact CloakBrowser build strings). Profile binding uses these
+# full strings — never major-only. Keep in sync with ~/.cloakbrowser/chromium-{ver}/.
+ALLOWED_BROWSER_VERSIONS: tuple[str, ...] = (
+    "145.0.7632.109.2",
+    "146.0.7680.177.5",
+)
+# Existing profiles without browser_version bind here (no silent remint / major hop).
+LEGACY_BROWSER_VERSION = "146.0.7680.177.5"
+_BROWSER_VERSION_FIELD = "browser_version"
+
 
 class PersonaWhitelistError(ValueError):
     """Persona is not on the verified (brand, version, chromium, platform) list."""
@@ -190,6 +207,10 @@ class FontAvailabilityError(RuntimeError):
 
 class WebrtcIceLeakError(RuntimeError):
     """Host ICE candidates leaked a non-exit IP (or none matched exit IP)."""
+
+
+class BrowserVersionError(RuntimeError):
+    """Dual-bin pin missing, invalid, or hot-switched."""
 
 
 def mint_fingerprint_seed() -> int:
@@ -218,17 +239,50 @@ def coerce_fingerprint_seed(value: Any) -> int | None:
     return int(value)
 
 
-def deployed_chromium_version() -> str:
-    """Public Chromium version of the installed binary (no CloakBrowser patch suffix).
+def dual_bin_mode() -> bool:
+    """True when CloakCLI is configured with ≥2 exact free pins.
 
-    cloakbrowser reports e.g. 146.0.7680.177.5; Chrome UA/CH use 146.0.7680.177.
+    Opt out with CLOAKCLI_DUAL_BIN=0 (emergency single-bin). When on, launches
+    must pass an exact allowed browser_version — no unpinned / wrapper-default.
     """
-    try:
-        from cloakbrowser.config import get_chromium_version
+    raw = os.environ.get("CLOAKCLI_DUAL_BIN", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return len(ALLOWED_BROWSER_VERSIONS) >= 2
 
-        raw = str(get_chromium_version() or "").strip()
-    except Exception:
-        raw = ""
+
+def is_allowed_browser_version(value: Any) -> bool:
+    return isinstance(value, str) and value.strip() in ALLOWED_BROWSER_VERSIONS
+
+
+def coerce_browser_version(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    pin = value.strip()
+    return pin if pin in ALLOWED_BROWSER_VERSIONS else None
+
+
+def public_chromium_version(browser_version: str | None = None) -> str:
+    """Public 4-part Chromium version for UA/CH from an exact Cloak pin.
+
+    cloakbrowser pins look like 146.0.7680.177.5; Chrome UA/CH use 146.0.7680.177.
+    When browser_version is omitted, fall back to the wrapper default pin
+    (LEGACY / get_chromium_version) — never invent a fake major.
+    """
+    raw = ""
+    if browser_version is not None:
+        raw = str(browser_version).strip()
+    if not raw:
+        try:
+            from cloakbrowser.config import get_chromium_version
+
+            raw = str(get_chromium_version() or "").strip()
+        except Exception:
+            raw = ""
+    if not raw:
+        raw = LEGACY_BROWSER_VERSION
     parts = [p for p in raw.split(".") if p.isdigit()]
     if len(parts) >= 4:
         return ".".join(parts[:4])
@@ -237,27 +291,67 @@ def deployed_chromium_version() -> str:
     return "146.0.7680.177"
 
 
+def public_chromium_major(browser_version: str | None = None) -> str:
+    return public_chromium_version(browser_version).split(".", 1)[0]
+
+
+def deployed_chromium_version() -> str:
+    """Public Chromium version of the wrapper default binary (compat alias).
+
+    Prefer public_chromium_version(bound_pin) for persona/UA/CH so dual-bin
+    profiles do not desync from the bound kernel.
+    """
+    return public_chromium_version(None)
+
+
 def deployed_chromium_major() -> str:
     return deployed_chromium_version().split(".", 1)[0]
 
 
-def verified_brand_tuples() -> tuple[tuple[str, str, str, str, str], ...]:
+def assign_browser_version_for_new_seed(seed: int) -> str:
+    """Deterministic pin for a brand-new profile: hash(seed) % len(pins)."""
+    if not is_valid_fingerprint_seed(seed):
+        raise ValueError(f"fingerprint_seed out of range [{SEED_MIN}, {SEED_MAX}]: {seed!r}")
+    pins = ALLOWED_BROWSER_VERSIONS
+    if not pins:
+        return LEGACY_BROWSER_VERSION
+    # Stable across processes: integer seed modulo pin count (not Python hash()).
+    idx = int(seed) % len(pins)
+    return pins[idx]
+
+
+def verified_brand_tuples(
+    browser_version: str | None = None,
+) -> tuple[tuple[str, str, str, str, str], ...]:
     """Verified coherent (brand, brand_version, chromium_compatible, platform, platform_version).
 
-    Opera/Vivaldi-on-146 are not enabled: product version is not the Chromium
-    kernel, and CH/UA coherence is unverified on this binary. Edge is omitted
-    for the same reason. Diversity comes from platform_version / hw / screen /
-    Windows ANGLE GPU vendor / geo.
+    Opera/Vivaldi are not enabled: product version is not the Chromium kernel,
+    and CH/UA coherence is unverified. Edge is omitted for the same reason.
+    Diversity comes from platform_version / hw / screen / Windows ANGLE GPU /
+    geo. brand_version / chromium_compatible MUST match the bound binary's
+    public 4-part version (never a fake UA for another major).
     """
-    compatible = deployed_chromium_version()
+    compatible = public_chromium_version(browser_version)
     # brand_version is the public Chromium version (e.g. 146.0.7680.177).
-    # The 146 binary keeps UA reduced (Chrome/146.0.0.0) and fills high-entropy
+    # The binary keeps UA reduced (Chrome/MAJOR.0.0.0) and fills high-entropy
     # CH uaFullVersion / fullVersionList from this flag. Passing major-only
-    # "146" leaves high-entropy CH as "146", which is less like stock Chrome.
+    # leaves high-entropy CH as major-only, which is less like stock Chrome.
     return tuple(
         ("Chrome", compatible, compatible, _PLATFORM_WINDOWS, pv)
         for pv in _PLATFORM_VERSIONS_WINDOWS
     )
+
+
+def all_allowed_brand_tuples() -> tuple[tuple[str, str, str, str, str], ...]:
+    """Union of verified brand tuples across every allowed pin (whitelist load)."""
+    seen: list[tuple[str, str, str, str, str]] = []
+    for pin in ALLOWED_BROWSER_VERSIONS:
+        for tup in verified_brand_tuples(pin):
+            if tup not in seen:
+                seen.append(tup)
+    if not seen:
+        seen.extend(verified_brand_tuples(LEGACY_BROWSER_VERSION))
+    return tuple(seen)
 
 
 def is_valid_iana_timezone(value: Any) -> bool:
@@ -314,12 +408,26 @@ def gpu_hw_memory_pool(vendor: str, renderer: str) -> tuple[tuple[int, int], ...
     return None
 
 
-def mint_fingerprint_persona(seed: int) -> dict[str, Any]:
-    """Deterministic persona from seed, drawn only from the verified whitelist."""
+def mint_fingerprint_persona(
+    seed: int,
+    *,
+    browser_version: str | None = None,
+) -> dict[str, Any]:
+    """Deterministic persona from seed, drawn only from the verified whitelist.
+
+    When browser_version (exact pin) is set, brand/fullVersion/CH are derived
+    from that bound binary — not from the wrapper default alone.
+    """
     if not is_valid_fingerprint_seed(seed):
         raise ValueError(f"fingerprint_seed out of range [{SEED_MIN}, {SEED_MAX}]: {seed!r}")
+    pin = coerce_browser_version(browser_version) if browser_version is not None else None
+    if browser_version is not None and pin is None and dual_bin_mode():
+        raise BrowserVersionError(
+            f"BROWSER_VERSION: not an allowed dual-bin pin: {browser_version!r}; "
+            f"allowed={list(ALLOWED_BROWSER_VERSIONS)}"
+        )
     rng = random.Random(int(seed))
-    tuples = verified_brand_tuples()
+    tuples = verified_brand_tuples(pin)
     brand, brand_version, chromium_compatible, platform, platform_version = rng.choice(tuples)
     gpu_vendor, gpu_renderer, hw_pool = rng.choice(WINDOWS_ANGLE_GPUS)
     hw, mem = rng.choice(hw_pool)
@@ -388,25 +496,39 @@ def _screen_coherent(persona: dict[str, Any]) -> bool:
     return (vw, vh, aw, ah) == (evw, evh, eaw, eah)
 
 
-def persona_derived_from_seed(persona: Any, seed: int) -> bool:
-    """True when persona was minted from this seed (binding field + identity)."""
+def persona_derived_from_seed(
+    persona: Any,
+    seed: int,
+    *,
+    browser_version: str | None = None,
+) -> bool:
+    """True when persona was minted from this seed (+ bound binary version)."""
     if not isinstance(persona, dict):
         return False
     stored = coerce_fingerprint_seed(persona.get("derived_from_seed"))
     if stored != int(seed):
         return False
-    minted = mint_fingerprint_persona(int(seed))
+    minted = mint_fingerprint_persona(int(seed), browser_version=browser_version)
     return all(persona.get(key) == value for key, value in minted.items())
 
 
-def is_whitelisted_persona(persona: Any) -> bool:
+def is_whitelisted_persona(
+    persona: Any,
+    *,
+    browser_version: str | None = None,
+) -> bool:
     if not isinstance(persona, dict):
         return False
     if persona.get("schema") not in (PERSONA_SCHEMA, None):
         return False
     if coerce_fingerprint_seed(persona.get("derived_from_seed")) is None:
         return False
-    if persona_brand_tuple(persona) not in verified_brand_tuples():
+    if browser_version is not None:
+        allowed_tuples = verified_brand_tuples(browser_version)
+    else:
+        # Accept personas minted for any currently allowed pin (disk load).
+        allowed_tuples = all_allowed_brand_tuples()
+    if persona_brand_tuple(persona) not in allowed_tuples:
         return False
     gpu = persona_gpu_tuple(persona)
     hw_pool = gpu_hw_memory_pool(gpu[0], gpu[1])
@@ -430,8 +552,12 @@ def is_whitelisted_persona(persona: Any) -> bool:
     return _screen_coherent(persona)
 
 
-def validate_persona(persona: Any) -> dict[str, Any]:
-    if not is_whitelisted_persona(persona):
+def validate_persona(
+    persona: Any,
+    *,
+    browser_version: str | None = None,
+) -> dict[str, Any]:
+    if not is_whitelisted_persona(persona, browser_version=browser_version):
         raise PersonaWhitelistError(
             f"persona not on verified Chrome/Windows whitelist: {persona_brand_tuple(persona) if isinstance(persona, dict) else type(persona).__name__}"
         )
@@ -750,6 +876,7 @@ def fingerprint_chrome_args(
     geo: dict[str, Any] | None = None,
     language: str | None = None,
     headed: bool = False,
+    browser_version: str | None = None,
 ) -> list[str]:
     """Chrome args that override cloakbrowser's random --fingerprint default.
 
@@ -757,14 +884,14 @@ def fingerprint_chrome_args(
     the same Chrome identity. Playwright user_agent is never emitted.
 
     Headed launches add --window-size matching persona screen (not maximize-only).
-    Never emits --fingerprint-windows-font-metrics on Chromium < 148 (146 no-op).
+    Never emits --fingerprint-windows-font-metrics on Chromium < 148 (145/146 no-op).
     """
     if not is_valid_fingerprint_seed(seed):
         raise ValueError(f"fingerprint_seed out of range [{SEED_MIN}, {SEED_MAX}]: {seed!r}")
     if persona is None:
-        persona = mint_fingerprint_persona(int(seed))
+        persona = mint_fingerprint_persona(int(seed), browser_version=browser_version)
     else:
-        persona = validate_persona(persona)
+        persona = validate_persona(persona, browser_version=browser_version)
 
     args = [
         f"--fingerprint={int(seed)}",
@@ -798,8 +925,8 @@ def fingerprint_chrome_args(
     exit_ip = (geo or {}).get("exit_ip")
     if exit_ip:
         args.append(f"--fingerprint-webrtc-ip={exit_ip}")
-    # Explicitly never emit font-metrics on 146 (no-op / unproven).
-    major = deployed_chromium_major()
+    # Explicitly never emit font-metrics on 145/146 (no-op / unproven).
+    major = public_chromium_major(browser_version)
     if major.isdigit() and int(major) >= WINDOWS_FONT_METRICS_MIN_MAJOR:
         # Reserved: only enable when ops + binary gate say so. Still omitted
         # by default so CloakCLI does not claim Windows native metrics.
@@ -839,22 +966,142 @@ def _read_profile_meta(meta_path: Path) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def ensure_browser_version(
+    meta_path: Path,
+    *,
+    seed: int | None = None,
+    explicit: str | None = None,
+    persist: bool = True,
+) -> str:
+    """Resolve and optionally persist immutable exact browser_version for a profile.
+
+    Rules (dual-bin):
+      - Existing exact pin in profile.json → keep forever (no hot-switch).
+      - Explicit pin differing from stored → BrowserVersionError.
+      - Missing field + legacy profile (already has seed/persona/name/other) →
+        bind LEGACY_BROWSER_VERSION (146) and persist; do not remint persona.
+      - Missing field + brand-new profile → assign_browser_version_for_new_seed(seed).
+      - Invalid stored pin → BrowserVersionError (fail closed; no silent migrate).
+    """
+    meta_path = Path(meta_path)
+    data = _read_profile_meta(meta_path)
+    stored = data.get(_BROWSER_VERSION_FIELD)
+    stored_pin = coerce_browser_version(stored) if stored is not None else None
+
+    if stored is not None and stored_pin is None:
+        raise BrowserVersionError(
+            f"BROWSER_VERSION: profile has unsupported pin {stored!r}; "
+            f"allowed={list(ALLOWED_BROWSER_VERSIONS)} (no silent migrate)"
+        )
+
+    if explicit is not None:
+        exp = coerce_browser_version(explicit)
+        if exp is None:
+            raise BrowserVersionError(
+                f"BROWSER_VERSION: explicit pin not allowed: {explicit!r}; "
+                f"allowed={list(ALLOWED_BROWSER_VERSIONS)}"
+            )
+        if stored_pin is not None and stored_pin != exp:
+            raise BrowserVersionError(
+                f"BROWSER_VERSION: hot-switch forbidden "
+                f"(bound={stored_pin}, requested={exp})"
+            )
+        pin = exp
+    elif stored_pin is not None:
+        pin = stored_pin
+    else:
+        # Missing field — legacy bind vs new assign.
+        # Legacy = already had fingerprint_seed or persona before dual-bin (do
+        # not hop majors / remint). Name-only shells are still "new": assign
+        # from seed via hash(seed)%2 once the seed is known.
+        looks_legacy = (
+            coerce_fingerprint_seed(data.get(_FIELD)) is not None
+            or isinstance(data.get(_PERSONA_FIELD), dict)
+        )
+        if looks_legacy:
+            pin = LEGACY_BROWSER_VERSION
+        else:
+            if seed is None:
+                raise BrowserVersionError(
+                    "BROWSER_VERSION: cannot assign pin for new profile without seed"
+                )
+            pin = assign_browser_version_for_new_seed(int(seed))
+
+    if persist and data.get(_BROWSER_VERSION_FIELD) != pin:
+        data[_BROWSER_VERSION_FIELD] = pin
+        _atomic_write_json(meta_path, data)
+        sys.stderr.write(f"[fingerprint] browser_version={pin}\n")
+        sys.stderr.flush()
+    return pin
+
+
+def resolve_browser_version_for_launch(
+    *,
+    browser_version: str | None = None,
+    profile_meta_path: str | Path | None = None,
+    seed: int | None = None,
+) -> str:
+    """Exact pin for launch_persistent_context(browser_version=...).
+
+    Dual-bin mode forbids unpinned launches. Without a profile meta path, an
+    explicit allowed pin or CLOAKCLI_BROWSER_VERSION is required (seed-only
+    ephemeral assign is allowed when seed is known).
+    """
+    explicit_env = os.environ.get("CLOAKCLI_BROWSER_VERSION", "").strip() or None
+    explicit = browser_version if browser_version is not None else explicit_env
+
+    if profile_meta_path is not None:
+        return ensure_browser_version(
+            Path(profile_meta_path),
+            seed=seed,
+            explicit=explicit,
+            persist=True,
+        )
+
+    if explicit is not None:
+        pin = coerce_browser_version(explicit)
+        if pin is None:
+            raise BrowserVersionError(
+                f"BROWSER_VERSION: not allowed: {explicit!r}; "
+                f"allowed={list(ALLOWED_BROWSER_VERSIONS)}"
+            )
+        return pin
+
+    if dual_bin_mode():
+        if seed is not None:
+            # Ephemeral (no profile.json to persist) — still pin exactly.
+            return assign_browser_version_for_new_seed(int(seed))
+        raise BrowserVersionError(
+            "BROWSER_VERSION: unpinned launch forbidden in dual-bin mode; "
+            "pass browser_version / CLOAKCLI_BROWSER_VERSION or profile_meta_path"
+        )
+
+    return LEGACY_BROWSER_VERSION
+
+
 def ensure_fingerprint_seed(meta_path: Path, *, regenerate: bool = False) -> int:
     """Load profile.json; mint/persist fingerprint_seed if missing/invalid or regenerate.
 
     Preserves all other fields (proxy, notes, etc.). Returns the seed to use.
-    A reminted seed also remints fingerprint_persona from that seed.
+    A reminted seed also remints fingerprint_persona from that seed and keeps
+    (or assigns) the immutable browser_version pin.
     """
     meta_path = Path(meta_path)
     data = _read_profile_meta(meta_path)
 
     existing = coerce_fingerprint_seed(data.get(_FIELD))
     if existing is not None and not regenerate:
+        # Bind legacy profiles to 146 without reminting persona.
+        ensure_browser_version(meta_path, seed=existing, persist=True)
         return existing
 
     seed = mint_fingerprint_seed()
+    # New seed → assign pin from seed (or keep existing immutable pin).
+    pin = ensure_browser_version(meta_path, seed=seed, persist=True)
+    data = _read_profile_meta(meta_path)
     data[_FIELD] = seed
-    data[_PERSONA_FIELD] = mint_fingerprint_persona(seed)
+    data[_BROWSER_VERSION_FIELD] = pin
+    data[_PERSONA_FIELD] = mint_fingerprint_persona(seed, browser_version=pin)
     _atomic_write_json(meta_path, data)
     return seed
 
@@ -865,22 +1112,24 @@ def ensure_fingerprint_persona(
     *,
     regenerate: bool = False,
 ) -> dict[str, Any]:
-    """Load or mint a whitelist persona bound to this seed; persist on profile.json.
+    """Load or mint a whitelist persona bound to this seed + browser_version.
 
     A whitelist-valid persona minted for a *different* fingerprint_seed is
-    reminted (same path as a schema bump). Same profile + same seed is stable.
+    reminted (same path as a schema bump). Same profile + same seed + same
+    bound binary is stable. Binding a legacy profile to 146 does not remint.
     """
     meta_path = Path(meta_path)
+    pin = ensure_browser_version(meta_path, seed=seed, persist=True)
     data = _read_profile_meta(meta_path)
     existing = data.get(_PERSONA_FIELD)
     if (
         not regenerate
-        and is_whitelisted_persona(existing)
-        and persona_derived_from_seed(existing, seed)
+        and is_whitelisted_persona(existing, browser_version=pin)
+        and persona_derived_from_seed(existing, seed, browser_version=pin)
     ):
         assert isinstance(existing, dict)
         return existing
-    if existing is not None and not is_whitelisted_persona(existing):
+    if existing is not None and not is_whitelisted_persona(existing, browser_version=pin):
         sys.stderr.write(
             "[fingerprint] rejected non-whitelist persona; reminting from seed\n"
         )
@@ -890,8 +1139,9 @@ def ensure_fingerprint_persona(
             "[fingerprint] persona not bound to current fingerprint_seed; reminting\n"
         )
         sys.stderr.flush()
-    persona = mint_fingerprint_persona(seed)
+    persona = mint_fingerprint_persona(seed, browser_version=pin)
     data[_FIELD] = int(seed)
+    data[_BROWSER_VERSION_FIELD] = pin
     data[_PERSONA_FIELD] = persona
     _atomic_write_json(meta_path, data)
     return persona
@@ -1312,11 +1562,16 @@ def apply_to_launch_kwargs(
     lookup_city: Callable[[str], dict[str, Any]] | None = None,
     db_version: str | None = None,
     now: datetime | None = None,
+    browser_version: str | None = None,
 ) -> dict[str, Any]:
     """Fill launch_persistent_context kwargs with persona flags + geoip alignment.
 
     Sets binary flags only. Passes geoip=True when a proxy is present and geo
     resolved (cloakbrowser still injects WebRTC if we did not already set it).
+
+    Always sets kwargs["browser_version"] to the profile-bound exact pin when
+    dual-bin mode is on (forbids unpinned launch). Persona brand/CH derive from
+    that pin — not wrapper get_chromium_version() alone.
 
     Font gate runs before launch args are finalized: register/strict fail-closed
     on missing Windows minimum fonts; nurture warns. Headed emits --window-size
@@ -1324,12 +1579,19 @@ def apply_to_launch_kwargs(
     assert_webrtc_host_equals_exit_ip) — call after gather on register paths.
     """
     meta = Path(profile_meta_path) if profile_meta_path is not None else None
+    pin = resolve_browser_version_for_launch(
+        browser_version=browser_version,
+        profile_meta_path=meta,
+        seed=seed,
+    )
+    kwargs["browser_version"] = pin
+
     persona: dict[str, Any] | None = None
     if seed is not None:
         if meta is not None:
             persona = ensure_fingerprint_persona(meta, seed)
         else:
-            persona = mint_fingerprint_persona(seed)
+            persona = mint_fingerprint_persona(seed, browser_version=pin)
         log_fingerprint_persona(persona)
 
     env_geo = env_require_geo()
@@ -1379,7 +1641,12 @@ def apply_to_launch_kwargs(
 
     if seed is not None:
         kwargs["args"] = fingerprint_chrome_args(
-            seed, persona, geo=geo or None, language=language, headed=headed
+            seed,
+            persona,
+            geo=geo or None,
+            language=language,
+            headed=headed,
+            browser_version=pin,
         )
     elif geo or language:
         extra: list[str] = []

@@ -33,6 +33,7 @@ def launch_context(
     require_geo: bool | None = None,
     skill_name: str | None = None,
     skill_path: str | None = None,
+    browser_version: str | None = None,
 ) -> Any:
     """Launch persistent stealth Chromium via cloakbrowser.
 
@@ -49,6 +50,8 @@ def launch_context(
     set, launch_context gathers ICE (page/iframe/worker) and fail-closes on
     host leak (opt out with CLOAKCLI_REQUIRE_WEBRTC_ICE=0). Playwright user_agent is not
     used for persona (it desyncs HTTP UA / Client Hints / JS userAgentData).
+    Dual-bin mode persists exact browser_version on the profile and always
+    passes it into cloakbrowser; persona/UA/CH follow the bound binary.
     """
     from cloakbrowser import launch_persistent_context
 
@@ -57,6 +60,7 @@ def launch_context(
         env_require_geo,
         is_register_launch,
         log_fingerprint_seed,
+        resolve_browser_version_for_launch,
         resolve_fingerprint_seed,
         resolve_profile_meta_path,
     )
@@ -91,6 +95,7 @@ def launch_context(
         else:
             require_geo = is_register_launch(skill_name, skill_path)
 
+    # Dual-bin: always resolve exact pin before launch (forbid unpinned).
     if seed is not None or proxy:
         apply_to_launch_kwargs(
             kwargs,
@@ -99,6 +104,13 @@ def launch_context(
             headed=headed,
             profile_meta_path=meta,
             require_geo=require_geo,
+            browser_version=browser_version,
+        )
+    else:
+        kwargs["browser_version"] = resolve_browser_version_for_launch(
+            browser_version=browser_version,
+            profile_meta_path=meta,
+            seed=seed,
         )
     if seed is not None:
         log_fingerprint_seed(seed)
