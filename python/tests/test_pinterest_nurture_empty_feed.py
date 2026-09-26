@@ -49,6 +49,11 @@ class FakeLocator:
     def scroll_into_view_if_needed(self, timeout: int = 0) -> None:
         return None
 
+    def get_attribute(self, name: str) -> str | None:
+        if name == "data-test-id":
+            return getattr(self, "_test_id", None)
+        return None
+
     def filter(self, **k):
         return self
 
@@ -257,6 +262,66 @@ class RecoverEmptyFeedTests(unittest.TestCase):
         self.assertTrue(out.get("reloaded"))
         self.assertTrue(out.get("blank"))
         self.assertIn(out.get("detail"), {"blank_paint", "no_pin_links"})
+
+
+class UseCaseClickCountTests(unittest.TestCase):
+    def test_failed_hclick_not_counted(self) -> None:
+        """picked counts only successful _hclick results (Astra R1 blocker)."""
+        class Tile(FakeLocator):
+            def __init__(self, label: str, test_id: str):
+                super().__init__(1, text=label, visible=True)
+                self._test_id = test_id
+                self._label = label
+
+            def inner_text(self, timeout: int = 0) -> str:
+                return self._label
+
+        tiles = [Tile(f"Interest {i}", f"use-case-tap-area-{i}") for i in range(5)]
+
+        class PickerPage(FakePage):
+            def locator(self, sel: str):
+                if "use-case-tap-area" in sel or sel == nb.USE_CASE_TILE:
+                    loc = FakeLocator(len(tiles), text="Interest")
+                    loc.nth = lambda i: tiles[i]  # type: ignore
+                    return loc
+                if sel == nb.USE_CASE_PICKER:
+                    return FakeLocator(1)
+                if sel == nb.USE_CASE_CONTINUE:
+                    return FakeLocator(0)
+                return super().locator(sel)
+
+        page = PickerPage(
+            body="What are you in the mood to do? Pick 3 or more",
+            counts={nb.PIN_LINK: 0},
+        )
+        calls = {"n": 0}
+        real_hclick = nb._hclick
+        real_pause = nb.pause
+
+        def flaky_hclick(page, loc):
+            calls["n"] += 1
+            # Fail first two attempts, succeed after.
+            if calls["n"] <= 2:
+                return {"ok": False, "error": "no_box", "method": "no_box"}
+            return {"ok": True, "method": "mouse_trail_down_up", "hover_ms": 1}
+
+        def fast_pause(page, lo, hi, label="", *, ambient=False):
+            page.wait_for_timeout(1)
+            return 1
+
+        nb._hclick = flaky_hclick  # type: ignore
+        nb.pause = fast_pause  # type: ignore
+        try:
+            out = nb.complete_use_case_picker(page, run_art=None)
+        finally:
+            nb._hclick = real_hclick  # type: ignore
+            nb.pause = real_pause  # type: ignore
+        self.assertTrue(out["seen"])
+        self.assertEqual(out["picked"], len(out["labels"]))
+        self.assertGreaterEqual(out["picked"], 3)
+        self.assertEqual(out.get("click_fail"), 2)
+        self.assertEqual(len(set(x.casefold() for x in out["labels"])), out["picked"])
+
 
 
 if __name__ == "__main__":

@@ -805,13 +805,39 @@ def use_case_picker_visible(page) -> bool:
 
 
 def _use_case_tile_locators(page) -> list:
-    """Collect clickable use-case / interest tiles (≥3 target)."""
+    """Collect clickable use-case / interest tiles (≥3 target).
+
+    Prefer verified use-case-tap-area-* nodes. Fallback selectors are deduped by
+    normalized label so the same chip is not collected twice across CSS queries.
+    """
     found = []
+    seen_keys: set[str] = set()
+
+    def _tile_key(el, idx: int) -> str:
+        try:
+            tid = el.get_attribute("data-test-id") or ""
+        except Exception:
+            tid = ""
+        try:
+            label = (el.inner_text(timeout=400) or "").strip().casefold()[:80]
+        except Exception:
+            label = ""
+        if tid:
+            return f"tid:{tid}"
+        if label:
+            return f"label:{label}"
+        return f"idx:{idx}"
+
     try:
         tiles = page.locator(USE_CASE_TILE)
         n = tiles.count()
         for i in range(n):
-            found.append(tiles.nth(i))
+            el = tiles.nth(i)
+            key = _tile_key(el, i)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            found.append(el)
     except Exception:
         pass
     if len(found) >= 3:
@@ -836,12 +862,16 @@ def _use_case_tile_locators(page) -> list:
             try:
                 loc = scope.locator(sel)
                 for i in range(min(loc.count(), 24)):
-                    found.append(loc.nth(i))
+                    el = loc.nth(i)
+                    key = _tile_key(el, len(found) + i)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    found.append(el)
             except Exception:
                 continue
     except Exception:
         pass
-    # Dedup by object id is fine for fakes; live PW locators are distinct nth.
     return found
 
 
@@ -872,6 +902,8 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
         idxs = list(range(n))
         random.shuffle(idxs)
         chosen = []
+        seen_labels: set[str] = set()
+        click_fail = 0
         for i in idxs:
             if len(chosen) >= want:
                 break
@@ -886,18 +918,27 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
                     label = (el.inner_text(timeout=500) or "").strip()[:40]
                 except Exception:
                     label = ""
+                label_key = (label or f"tile_{i}").casefold()
+                if label_key in seen_labels:
+                    continue
                 try:
                     el.scroll_into_view_if_needed(timeout=3000)
                 except Exception:
                     pass
                 pause(page, 400, 1100, "use_case_before_tile")
-                _hclick(page, el)
+                clk = _hclick(page, el)
+                if not clk.get("ok"):
+                    click_fail += 1
+                    continue
                 chosen.append(label or f"tile_{i}")
+                seen_labels.add(label_key)
                 pause(page, 600, 1400, "use_case_after_tile")
             except Exception:
+                click_fail += 1
                 continue
         out["picked"] = len(chosen)
         out["labels"] = chosen
+        out["click_fail"] = click_fail
         log({"use_case_picked": chosen})
         if run_art is not None:
             try:
