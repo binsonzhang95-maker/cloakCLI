@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinterest nurture browse (0.2.3).
+"""Pinterest nurture browse (0.2.6).
 
 Logged-in feed browse with behavior hardening (Gemini 2026-09-21 + 2026-09-23):
 default headed, continuous randomized mouse trails, inertial scroll, session
@@ -11,9 +11,11 @@ CloakBrowser persistent context; one account ↔ one geo/proxy. Use persisted
 fingerprint_seed from profile.json; do not randomize per launch.
 
 At session start, clears name onboarding ("What's your name") then use-case
-picker if present. Does NOT wipe user_data_dir. Does NOT attempt login /
-credential recovery (dead-account audit owns that). Emits fleet status JSON
-as last stdout line.
+picker if present. 0.2.6: before like_failed/no_pin_links, re-run login gate
+(unauth → not_logged_in), blank-paint wait+reload once, re-clear name/gender/
+use-case NUX with broader picker detection (≥3 tiles via _hclick). Does NOT
+wipe user_data_dir. Does NOT attempt login / credential recovery (dead-account
+audit owns that). Emits fleet status JSON as last stdout line.
 
 Statuses: browsed_ok | not_logged_in | like_failed | account_deactivated | session_lost_before_nurture (register chain)
 """
@@ -66,7 +68,7 @@ from pinterest_nurture_behavior import (  # noqa: E402
 )
 
 ART = ROOT / "artifacts/pinterest/nurture-browse"
-VERSION = "0.2.3"
+VERSION = "0.2.6"
 
 # Draft selectors — refine after a healthy logged-in probe
 PIN_LINK = 'a[href*="/pin/"]'
@@ -176,16 +178,45 @@ def emit_status(status: str, **extra) -> None:
     print(json.dumps(report, ensure_ascii=False), flush=True)
 
 
-def detect_login_state(page) -> str:
-    """Return browsed_ok-path gate: ok | not_logged_in | account_deactivated."""
-    b = body_text(page, 3000)
-    if re.search(r"account has been deactivated|your account has been deactivated", b, re.I):
-        return "account_deactivated"
+def page_looks_blank(page) -> dict:
+    """Heuristic for blank/white incomplete paint (e.g. ~3KB white home).
+
+    Returns {blank: bool, body_len: int, pins: int, reason?: str}.
+    Pure signal helper — does not navigate or click.
+    """
+    out: dict = {"blank": False, "body_len": 0, "pins": 0}
     try:
-        if page.locator('text=/account has been deactivated/i').count():
-            return "account_deactivated"
+        b = body_text(page, 4000)
     except Exception:
-        pass
+        b = ""
+    out["body_len"] = len((b or "").strip())
+    try:
+        out["pins"] = int(page.locator(PIN_LINK).count())
+    except Exception:
+        out["pins"] = 0
+    # Strip common whitespace / zero-width; treat near-empty as blank paint.
+    compact = re.sub(r"\s+", "", b or "")
+    if out["pins"] > 0:
+        return out
+    if out["body_len"] < 40 or len(compact) < 24:
+        out["blank"] = True
+        out["reason"] = "short_body"
+        return out
+    # White / loading shells often only expose tiny chrome strings.
+    if out["body_len"] < 120 and not re.search(
+        r"Log in|Sign up|Pinterest|pin/|mood|interest|identify|Continue",
+        b or "",
+        re.I,
+    ):
+        out["blank"] = True
+        out["reason"] = "sparse_shell"
+    return out
+
+
+def _unauth_cta_signals(page, body: str) -> dict:
+    """Detect logged-out marketing / signup wall (broader than one test-id)."""
+    b = body or ""
+    head = b[:2000]
     unauth = 0
     acct = 0
     try:
@@ -198,12 +229,79 @@ def detect_login_state(page) -> str:
         pins = page.locator(PIN_LINK).count()
     except Exception:
         pass
-    has_cta = bool(re.search(r"\bLog in\b", b[:1500])) and bool(
-        re.search(r"\bSign up\b", b[:1500])
+    has_login = bool(re.search(r"\bLog in\b", head))
+    has_signup = bool(re.search(r"\bSign up\b", head))
+    has_cta = has_login and has_signup
+    marketing = bool(
+        re.search(
+            r"Create a free account|Already a member|Welcome to Pinterest|"
+            r"Sign up to get|Log in to get|birthday|When.?s your birthday|"
+            r"Continue as guest",
+            head,
+            re.I,
+        )
     )
+    url = ""
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    url_unauth = bool(re.search(r"/login|/signup|/sec/|"
+                                 r"pinterest\.com/?$", url, re.I)) and has_cta
+    return {
+        "unauth_sels": unauth,
+        "acct": acct,
+        "pins": pins,
+        "has_cta": has_cta,
+        "has_login": has_login,
+        "has_signup": has_signup,
+        "marketing": marketing,
+        "url_unauth": url_unauth,
+        "url": url,
+    }
+
+
+def detect_login_state(page) -> str:
+    """Return browsed_ok-path gate: ok | not_logged_in | account_deactivated.
+
+    Positive logged-in evidence preferred (acct header / pin links). Blank paint
+    with zero signals is NOT treated as logged-in (avoids false ok → like_failed).
+    """
+    b = body_text(page, 3000)
+    if re.search(r"account has been deactivated|your account has been deactivated", b, re.I):
+        return "account_deactivated"
+    try:
+        if page.locator('text=/account has been deactivated/i').count():
+            return "account_deactivated"
+    except Exception:
+        pass
+    sig = _unauth_cta_signals(page, b)
+    unauth = int(sig["unauth_sels"])
+    acct = int(sig["acct"])
+    pins = int(sig["pins"])
+    has_cta = bool(sig["has_cta"])
+    marketing = bool(sig["marketing"])
+    blank = page_looks_blank(page)
+    # Strong unauth: DOM CTA or Log in+Sign up with no account chrome.
     if unauth > 0 or (has_cta and acct == 0 and pins < 3):
         return "not_logged_in"
-    if acct > 0 or pins >= 3 or not has_cta:
+    # Marketing / birthday wall without account chrome or pins (i10-021 class).
+    if marketing and acct == 0 and pins < 1 and not has_cta:
+        # birthday Continue alone can appear on NUX too; require login-ish words
+        if sig["has_login"] or sig["has_signup"] or unauth > 0:
+            return "not_logged_in"
+        if re.search(r"\bLog in\b|\bSign up\b|Create a free account|Already a member", b, re.I):
+            return "not_logged_in"
+    if acct > 0 or pins >= 3:
+        return "ok"
+    if has_cta and acct == 0:
+        return "not_logged_in"
+    # Blank / incomplete paint with zero unauth CTA: defer to recover_empty_feed
+    # (wait + reload once) instead of hard not_logged_in / false ok→like_failed.
+    if blank.get("blank") and acct == 0 and pins < 1:
+        return "ok"
+    # Ambiguous but some body content and no unauth CTA → allow browse path.
+    if not has_cta:
         return "ok"
     return "not_logged_in"
 
@@ -501,8 +599,7 @@ def _onboarding_progress_state(page) -> dict:
         try:
             state["modal"] = bool(
                 gender_onboarding_visible(page)
-                or page.locator(USE_CASE_PICKER).count()
-                or page.locator('text=/What are you in the mood to do/i').count()
+                or use_case_picker_visible(page)
                 or page.locator('text=/What\'?s your name/i').count()
             )
         except Exception:
@@ -632,7 +729,7 @@ def complete_onboarding_progress(page, run_art: Path | None = None, max_steps: i
         if gender_onboarding_visible(page):
             action = "gender"
             result = complete_gender_onboarding(page, run_art=None)
-        elif page.locator(USE_CASE_PICKER).count() or page.locator('text=/What are you in the mood to do/i').count():
+        elif use_case_picker_visible(page):
             action = "use_case"
             result = complete_use_case_picker(page, run_art=None)
         elif name_onboarding_visible(page):
@@ -659,6 +756,93 @@ def complete_onboarding_progress(page, run_art: Path | None = None, max_steps: i
 USE_CASE_PICKER = '[data-test-id="desktop-use-case-picker"]'
 USE_CASE_TILE = '[data-test-id^="use-case-tap-area-"]'
 USE_CASE_CONTINUE = '[data-test-id="skip-or-continue-button"]'
+USE_CASE_TEXT_HINTS = (
+    r"What are you in the mood to do",
+    r"pick\s*3",
+    r"Pick\s*3\s*or\s*more",
+    r"continue to (your )?feed",
+    r"Choose your interests",
+    r"Tell us what you.?re interested",
+    r"Select topics",
+    r"interests",
+)
+
+
+def use_case_picker_visible(page) -> bool:
+    """Broader than single data-test-id — tiles / continue / mood text."""
+    try:
+        if page.locator(USE_CASE_PICKER).count():
+            return True
+    except Exception:
+        pass
+    try:
+        if page.locator(USE_CASE_TILE).count():
+            return True
+    except Exception:
+        pass
+    try:
+        if page.locator(USE_CASE_CONTINUE).count():
+            # skip-or-continue alone is weak; require mood/pick-3 context
+            body = body_text(page, 2500)
+            if re.search(r"mood|interest|pick\s*3|topics|feed", body, re.I):
+                return True
+    except Exception:
+        pass
+    try:
+        body = body_text(page, 2500)
+        for pat in USE_CASE_TEXT_HINTS:
+            if re.search(pat, body, re.I):
+                return True
+        if page.locator('text=/What are you in the mood to do/i').count():
+            return True
+        if page.locator('text=/pick 3 or more/i').count():
+            return True
+        if page.locator('text=/continue to your feed/i').count():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _use_case_tile_locators(page) -> list:
+    """Collect clickable use-case / interest tiles (≥3 target)."""
+    found = []
+    try:
+        tiles = page.locator(USE_CASE_TILE)
+        n = tiles.count()
+        for i in range(n):
+            found.append(tiles.nth(i))
+    except Exception:
+        pass
+    if len(found) >= 3:
+        return found
+    # Fallback: role=button / clickable cards inside picker container.
+    try:
+        root = page.locator(USE_CASE_PICKER)
+        if not root.count():
+            root = page.locator('[role="dialog"]').filter(
+                has_text=re.compile(r"mood|interest|pick\s*3|topics", re.I)
+            )
+        scope = root.first if root.count() else page
+        for sel in (
+            '[data-test-id*="use-case" i]',
+            '[data-test-id*="interest" i]',
+            '[data-test-id*="topic" i]',
+            'button[aria-pressed]',
+            '[role="button"][aria-pressed]',
+            '[role="checkbox"]',
+            '[role="option"]',
+        ):
+            try:
+                loc = scope.locator(sel)
+                for i in range(min(loc.count(), 24)):
+                    found.append(loc.nth(i))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # Dedup by object id is fine for fakes; live PW locators are distinct nth.
+    return found
 
 
 def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
@@ -666,15 +850,13 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
 
     Verified 2026-09-19 CST on geo46: desktop-use-case-picker +
     use-case-tap-area-* tiles + skip-or-continue-button.
-    Pick >=3 tiles (human delay), then continue to feed.
+    0.2.6: broader detection (text / continue / interests) + tile fallbacks.
+    Pick >=3 tiles via _hclick (never locator.click / force), then continue.
     """
     out: dict = {"seen": False, "picked": 0, "continued": False}
     try:
-        picker = page.locator(USE_CASE_PICKER)
-        if not picker.count():
-            # text fallback
-            if not page.locator('text=/What are you in the mood to do/i').count():
-                return out
+        if not use_case_picker_visible(page):
+            return out
         out["seen"] = True
         out["step_title"] = _onboarding_step_title(page)
     except Exception:
@@ -682,8 +864,9 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
 
     try:
         pause(page, 800, 1600, "use_case_settle")
-        tiles = page.locator(USE_CASE_TILE)
-        n = tiles.count()
+        tiles = _use_case_tile_locators(page)
+        n = len(tiles)
+        out["tile_candidates"] = n
         # pick 3–5 distinct tiles with human pacing
         want = min(max(3, random.randint(3, 5)), n if n else 3)
         idxs = list(range(n))
@@ -693,11 +876,20 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
             if len(chosen) >= want:
                 break
             try:
-                el = tiles.nth(i)
-                if not el.is_visible(timeout=500):
-                    continue
-                label = (el.inner_text(timeout=500) or "").strip()[:40]
-                el.scroll_into_view_if_needed(timeout=3000)
+                el = tiles[i]
+                try:
+                    if not el.is_visible(timeout=500):
+                        continue
+                except Exception:
+                    pass
+                try:
+                    label = (el.inner_text(timeout=500) or "").strip()[:40]
+                except Exception:
+                    label = ""
+                try:
+                    el.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
                 pause(page, 400, 1100, "use_case_before_tile")
                 _hclick(page, el)
                 chosen.append(label or f"tile_{i}")
@@ -715,6 +907,7 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
 
         # wait for continue to enable (button text changes / becomes clickable)
         btn = page.locator(USE_CASE_CONTINUE)
+        clicked_continue = False
         for _ in range(12):
             try:
                 if not btn.count():
@@ -734,6 +927,7 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
                     out["continued"] = bool(clk.get("ok"))
                     out["continue_text"] = txt[:60]
                     if out["continued"]:
+                        clicked_continue = True
                         pause(page, 2500, 4500, "use_case_after_continue")
                     break
                 # Trail-only retry after enough picks even if the label still says pick.
@@ -743,6 +937,7 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
                         if clk.get("ok"):
                             out["continued"] = True
                             out["continue_forced"] = True
+                            clicked_continue = True
                             pause(page, 2500, 4500, "use_case_continue_forced")
                             break
                     except Exception:
@@ -751,13 +946,33 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
                 pass
             page.wait_for_timeout(500)
 
+        # Text / role fallback when data-test-id continue missing.
+        if not clicked_continue and out["picked"] >= 3:
+            for pattern in (
+                r"continue to (your )?feed",
+                r"^\s*Continue\s*$",
+                r"^\s*Next\s*$",
+            ):
+                try:
+                    loc = page.get_by_role("button", name=re.compile(pattern, re.I))
+                    if loc.count() and loc.first.is_visible(timeout=500):
+                        pause(page, 500, 1200, "use_case_before_continue_fb")
+                        clk = _hclick(page, loc.first)
+                        if clk.get("ok"):
+                            out["continued"] = True
+                            out["continue_fallback"] = pattern
+                            pause(page, 2500, 4500, "use_case_after_continue_fb")
+                            break
+                except Exception:
+                    continue
+
         # Do not Escape a residual onboarding modal: the progress loop below
         # must finish its next segmented step instead of dismissing it.
 
         # Wait for pin feed to appear
         for _ in range(15):
             try:
-                if page.locator(PIN_LINK).count() >= 3:
+                if page.locator(PIN_LINK).count() >= 1:
                     break
             except Exception:
                 pass
@@ -770,6 +985,125 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
                 pass
     except Exception as e:
         out["error"] = f"{type(e).__name__}:{str(e)[:160]}"
+    return out
+
+
+def recover_empty_feed(page, run_art: Path | None = None) -> dict:
+    """Before like_failed/no_pin_links: re-gate, blank reload once, re-clear NUX.
+
+    Returns dict with gate, blank, reloaded, nux bits, pin_count, detail.
+    Does not wipe user_data_dir or attempt credential login.
+    """
+    out: dict = {
+        "gate": "ok",
+        "blank": False,
+        "reloaded": False,
+        "pin_count": 0,
+        "detail": None,
+    }
+    try:
+        gate = detect_login_state(page)
+        out["gate"] = gate
+        if gate != "ok":
+            out["detail"] = gate
+            if run_art is not None:
+                try:
+                    page.screenshot(path=str(run_art / "02-empty-feed-diagnose.png"))
+                except Exception:
+                    pass
+            return out
+
+        blank = page_looks_blank(page)
+        out["blank_probe"] = blank
+        out["blank"] = bool(blank.get("blank"))
+        if out["blank"]:
+            # Quiet wait then single reload + re-gate.
+            try:
+                pause(page, 1800, 3500, "empty_feed_blank_wait")
+            except Exception:
+                page.wait_for_timeout(2000)
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=90000)
+                out["reloaded"] = True
+            except Exception as e:
+                out["reload_error"] = type(e).__name__
+            try:
+                quiet_window(page)
+            except Exception:
+                page.wait_for_timeout(1200)
+            gate = detect_login_state(page)
+            out["gate"] = gate
+            out["gate_after_reload"] = gate
+            if gate != "ok":
+                out["detail"] = gate
+                if run_art is not None:
+                    try:
+                        page.screenshot(path=str(run_art / "02-empty-feed-diagnose.png"))
+                    except Exception:
+                        pass
+                return out
+            # If still blank after reload while "ok", keep going to NUX clear.
+            blank2 = page_looks_blank(page)
+            out["blank_after_reload"] = blank2
+            if blank2.get("blank"):
+                out["detail"] = "blank_paint"
+
+        # Re-clear name → gender → use-case → onboarding progress.
+        name_nux = complete_name_onboarding(page, run_art)
+        gender_nux = complete_gender_onboarding(page, run_art)
+        use_nux = complete_use_case_picker(page, run_art)
+        onboard = complete_onboarding_progress(page, run_art)
+        out["name_onboarding"] = name_nux
+        out["gender_onboarding"] = gender_nux
+        out["use_case_picker"] = use_nux
+        out["onboarding_progress"] = onboard
+
+        # Wait until at least one pin link appears.
+        pin_count = 0
+        for _ in range(12):
+            try:
+                pin_count = int(page.locator(PIN_LINK).count())
+            except Exception:
+                pin_count = 0
+            if pin_count >= 1:
+                break
+            try:
+                inertial_scroll(page, direction=1)
+            except Exception:
+                pass
+            try:
+                pause(page, 700, 1400, "empty_feed_wait_pins")
+            except Exception:
+                page.wait_for_timeout(800)
+        out["pin_count"] = pin_count
+
+        # Final gate — unauth wall may appear after NUX attempt.
+        gate = detect_login_state(page)
+        out["gate"] = gate
+        if gate != "ok":
+            out["detail"] = gate
+        elif pin_count < 1:
+            if use_nux.get("seen") and not use_nux.get("continued"):
+                out["detail"] = "nux_uncleared"
+            elif out.get("detail") == "blank_paint" or (
+                out.get("blank") and page_looks_blank(page).get("blank")
+            ):
+                out["detail"] = "blank_paint"
+            else:
+                out["detail"] = "no_pin_links"
+
+        if pin_count < 1 and run_art is not None:
+            try:
+                page.screenshot(path=str(run_art / "02-empty-feed-diagnose.png"))
+            except Exception:
+                pass
+        try:
+            page.screenshot(path=str(run_art / "02-feed.png")) if run_art is not None else None
+        except Exception:
+            pass
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}:{str(e)[:160]}"
+        out["detail"] = out.get("detail") or "no_pin_links"
     return out
 
 
@@ -1098,6 +1432,35 @@ def run_nurture_session(
         if onboarding.get("complete"):
             dismiss_light(page)
 
+        # 0.2.6: if feed still has zero pin links, recover before browse/fail.
+        pin_boot = 0
+        try:
+            pin_boot = int(page.locator(PIN_LINK).count())
+        except Exception:
+            pin_boot = 0
+        if pin_boot < 1:
+            recovery = recover_empty_feed(page, run_art)
+            log({"empty_feed_recovery": recovery})
+            worked["empty_feed_recovery"] = recovery
+            gate2 = recovery.get("gate") or detect_login_state(page)
+            if gate2 != "ok":
+                return {
+                    "status": gate2,
+                    "profile": profile,
+                    "url": page.url,
+                    "error": recovery.get("detail") or gate2,
+                    "note": "empty_feed_recovery_gate",
+                    "elapsed_sec": round(time.time() - t0, 1),
+                    "liked": False,
+                    "pins_opened": 0,
+                    "persona": plan["persona"],
+                    "worked": worked,
+                }
+            try:
+                pin_boot = int(page.locator(PIN_LINK).count())
+            except Exception:
+                pin_boot = int(recovery.get("pin_count") or 0)
+
         # Visibility keepalive before first feed interaction burst.
         try:
             ensure_page_visible(page, log_fn=log)
@@ -1214,19 +1577,52 @@ def run_nurture_session(
             pin_ids = collect_pin_ids(page, want=n_pins, pool=max(n_pins * 4, 16))
             log({"pin_ids_n": len(pin_ids), "pin_ids": pin_ids})
             if not pin_ids:
-                return {
-                    "status": "like_failed",
-                    "profile": profile,
-                    "error": "no_pin_links",
-                    "note": "logged_in_but_empty_feed",
-                    "elapsed_sec": round(time.time() - t0, 1),
-                    "liked": False,
-                    "pins_opened": 0,
-                    "feed_dwell_sec": feed_dwell_sec,
-                    "scroll_distance_px": int(scroll_distance_px),
-                    "persona": plan["persona"],
-                    "worked": worked,
-                }
+                recovery = worked.get("empty_feed_recovery")
+                if not isinstance(recovery, dict):
+                    recovery = recover_empty_feed(page, run_art)
+                    log({"empty_feed_recovery": recovery})
+                    worked["empty_feed_recovery"] = recovery
+                    pin_ids = collect_pin_ids(page, want=n_pins, pool=max(n_pins * 4, 16))
+                    log({"pin_ids_n_after_recovery": len(pin_ids), "pin_ids": pin_ids})
+                gate3 = (recovery or {}).get("gate") or detect_login_state(page)
+                if gate3 != "ok":
+                    return {
+                        "status": gate3,
+                        "profile": profile,
+                        "error": (recovery or {}).get("detail") or gate3,
+                        "note": "empty_feed_reclassified",
+                        "elapsed_sec": round(time.time() - t0, 1),
+                        "liked": False,
+                        "pins_opened": 0,
+                        "feed_dwell_sec": feed_dwell_sec,
+                        "scroll_distance_px": int(scroll_distance_px),
+                        "persona": plan["persona"],
+                        "worked": worked,
+                    }
+                if not pin_ids:
+                    detail = (recovery or {}).get("detail") or "no_pin_links"
+                    note = "logged_in_but_empty_feed"
+                    if detail == "nux_uncleared":
+                        note = "nux_uncleared"
+                    elif detail == "blank_paint":
+                        note = "blank_paint"
+                    try:
+                        page.screenshot(path=str(run_art / "02-empty-feed-diagnose.png"))
+                    except Exception:
+                        pass
+                    return {
+                        "status": "like_failed",
+                        "profile": profile,
+                        "error": "no_pin_links" if detail in (None, "no_pin_links") else detail,
+                        "note": note,
+                        "elapsed_sec": round(time.time() - t0, 1),
+                        "liked": False,
+                        "pins_opened": 0,
+                        "feed_dwell_sec": feed_dwell_sec,
+                        "scroll_distance_px": int(scroll_distance_px),
+                        "persona": plan["persona"],
+                        "worked": worked,
+                    }
 
             for pi, pid in enumerate(pin_ids):
                 if time.time() - t0 > plan["max_sec"] - 15:

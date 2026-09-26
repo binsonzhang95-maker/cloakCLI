@@ -1,4 +1,4 @@
-# pinterest-nurture-browse (0.2.3)
+# pinterest-nurture-browse (0.2.6)
 
 Logged-in **nurture browse** for a single Pinterest account. Behavior hardening
 (Gemini JS strategy 2026-09-21): default **headed**, continuous **randomized
@@ -13,7 +13,7 @@ pauses, quiet window after load. 0 likes is a valid success.
 - Use persisted `fingerprint_seed` from profile.json; do not randomize per launch.
 - Use the account’s **bound proxy** from `profile.json`.
 
-## Behavior hardening (0.2.3)
+## Behavior hardening (0.2.6)
 
 | Surface | What the runner does |
 |---------|----------------------|
@@ -33,6 +33,7 @@ pauses, quiet window after load. 0 likes is a valid success.
 - **Zero-pin bounce + browsed_ok (0.2.3 P1):** ~15–25% sessions open 0 pins (mostly bounce_early / browse_only); feed scroll 3–7 screens, dwell ~25–90s (lognormal ~45s). Success gate:
   `browsed_ok` iff `(pins_opened >= 1) OR (feed_dwell_sec >= 25 AND scroll_distance_px >= 1500)`.
   Zero-pin success is **not** `like_failed`.
+- **Empty-feed / NUX recovery (0.2.6 P0):** before `like_failed` / `no_pin_links`, re-run login gate (unauth CTA / Log in+Sign up → `not_logged_in`, not false `logged_in_but_empty_feed`); if blank/white paint, quiet wait + **reload once** + re-gate; re-clear name → gender → use-case picker with broader detection (test-id + mood/interests/pick-3 / continue-to-feed text); click **≥3** tiles via `_hclick` only; screenshot `01e-use-case-*`, `02-feed`, `02-empty-feed-diagnose.png` when still empty. `like_failed` only when gate still ok after recovery.
 - **Timing variation (must):** every intermediate pause re-samples lognormal/gamma independently — no identical fixed sleep chains across steps/runs/profiles.
 
 Helpers: `scripts/pinterest_nurture_behavior.py` (unit-tested). Product path is this **python_runner**.
@@ -83,7 +84,7 @@ Hang 60–180s + longer pin linger → recommend wall clock **≥30–35 min** (
 |----|---------|-----------|-------|
 | `browsed_ok` | yes | no | ≥1 pin opened; likes optional |
 | `not_logged_in` | no | yes | |
-| `like_failed` | no | yes | empty feed / no pins — not “0 likes” |
+| `like_failed` | no | yes | empty feed / no pins after recovery — not “0 likes”; unauth reclassified as `not_logged_in` |
 | `account_deactivated` | no | no | |
 | `session_lost_before_nurture` | no | yes | register-chain probe only |
 
@@ -113,7 +114,8 @@ python3 -m unittest python/tests/test_pinterest_nurture_behavior.py -v
 
 ## Hardening notes
 
-- Fresh accounts often show **desktop-use-case-picker**; without clearing it the feed has zero pin links → `like_failed` / empty feed.
+- Fresh accounts often show **desktop-use-case-picker** (or text-only mood/interests); without clearing it the feed has zero pin links. 0.2.6 recovers (re-gate / blank reload / broader picker) before `like_failed`.
+- Mirror: `skills/pinterest-nurture-browse/scripts/*.py` and root `scripts/run_pinterest_nurture_browse.py` + `scripts/pinterest_nurture_behavior.py` must stay identical (skill package is source; copy to root scripts/).
 - Final linger previously crashed when remaining time < 3s (`randrange` empty); fixed in 0.1.3.
 - Runner does **not** log in or recover cookies — requires an already logged-in `*-pinterest-run` profile (or be chained from register keep-open).
 - Do not nurture dead/deactivated accounts; only known-alive sessions.

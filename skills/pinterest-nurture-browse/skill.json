@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "name": "pinterest-nurture-browse",
-  "description": "Nurture browse 0.2.3: headed default, continuous randomized mouse trails, inertial scroll + micro reverse, personas (browse_only/light_like/deep_browse/bounce_early), pins 0\u201312 (15\u201325% feed-only bounce), longer pin linger, visibility keepalive, mixed close paths, like 15\u201340% (0 likes OK), independent log-normal/gamma pauses, quiet window; browsed_ok=(pins>=1) OR (feed_dwell>=25s AND scroll>=1500px); hang_before_close ~60\u2013180s + flush before ctx.close. Prefer python_runner. One account \u2194 one geo/proxy. Pipeline: register \u2192 nurture same job.",
+  "description": "Nurture browse 0.2.6: headed default, continuous randomized mouse trails, inertial scroll + micro reverse, personas (browse_only/light_like/deep_browse/bounce_early), pins 0–12 (15–25% feed-only bounce), longer pin linger, visibility keepalive, mixed close paths, like 15–40% (0 likes OK), independent log-normal/gamma pauses, quiet window; browsed_ok=(pins>=1) OR (feed_dwell>=25s AND scroll>=1500px); empty-feed recovery before like_failed/no_pin_links (re-gate→not_logged_in, blank wait+reload once, broader use-case picker ≥3 _hclick tiles); hang_before_close ~60–180s + flush before ctx.close. Prefer python_runner. One account ↔ one geo/proxy. Pipeline: register → nurture same job.",
   "params": [],
   "steps": [
     {
       "action": "note",
-      "text": "Requires logged-in persistent profile (cookies). Do not wipe user_data_dir. Stop on unauth CTA / account deactivated. 0.2.3 behavior: default headed (--headless opt-in, Xvfb OK); continuous random mouse trails then mousedown/mouseup (never locator.click / force click); inertial scroll; personas; log-normal pauses; quiet window after load; no fill for human fields."
+      "text": "Requires logged-in persistent profile (cookies). Do not wipe user_data_dir. Stop on unauth CTA / account deactivated. 0.2.6 behavior: default headed (--headless opt-in, Xvfb OK); continuous random mouse trails then mousedown/mouseup (never locator.click / force click); inertial scroll; personas; log-normal pauses; quiet window after load; no fill for human fields; empty-feed recovery re-gates unauth→not_logged_in, blank reload once, broader NUX use-case clear."
     },
     {
       "action": "goto",
@@ -19,7 +19,7 @@
     },
     {
       "action": "note",
-      "text": "If name/gender onboarding appears, complete each step (gender: Male/Female 50/50); if [data-test-id=desktop-use-case-picker], click 3+ [data-test-id^=use-case-tap-area-], then [data-test-id=skip-or-continue-button]. Do not Escape while onboarding is up."
+      "text": "If name/gender onboarding appears, complete each step (gender: Male/Female 50/50); if use-case / mood / interests picker (desktop-use-case-picker or text fallbacks), click ≥3 tiles via human trail, then continue-to-feed. Do not Escape while onboarding is up. Before like_failed/no_pin_links: re-run login gate, blank wait+reload once, re-clear NUX."
     },
     {
       "action": "screenshot",

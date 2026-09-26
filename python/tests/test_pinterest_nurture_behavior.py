@@ -1,4 +1,4 @@
-"""Nurture 0.2.3 behavior helpers: linger, reverse scroll, close paths, browsed_ok."""
+"""Nurture 0.2.6 behavior helpers: linger, reverse scroll, close paths, browsed_ok."""
 from __future__ import annotations
 
 import importlib.util
@@ -328,7 +328,7 @@ class RunnerCliTests(unittest.TestCase):
         cls.runner = load_mod(RUNNER, "run_pinterest_nurture_browse")
 
     def test_default_headed_and_persona_pins(self) -> None:
-        self.assertEqual(self.runner.VERSION, "0.2.3")
+        self.assertEqual(self.runner.VERSION, "0.2.6")
         ns = self.runner.build_arg_parser().parse_args(["--profile", "geo46"])
         self.assertFalse(ns.headless)
         self.assertEqual(ns.pins, 0)
@@ -355,7 +355,7 @@ class RunnerCliTests(unittest.TestCase):
         manifest = json.loads(
             (ROOT / "skills/pinterest-nurture-browse/manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["version"], "0.2.3")
+        self.assertEqual(manifest["version"], "0.2.6")
         self.assertEqual(manifest["entry"]["path"], "scripts/run_pinterest_nurture_browse.py")
         behavior_src = (ROOT / "scripts/pinterest_nurture_behavior.py").read_text(encoding="utf-8")
         click_fn = behavior_src.split("def human_click_locator", 1)[1].split("\ndef ", 1)[0]
