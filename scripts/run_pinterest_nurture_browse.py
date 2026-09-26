@@ -977,9 +977,9 @@ def complete_use_case_picker(page, run_art: Path | None = None) -> dict:
                         clk = _hclick(page, btn.first)
                         if clk.get("ok"):
                             out["continued"] = True
-                            out["continue_forced"] = True
+                            out["continue_after_pick_retry"] = True
                             clicked_continue = True
-                            pause(page, 2500, 4500, "use_case_continue_forced")
+                            pause(page, 2500, 4500, "use_case_continue_after_pick_retry")
                             break
                     except Exception:
                         pass
