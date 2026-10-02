@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hubstudio Pinterest register — selector Playwright over CDP (0.1.2).
+"""Hubstudio Pinterest register — selector Playwright over CDP (0.1.3).
 
 Attach to an already-started Hubstudio env via chromium.connect_over_cdp.
 Never launches CloakBrowser or system Chrome. Never a vision / MM loop.
@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 SKILL_ID = "hubstudio-pinterest-register"
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
 SETTINGS_ACCOUNT_URL = "https://www.pinterest.com/settings/account-settings/"
@@ -269,6 +269,14 @@ def redact_proxy_msg(msg: Any, proxy: dict[str, Any] | None) -> str:
         if v:
             s = s.replace(v, "***")
     return redact_text(s, extra=extra)
+
+
+def hub_api_success_code(code: Any) -> bool:
+    """Hub API success is only literal int 0 or str '0'.
+
+    False, 0.0, None, and missing fail. Membership tests treat False/0.0 as 0.
+    """
+    return code is 0 or code == "0"
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -1329,13 +1337,13 @@ def start_hub_browser(container_code: int, proxy: dict[str, Any] | None) -> dict
         )
         if d.get("msg") == "protected_env_refused" or d.get("code") == -1:
             raise RuntimeError("protected_env_refused")
-        if d.get("code") not in (0, "0"):
+        if not hub_api_success_code(d.get("code")):
             raise RuntimeError("proxy_update_failed")
     d = browser_start(container_code)
     if d.get("msg") == "protected_env_refused" or d.get("code") == -1:
         raise RuntimeError("protected_env_refused")
     data = d.get("data") or {}
-    if d.get("code") not in (0, "0"):
+    if not hub_api_success_code(d.get("code")):
         raise RuntimeError(f"browser_start_failed code={d.get('code')}")
     port = data.get("debuggingPort")
     if not port:

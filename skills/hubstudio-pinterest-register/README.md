@@ -1,8 +1,8 @@
-# hubstudio-pinterest-register 0.1.2
+# hubstudio-pinterest-register 0.1.3
 
 Pinterest **selector** register against an already-started **Hubstudio** env (Playwright `connect_over_cdp`). Not CloakBrowser. Not a vision / multimodal loop.
 
-Package version **0.1.2**. `registered_ok` requires a positive **DOM** login signal (account menu / pin feed / onboarding / Search Pinterest or header-accounts). A blank page, or `/homefeed/` / `/today/` with an empty body, is not success. URL alone is never enough.
+Package version **0.1.3**. `registered_ok` requires a positive **DOM** login signal (account menu / pin feed / onboarding / Search Pinterest or header-accounts). A blank page, or `/homefeed/` / `/today/` with an empty body, is not success. URL alone is never enough. `proxy_update` continues to `browser_start` only on literal success code `0` (int) or `"0"` (str).
 
 Product path: `scripts/run_hubstudio_pinterest_register.py` (package python_runner). Repo shim: `scripts/run_hubstudio_pinterest_register.py`.
 
@@ -12,6 +12,7 @@ Mirrors Cloak `run_pinterest_register_outlook_verify.py` **0.1.4** (human trail 
 
 - Hubstudio Local API: `http://127.0.0.1:6873` (override `HUBSTUDIO_API`)
   - env list, `/api/v1/env/proxy/update` with required `asDynamicType`, browser start/stop
+  - `proxy_update` proceeds to `browser_start` only when `code is 0` or `code == "0"` (`False`, `0.0`, `None`, missing fail)
 - Playwright attaches with `chromium.connect_over_cdp` after API start
 - **Never** launch CloakBrowser or system Chrome
 - **Never** start/stop protected `containerCode`s: `1863073221`, `1863107506`, `1863108423`
