@@ -1,0 +1,87 @@
+{
+  "version": "0.1.0",
+  "entry": {
+    "kind": "python_runner",
+    "path": "scripts/run_hubstudio_pinterest_register.py"
+  },
+  "secrets": [
+    "PINTEREST_EMAIL",
+    "PINTEREST_PASSWORD",
+    "OUTLOOK_EMAIL",
+    "OUTLOOK_CLIENT_ID",
+    "OUTLOOK_REFRESH_TOKEN"
+  ],
+  "statuses": [
+    {
+      "id": "registered_ok",
+      "success": true,
+      "retryable": false,
+      "label": "Registered / logged in (onboarding or homefeed; no unauth Log in+Sign up CTA)",
+      "exit": 0
+    },
+    {
+      "id": "browsed_ok",
+      "success": true,
+      "retryable": false,
+      "label": "Nurture browse OK (optional same-session chain)",
+      "optional": true,
+      "exit": 0
+    },
+    {
+      "id": "oops_blocked",
+      "success": false,
+      "retryable": false,
+      "label": "Pinterest Oops — park",
+      "exit": 2
+    },
+    {
+      "id": "verify_soft_fail",
+      "success": false,
+      "retryable": true,
+      "label": "Verify soft fail (retryable; Send-new-code once already tried)",
+      "exit": 5
+    },
+    {
+      "id": "imap_timeout",
+      "success": false,
+      "retryable": true,
+      "label": "Outlook IMAP did not yield a Pinterest code",
+      "exit": 5
+    },
+    {
+      "id": "account_deactivated",
+      "success": false,
+      "retryable": false,
+      "label": "Account deactivated",
+      "exit": 7
+    },
+    {
+      "id": "not_logged_in",
+      "success": false,
+      "retryable": true,
+      "label": "Not logged in / still on signup or login wall",
+      "exit": 8
+    },
+    {
+      "id": "env_protected",
+      "success": false,
+      "retryable": false,
+      "label": "Refused start/stop of a protected Hubstudio env",
+      "exit": 9
+    },
+    {
+      "id": "env_missing",
+      "success": false,
+      "retryable": true,
+      "label": "Hubstudio env not found (name / containerCode)",
+      "exit": 10
+    },
+    {
+      "id": "adapter_error",
+      "success": false,
+      "retryable": true,
+      "label": "Adapter / CDP / unexpected UI error",
+      "exit": 4
+    }
+  ]
+}

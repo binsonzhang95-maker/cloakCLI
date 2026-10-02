@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "name": "hubstudio-pinterest-register",
+  "description": "Hubstudio Pinterest register 0.1.0 (selector / normal Playwright). Attach via CDP to an already-started Hubstudio env (connect_over_cdp). Never CloakBrowser, never system Chrome, never a vision/MM loop. Mirrors Cloak run_pinterest_register_outlook_verify 0.1.4: #email #password #birthdate (YYYY-MM-DD age 25–35) with nurture 0.2.3+ human_click_locator trail + human_type_text; Continue (not Google); settle; Oops → oops_blocked; Path A #code + IMAP; Path B signup_ok_no_code_challenge → Settings Confirm Email. Soft verify Send-new-code once. Default same-session nurture before browser stop (--skip-nurture / HUB_SKIP_NURTURE=1). Success bar = logged-in (onboarding/homefeed, no unauth Log in+Sign up CTA). Email Confirmed is preferred same-run, not required for registered_ok.",
+  "params": [
+    "ROW_ID",
+    "STATE_DIR",
+    "CDP_ENDPOINT",
+    "SECRETS_ENV",
+    "EMAIL",
+    "PASSWORD",
+    "BIRTHDAY",
+    "CODE"
+  ],
+  "steps": [
+    {
+      "action": "note",
+      "text": "PRODUCT PATH: python_runner scripts/run_hubstudio_pinterest_register.py. Selector Playwright only. Do NOT use pinterest-register-visual / vision chat/completions. Bot/fleet: python3 scripts/run_hubstudio_pinterest_register.py --row-id row-00NN --state-dir /home/box/.local/state/hubstudio-registration/<batch>/ (or --cdp-endpoint after Hub API start)."
+    },
+    {
+      "action": "note",
+      "text": "BROWSER: Hubstudio Local API http://127.0.0.1:6873 env list / proxy/update (asDynamicType required) / browser start+stop. Playwright chromium.connect_over_cdp only. NEVER launch CloakBrowser or system Chrome. NEVER start/stop protected containerCodes 1863073221, 1863107506, 1863108423."
+    },
+    {
+      "action": "note",
+      "text": "SECRETS: never in skill/git. Cloak-style data/secrets/*.env (PINTEREST_EMAIL/PASSWORD, OUTLOOK_EMAIL/CLIENT_ID/REFRESH_TOKEN) OR STATE secrets/accounts-raw.txt lines outlook----pwd----uuid----token----evenemail----evenpwd. Proxies HTTP host:port:user:pass from STATE secrets/proxies-fresh-*.txt. Do not log values."
+    },
+    {
+      "action": "note",
+      "text": "SIGNUP: goto https://www.pinterest.com/signup/ → quiet window → human_type_text #email #password; trail-focus then fill #birthdate YYYY-MM-DD (age 25–35); blur; Continue in form:has(#email) excluding Google. Pacing 800–2500ms fields, 2–5s before Continue, 3–8s settle. Trail click only (never locator.click / force teleport)."
+    },
+    {
+      "action": "note",
+      "text": "AFTER CONTINUE: Oops → oops_blocked park (no re-Continue spam). Path A: #code + IMAP (scripts/outlook_imap_pinterest_code.py); if #code value ≠ target → verify_soft_fail, do not Continue. Soft fail: Send-new-code once. Email confirmed toast → success candidate. Path B: signup_ok_no_code_challenge → onboarding human name (not email local-part) then Settings Confirm Email (best-effort; Confirmed is not required for registered_ok)."
+    },
+    {
+      "action": "note",
+      "text": "SUCCESS / NURTURE: registered_ok only after independent login gate (account menu / pin feed / onboarding / homefeed without unauth Log in+Sign up CTA). Default chain run_nurture_session before Hub browser_stop. --skip-nurture or HUB_SKIP_NURTURE=1 logs a warning. Nurture fail does not negate registered_ok. Hang ~60–180s then disconnect CDP (do not kill remote via Browser.close)."
+    },
+    {
+      "action": "note",
+      "text": "FLEET: STATE/bin/run_api_row.py starts Hub env then optional bin/row_register_hook.py <row_id> <cdp_endpoint>. Drop-in hook is this package scripts/row_register_hook.py. Env names hub-reg-YYYYMMDD-NN. Last stdout line is JSON skill_id/version/status (+ digest when supplied). Statuses from this package manifest.json."
+    }
+  ]
+}
