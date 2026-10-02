@@ -153,7 +153,6 @@ def plan_nurture_session(
         min_sec, max_sec = max_sec, min_sec
     raw_persona = (persona or "").strip().lower()
     explicit_persona = bool(raw_persona) and raw_persona not in ("auto", "*")
-    must_like = os.environ.get("CLOAKCLI_MUST_LIKE") == "1"
     pname = choose_persona(persona, rng=rng)
     spec = PERSONAS[pname]
     feed_only = False
@@ -174,16 +173,10 @@ def plan_nurture_session(
         else:
             lo, hi = spec["pins"]
             n_pins = max(1, min(12, int(rng.randint(int(lo), int(hi)))))
-    if must_like:
-        # user_must_like_20260930
-        pname, spec, feed_only = "light_like", PERSONAS["light_like"], False
-        n_pins = max(int(n_pins), 2)
     pr = spec.get("like_prob_range") or (0.0, 0.0)
     like_p = 0.0 if feed_only or n_pins == 0 else float(
         rng.uniform(float(pr[0]), float(pr[1]))
     )
-    if must_like:
-        like_p = 1.0
     span = max(0, int(max_sec) - int(min_sec))
     if feed_only or spec.get("bounce"):
         target_sec = int(min_sec) + int(span * rng.uniform(0.0, 0.2))

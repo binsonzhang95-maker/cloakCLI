@@ -1,6 +1,8 @@
-# hubstudio-pinterest-register
+# hubstudio-pinterest-register 0.1.1
 
 Pinterest **selector** register against an already-started **Hubstudio** env (Playwright `connect_over_cdp`). Not CloakBrowser. Not a vision / multimodal loop.
+
+Package version **0.1.1**. `registered_ok` requires a positive login signal (account menu / pin feed / onboarding / feed-like page). A blank page is not success.
 
 Product path: `scripts/run_hubstudio_pinterest_register.py` (package python_runner). Repo shim: `scripts/run_hubstudio_pinterest_register.py`.
 

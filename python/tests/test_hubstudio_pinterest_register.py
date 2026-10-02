@@ -1,7 +1,9 @@
-"""Hubstudio Pinterest register skill (0.1.0) — selector CDP path, not vision."""
+"""Hubstudio Pinterest register skill (0.1.1) — selector CDP path, not vision."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -150,7 +152,7 @@ class HubstudioRegisterTests(unittest.TestCase):
 
     def test_version_skill_id_and_catalog(self) -> None:
         self.assertEqual(self.mod.SKILL_ID, "hubstudio-pinterest-register")
-        self.assertEqual(self.mod.VERSION, "0.1.0")
+        self.assertEqual(self.mod.VERSION, "0.1.1")
         self.assertIn("registered_ok", self.mod.SUCCESS_STATUSES)
         self.assertIn("oops_blocked", self.mod.ALLOWED_STATUSES)
         self.assertIn("env_protected", self.mod.ALLOWED_STATUSES)
@@ -162,7 +164,7 @@ class HubstudioRegisterTests(unittest.TestCase):
     def test_manifest_and_skill_json_aligned(self) -> None:
         manifest = json.loads((PKG / "manifest.json").read_text(encoding="utf-8"))
         skill = json.loads((PKG / "skill.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.1.0")
+        self.assertEqual(manifest["version"], "0.1.1")
         self.assertEqual(manifest["entry"]["kind"], "python_runner")
         self.assertEqual(manifest["entry"]["path"], "scripts/run_hubstudio_pinterest_register.py")
         ids = [s["id"] for s in manifest["statuses"]]
@@ -170,7 +172,7 @@ class HubstudioRegisterTests(unittest.TestCase):
         self.assertTrue(manifest["statuses"][0]["success"])
         self.assertIn("oops_blocked", ids)
         self.assertIn("verify_soft_fail", ids)
-        self.assertIn("0.1.0", skill["description"])
+        self.assertIn("0.1.1", skill["description"])
         self.assertIn("connect_over_cdp", skill["description"])
         self.assertIn("never a vision", skill["description"].lower())
 
@@ -329,7 +331,7 @@ class HubstudioRegisterTests(unittest.TestCase):
             reason="ok secretvalue12",
         )
         self.assertEqual(r["skill_id"], "hubstudio-pinterest-register")
-        self.assertEqual(r["version"], "0.1.0")
+        self.assertEqual(r["version"], "0.1.1")
         self.assertEqual(r["status"], "registered_ok")
         self.assertEqual(r["digest"], "a" * 64)
         self.assertNotIn("secretvalue12", r["reason"])
@@ -453,6 +455,300 @@ class HubstudioRegisterTests(unittest.TestCase):
         report = json.loads([ln for ln in proc.stdout.splitlines() if ln.strip()][-1])
         self.assertEqual(report["status"], "env_protected")
         self.assertEqual(proc.returncode, 9)
+
+    def _blank_page(self) -> FakePage:
+        page = FakePage()
+        page.url = "about:blank"
+        page.body = ""
+        page._locs[self.mod.UNAUTH_SELS] = FakeLocator(None)
+        page._locs[self.mod.ACCT_SELS] = FakeLocator(None)
+        page._locs[self.mod.PIN_LINK] = FakeLocator(None)
+        page._locs["#code"] = FakeLocator(None)
+        return page
+
+    def test_login_gate_blank_page_not_success(self) -> None:
+        gate = self.mod.page_login_gate(self._blank_page())
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["gate"], "not_logged_in")
+        self.assertEqual(gate["reason"], "no_login_signals")
+        self.assertIsNotNone(self.mod.login_gate_fail_status(gate))
+        self.assertNotEqual(self.mod.login_gate_fail_status(gate), "registered_ok")
+
+    def test_login_gate_homefeed_positive_signal(self) -> None:
+        page = FakePage()
+        page.url = "https://www.pinterest.com/homefeed/"
+        page.body = "Search Pinterest"
+        page._locs[self.mod.UNAUTH_SELS] = FakeLocator(None)
+        page._locs[self.mod.ACCT_SELS] = FakeLocator(None)
+        page._locs[self.mod.PIN_LINK] = FakeLocator(None)
+        page._locs["#code"] = FakeLocator(None)
+        gate = self.mod.page_login_gate(page)
+        self.assertTrue(gate["ok"])
+        self.assertEqual(gate["reason"], "feed_no_unauth_cta")
+        self.assertIsNone(self.mod.login_gate_fail_status(gate))
+
+    def test_login_gate_fail_status_mapping(self) -> None:
+        self.assertIsNone(self.mod.login_gate_fail_status({"ok": True, "gate": "logged_in"}))
+        self.assertEqual(
+            self.mod.login_gate_fail_status({"ok": False, "gate": "not_logged_in"}),
+            "not_logged_in",
+        )
+        self.assertEqual(self.mod.login_gate_fail_status({"ok": False, "gate": "oops"}), "oops_blocked")
+        self.assertEqual(
+            self.mod.login_gate_fail_status({"ok": False, "gate": "account_deactivated"}),
+            "account_deactivated",
+        )
+        self.assertEqual(
+            self.mod.login_gate_fail_status({"ok": False, "gate": "code_ui"}),
+            "verify_soft_fail",
+        )
+
+    def test_path_a_final_gate_fail_not_registered_ok(self) -> None:
+        page = FakePage()
+        args = mock.Mock(skip_nurture=True, nurture_pins=0, nurture_min_sec=1, nurture_max_sec=2)
+        secrets = {
+            "PINTEREST_EMAIL": "a@example.com",
+            "PINTEREST_PASSWORD": "pw123456",
+            "OUTLOOK_EMAIL": "a@example.com",
+            "OUTLOOK_CLIENT_ID": "cidcidcidcid",
+            "OUTLOOK_REFRESH_TOKEN": "rtokenvalue12",
+        }
+        start_gate = {"ok": False, "gate": "not_logged_in", "reason": "signup_url"}
+        blank_gate = {"ok": False, "gate": "not_logged_in", "reason": "no_login_signals"}
+        with (
+            mock.patch.object(self.mod, "imap_max_uid", return_value=1),
+            mock.patch.object(self.mod, "page_login_gate", side_effect=[start_gate, blank_gate]),
+            mock.patch.object(self.mod, "fill_signup_form", return_value=None),
+            mock.patch.object(self.mod, "click_signup_continue", return_value=True),
+            mock.patch.object(self.mod, "settle_after_continue", return_value={"outcome": "code_ui"}),
+            mock.patch.object(self.mod, "body_text", return_value="Enter the code we sent you"),
+            mock.patch.object(self.mod, "_code_visible", return_value=True),
+            mock.patch.object(self.mod, "maybe_verify_path_a", return_value={"status": "ok", "email_confirmed_toast": True}),
+            mock.patch.object(self.mod, "finish_onboarding", return_value="James"),
+            mock.patch.object(self.mod, "maybe_nurture") as nurture,
+        ):
+            out = self.mod.run_register_flow(page, args, secrets, Path("/tmp"), "hub")
+        nurture.assert_not_called()
+        self.assertEqual(out["status"], "not_logged_in")
+        self.assertNotEqual(out["status"], "registered_ok")
+
+    def test_send_new_code_captures_uid_before_wait(self) -> None:
+        page = FakePage()
+        secrets = {
+            "OUTLOOK_EMAIL": "a@example.com",
+            "OUTLOOK_CLIENT_ID": "cidcidcidcid",
+            "OUTLOOK_REFRESH_TOKEN": "rtokenvalue12",
+        }
+        order: list = []
+
+        def submit(_page, code, art=None):
+            order.append(("submit", code))
+            if code == "111111":
+                return {"status": "verify_soft_oops"}
+            return {"status": "ok"}
+
+        def pause(*a, **k):
+            label = k.get("label") or (a[3] if len(a) > 3 else "")
+            order.append(("pause", label))
+            return 1
+
+        def max_uid(_s):
+            order.append("uid")
+            return 99
+
+        def wait(_s, after, timeout=180):
+            order.append(("wait", after))
+            if after == 99:
+                return {"code": "222222", "subject": "n"}
+            return {"code": "111111", "subject": "o"}
+
+        with (
+            mock.patch.object(self.mod, "submit_verify_code", side_effect=submit),
+            mock.patch.object(self.mod, "human_pause", side_effect=pause),
+            mock.patch.object(self.mod, "imap_max_uid", side_effect=max_uid),
+            mock.patch.object(self.mod, "imap_wait_code", side_effect=wait),
+            mock.patch.object(self.mod, "click_send_new_code", return_value=True),
+        ):
+            out = self.mod.maybe_verify_path_a(page, secrets, 1, None)
+        self.assertTrue(out.get("verify_retry"))
+        uid_i = order.index("uid")
+        pause_after = next(i for i, x in enumerate(order) if x == ("pause", "after_send_new_code"))
+        wait_retry = next(i for i, x in enumerate(order) if x == ("wait", 99))
+        self.assertLess(uid_i, pause_after)
+        self.assertLess(uid_i, wait_retry)
+
+    def test_proxy_update_fail_does_not_start_and_redacts_msg(self) -> None:
+        proxy = {
+            "host": "sensitive-host",
+            "port": 8080,
+            "account": "sensitive-user",
+            "password": "sensitive-pass",
+            "asDynamicType": 0,
+        }
+        buf = io.StringIO()
+        with (
+            mock.patch.object(
+                self.mod,
+                "proxy_update",
+                return_value={"code": "E010008", "msg": "invalid sensitive-host sensitive-user sensitive-pass"},
+            ),
+            mock.patch.object(self.mod, "browser_start") as start,
+            mock.patch.object(self.mod, "wait_cdp", return_value=True),
+            contextlib.redirect_stdout(buf),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.mod.start_hub_browser(1863092952, proxy)
+        self.assertIn("proxy_update", str(ctx.exception))
+        start.assert_not_called()
+        out = buf.getvalue()
+        self.assertNotIn("sensitive-pass", out)
+        self.assertNotIn("sensitive-user", out)
+        self.assertNotIn("sensitive-host", out)
+
+    def test_cdp_timeout_stops_browser(self) -> None:
+        buf = io.StringIO()
+        with (
+            mock.patch.object(
+                self.mod,
+                "browser_start",
+                return_value={"code": 0, "data": {"debuggingPort": 9222}},
+            ),
+            mock.patch.object(self.mod, "wait_cdp", return_value=False),
+            mock.patch.object(self.mod, "browser_stop", return_value={"code": 0}) as stop,
+            contextlib.redirect_stdout(buf),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.mod.start_hub_browser(1863092952, None)
+        self.assertIn("cdp_timeout", str(ctx.exception))
+        stop.assert_called_once_with(1863092952)
+
+    def test_main_cdp_timeout_stops_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            (state / "secrets").mkdir()
+            envf = state / "secrets" / "t.env"
+            envf.write_text(
+                "PINTEREST_EMAIL=a@example.com\n"
+                "PINTEREST_PASSWORD=pw123456\n"
+                "OUTLOOK_EMAIL=a@example.com\n"
+                "OUTLOOK_CLIENT_ID=cid\n"
+                "OUTLOOK_REFRESH_TOKEN=rtokenvalue\n"
+            )
+            buf = io.StringIO()
+            with (
+                mock.patch.object(self.mod, "start_hub_browser", side_effect=RuntimeError("cdp_timeout port=9222")),
+                mock.patch.object(self.mod, "browser_stop", return_value={"code": 0}) as stop,
+                mock.patch.dict(os.environ, {"CLOAKCLI_HANG_BEFORE_CLOSE_MS": "0"}),
+                contextlib.redirect_stdout(buf),
+            ):
+                code = self.mod.main(
+                    [
+                        "--row-id",
+                        "row-0001",
+                        "--state-dir",
+                        str(state),
+                        "--secrets",
+                        str(envf),
+                        "--container-code",
+                        "1863092952",
+                    ]
+                )
+        stop.assert_called()
+        self.assertEqual(code, 4)
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        report = json.loads(lines[-1])
+        self.assertEqual(report["skill_id"], "hubstudio-pinterest-register")
+        self.assertEqual(report["status"], "adapter_error")
+        self.assertEqual(report.get("path"), "cdp_timeout")
+
+    def test_skip_nurture_cli_flag(self) -> None:
+        parser = self.mod.build_parser()
+        ns = parser.parse_args(["--skip-nurture"])
+        self.assertTrue(ns.skip_nurture)
+        ns2 = parser.parse_args([])
+        self.assertFalse(ns2.skip_nurture)
+        page = FakePage()
+        args = mock.Mock(skip_nurture=True, nurture_pins=0, nurture_min_sec=1, nurture_max_sec=2)
+        with mock.patch.dict(os.environ, {"HUB_SKIP_NURTURE": "0"}):
+            out = self.mod.maybe_nurture(
+                page, args, {"status": "registered_ok"}, profile="hub", art=Path("/tmp")
+            )
+        self.assertEqual(out["nurture_status"], "skipped")
+        self.assertTrue(out["nurture_skip_warning"])
+
+    def test_protected_env_refuses_start_stop_without_api(self) -> None:
+        api = load_mod(PKG / "scripts" / "hubstudio_api.py", "hubstudio_api_prot")
+        with mock.patch.object(api, "api_post") as post:
+            for c in (1863073221, 1863107506, 1863108423):
+                self.assertEqual(api.browser_start(c)["msg"], "protected_env_refused")
+                self.assertEqual(api.browser_stop(c)["msg"], "protected_env_refused")
+                self.assertEqual(
+                    api.proxy_update(c, "h", 1, "u", "p")["msg"],
+                    "protected_env_refused",
+                )
+            post.assert_not_called()
+        with (
+            mock.patch.object(self.mod, "browser_start") as start,
+            mock.patch.object(self.mod, "browser_stop") as stop,
+            mock.patch.object(self.mod, "proxy_update") as pu,
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.mod.start_hub_browser(1863073221, None)
+            self.assertIn("protected", str(ctx.exception))
+            start.assert_not_called()
+            stop.assert_not_called()
+            pu.assert_not_called()
+
+    def test_plan_update_err_does_not_append_json_after_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            (state / "secrets").mkdir()
+            envf = state / "secrets" / "t.env"
+            envf.write_text(
+                "PINTEREST_EMAIL=a@example.com\n"
+                "PINTEREST_PASSWORD=pw123456\n"
+                "OUTLOOK_EMAIL=a@example.com\n"
+                "OUTLOOK_CLIENT_ID=cid\n"
+                "OUTLOOK_REFRESH_TOKEN=rtokenvalue\n"
+            )
+            (state / "plan.json").write_text(
+                json.dumps({"records": [{"row_id": "row-0001", "status": "started"}]}),
+                encoding="utf-8",
+            )
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                mock.patch.object(self.mod, "update_plan_from_report", side_effect=OSError("disk")),
+                mock.patch.dict(os.environ, {"CLOAKCLI_HANG_BEFORE_CLOSE_MS": "0"}),
+                contextlib.redirect_stdout(buf),
+                contextlib.redirect_stderr(err),
+            ):
+                code = self.mod.main(
+                    [
+                        "--row-id",
+                        "row-0001",
+                        "--state-dir",
+                        str(state),
+                        "--secrets",
+                        str(envf),
+                        "--dry-run",
+                        "--container-code",
+                        "1863092952",
+                    ]
+                )
+        self.assertEqual(code, 8)
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        self.assertTrue(lines)
+        report = json.loads(lines[-1])
+        self.assertEqual(report["skill_id"], "hubstudio-pinterest-register")
+        self.assertEqual(report["status"], "not_logged_in")
+        self.assertTrue(report.get("dry_run"))
+        self.assertNotIn("plan_update_err", buf.getvalue())
+        for ln in lines:
+            obj = json.loads(ln)
+            if obj.get("status") == "plan_update_err":
+                self.fail("identity-less plan_update_err JSON on stdout")
+        self.assertIn("plan_update_err", err.getvalue())
 
 
 if __name__ == "__main__":

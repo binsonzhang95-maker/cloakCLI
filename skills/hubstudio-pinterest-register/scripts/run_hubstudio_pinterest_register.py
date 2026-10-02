@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hubstudio Pinterest register — selector Playwright over CDP (0.1.0).
+"""Hubstudio Pinterest register — selector Playwright over CDP (0.1.1).
 
 Attach to an already-started Hubstudio env via chromium.connect_over_cdp.
 Never launches CloakBrowser or system Chrome. Never a vision / MM loop.
@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 SKILL_ID = "hubstudio-pinterest-register"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
 SETTINGS_ACCOUNT_URL = "https://www.pinterest.com/settings/account-settings/"
@@ -248,6 +248,26 @@ def secret_bag(secrets: dict[str, str] | None) -> list[str]:
     if not secrets:
         return []
     return [v for v in secrets.values() if isinstance(v, str) and len(v) >= 4]
+
+
+def proxy_secret_bag(proxy: dict[str, Any] | None) -> list[str]:
+    if not proxy:
+        return []
+    out: list[str] = []
+    for k in ("host", "account", "password"):
+        v = proxy.get(k)
+        if isinstance(v, str) and v:
+            out.append(v)
+    return out
+
+
+def redact_proxy_msg(msg: Any, proxy: dict[str, Any] | None) -> str:
+    s = "" if msg is None else str(msg)
+    extra = proxy_secret_bag(proxy)
+    for v in extra:
+        if v:
+            s = s.replace(v, "***")
+    return redact_text(s, extra=extra)
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -546,8 +566,10 @@ def is_onboarding(body: str) -> bool:
 def page_login_gate(page) -> dict[str, Any]:
     """Independent login-state check. Success bar for registered_ok.
 
-    Logged-in: account menu, pin feed, onboarding, or feed-like page without
-    unauth Log in+Sign up CTA. Signup / code UI / Oops never count.
+    Logged-in requires a positive signal: account menu, pin feed, onboarding,
+    or a feed-like page (Search Pinterest / homefeed / today) without unauth
+    Log in+Sign up CTA. A blank page with no login signals is not success.
+    Signup / code UI / Oops never count.
     """
     body = body_text(page, 4000)
     url = page_url(page)
@@ -592,10 +614,21 @@ def page_login_gate(page) -> dict[str, Any]:
         return {"ok": True, "gate": "logged_in", "reason": "pin_feed", **info}
     if not has_cta and feedish:
         return {"ok": True, "gate": "logged_in", "reason": "feed_no_unauth_cta", **info}
-    if not has_cta and acct == 0 and pins == 0 and "signup" not in url and "login" not in url:
-        # Ambiguous but no unauth CTA — treat as logged-in candidate (homefeed paint).
-        return {"ok": True, "gate": "logged_in", "reason": "no_unauth_cta", **info}
     return {"ok": False, "gate": "not_logged_in", "reason": "no_login_signals", **info}
+
+
+def login_gate_fail_status(gate: dict[str, Any]) -> str | None:
+    """Map a failed independent login gate to a terminal status. None if logged in."""
+    if gate.get("ok"):
+        return None
+    g = str(gate.get("gate") or "")
+    if g == "account_deactivated":
+        return "account_deactivated"
+    if g == "oops":
+        return "oops_blocked"
+    if g == "code_ui":
+        return "verify_soft_fail"
+    return "not_logged_in"
 
 
 def settle_after_continue(
@@ -848,13 +881,14 @@ def maybe_verify_path_a(page, secrets: dict[str, str], base_uid: int, art: Path 
     payload = submit_verify_code(page, code, art=art)
     if payload.get("status") == "verify_soft_oops":
         human_pause(page, 2000, 4000, "before_soft_verify_retry")
+        try:
+            # Watermark before Send-new-code so a fast-arriving mail is not skipped.
+            watermark = imap_max_uid(secrets)
+        except Exception:
+            watermark = base_uid
         if click_send_new_code(page):
             human_pause(page, 2500, 5000, "after_send_new_code")
-            try:
-                new_uid = imap_max_uid(secrets)
-            except Exception:
-                new_uid = base_uid
-            hit2 = imap_wait_code(secrets, new_uid, timeout=180)
+            hit2 = imap_wait_code(secrets, watermark, timeout=180)
             if hit2 is None:
                 payload["status"] = "verify_soft_fail"
                 payload["verify_retry"] = "imap_timeout"
@@ -1279,6 +1313,7 @@ def start_hub_browser(container_code: int, proxy: dict[str, Any] | None) -> dict
     if is_protected_container(container_code) or int(container_code) in PROTECTED_CONTAINER_CODES:
         raise RuntimeError("protected_env_refused")
     if proxy:
+        extra_px = proxy_secret_bag(proxy)
         d = proxy_update(
             container_code,
             proxy["host"],
@@ -1287,9 +1322,18 @@ def start_hub_browser(container_code: int, proxy: dict[str, Any] | None) -> dict
             proxy["password"],
             as_dynamic_type=int(proxy.get("asDynamicType", 0)),
         )
-        emit({"status": "proxy_update", "code": d.get("code"), "msg": d.get("msg")})
-        if d.get("code") not in (0, "0", None) and d.get("msg") == "protected_env_refused":
+        emit(
+            {
+                "status": "proxy_update",
+                "code": d.get("code"),
+                "msg": redact_proxy_msg(d.get("msg"), proxy),
+            },
+            extra_px,
+        )
+        if d.get("msg") == "protected_env_refused" or d.get("code") == -1:
             raise RuntimeError("protected_env_refused")
+        if d.get("code") not in (0, "0", None):
+            raise RuntimeError("proxy_update_failed")
     d = browser_start(container_code)
     if d.get("msg") == "protected_env_refused" or d.get("code") == -1:
         raise RuntimeError("protected_env_refused")
@@ -1300,6 +1344,11 @@ def start_hub_browser(container_code: int, proxy: dict[str, Any] | None) -> dict
     if not port:
         raise RuntimeError("browser_start_no_port")
     if not wait_cdp(int(port), timeout=90):
+        try:
+            sd = browser_stop(container_code)
+            emit({"status": "hub_browser_stop", "code": sd.get("code")})
+        except Exception as e:
+            emit({"status": "hub_browser_stop_err", "err": type(e).__name__})
         raise RuntimeError(f"cdp_timeout port={port}")
     return {
         "debugging_port": int(port),
@@ -1629,8 +1678,11 @@ def run_register_flow(page, args, secrets: dict[str, str], art: Path, profile: s
             payload["email_verified"] = bool(settings_info.get("email_verified"))
             payload["settings_path"] = settings_info.get("settings_path")
         gate = page_login_gate(page)
-        if not gate.get("ok") and gate.get("gate") == "account_deactivated":
-            payload["status"] = "account_deactivated"
+        emit({"status": "login_gate", "phase": "path_a", **{k: gate[k] for k in ("ok", "gate", "reason") if k in gate}})
+        fail = login_gate_fail_status(gate)
+        if fail:
+            payload["status"] = fail
+            payload["login_gate_reason"] = gate.get("reason")
             return payload
         payload["status"] = "registered_ok"
         payload = maybe_nurture(page, args, payload, profile=profile, art=art)
@@ -1723,7 +1775,12 @@ def main(argv: list[str] | None = None, stdin_payload: dict[str, Any] | None = N
             try:
                 update_plan_from_report(state_dir, row_id, report)
             except Exception as e:
-                emit({"status": "plan_update_err", "err": type(e).__name__})
+                # Do not append a second identity-less JSON after the terminal report.
+                print(
+                    redact_text(f"plan_update_err {type(e).__name__}", extra=extra_secrets),
+                    file=sys.stderr,
+                    flush=True,
+                )
         return status_exit(status)
 
     t0 = time.time()
@@ -1777,9 +1834,18 @@ def main(argv: list[str] | None = None, stdin_payload: dict[str, Any] | None = N
             emit({"status": "hub_browser_started", "debugging_port": bind["debugging_port"], "dup": bind.get("duplicate")})
         except RuntimeError as e:
             msg = str(e)
+            if "cdp_timeout" in msg and cc is not None:
+                try:
+                    sd = browser_stop(cc)
+                    emit({"status": "hub_browser_stop", "code": sd.get("code")})
+                except Exception as se:
+                    emit({"status": "hub_browser_stop_err", "err": type(se).__name__})
             if "protected_env" in msg:
                 return done("env_protected", path="start_refused")
-            return done("adapter_error", path="hub_start", reason=type(e).__name__)
+            if "proxy_update" in msg:
+                return done("adapter_error", path="proxy_update", reason=type(e).__name__)
+            path = "cdp_timeout" if "cdp_timeout" in msg else "hub_start"
+            return done("adapter_error", path=path, reason=type(e).__name__)
         except Exception as e:
             return done("adapter_error", path="hub_start", reason=type(e).__name__)
 

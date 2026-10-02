@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "entry": {
     "kind": "python_runner",
     "path": "scripts/run_hubstudio_pinterest_register.py"
