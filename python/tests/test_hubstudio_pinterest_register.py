@@ -1,4 +1,4 @@
-"""Hubstudio Pinterest register skill (0.1.3) — selector CDP path, not vision."""
+"""Hubstudio Pinterest register skill (0.1.4) — selector CDP path, not vision."""
 from __future__ import annotations
 
 import contextlib
@@ -152,7 +152,7 @@ class HubstudioRegisterTests(unittest.TestCase):
 
     def test_version_skill_id_and_catalog(self) -> None:
         self.assertEqual(self.mod.SKILL_ID, "hubstudio-pinterest-register")
-        self.assertEqual(self.mod.VERSION, "0.1.3")
+        self.assertEqual(self.mod.VERSION, "0.1.4")
         self.assertIn("registered_ok", self.mod.SUCCESS_STATUSES)
         self.assertIn("oops_blocked", self.mod.ALLOWED_STATUSES)
         self.assertIn("env_protected", self.mod.ALLOWED_STATUSES)
@@ -164,7 +164,7 @@ class HubstudioRegisterTests(unittest.TestCase):
     def test_manifest_and_skill_json_aligned(self) -> None:
         manifest = json.loads((PKG / "manifest.json").read_text(encoding="utf-8"))
         skill = json.loads((PKG / "skill.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.1.3")
+        self.assertEqual(manifest["version"], "0.1.4")
         self.assertEqual(manifest["entry"]["kind"], "python_runner")
         self.assertEqual(manifest["entry"]["path"], "scripts/run_hubstudio_pinterest_register.py")
         ids = [s["id"] for s in manifest["statuses"]]
@@ -172,7 +172,7 @@ class HubstudioRegisterTests(unittest.TestCase):
         self.assertTrue(manifest["statuses"][0]["success"])
         self.assertIn("oops_blocked", ids)
         self.assertIn("verify_soft_fail", ids)
-        self.assertIn("0.1.3", skill["description"])
+        self.assertIn("0.1.4", skill["description"])
         self.assertIn("connect_over_cdp", skill["description"])
         self.assertIn("never a vision", skill["description"].lower())
 
@@ -338,7 +338,7 @@ class HubstudioRegisterTests(unittest.TestCase):
             reason="ok secretvalue12",
         )
         self.assertEqual(r["skill_id"], "hubstudio-pinterest-register")
-        self.assertEqual(r["version"], "0.1.3")
+        self.assertEqual(r["version"], "0.1.4")
         self.assertEqual(r["status"], "registered_ok")
         self.assertEqual(r["digest"], "a" * 64)
         self.assertNotIn("secretvalue12", r["reason"])
@@ -790,6 +790,159 @@ class HubstudioRegisterTests(unittest.TestCase):
             )
         self.assertEqual(out["nurture_status"], "skipped")
         self.assertTrue(out["nurture_skip_warning"])
+
+
+    def test_path_b_nurture_first_no_settings_imap(self) -> None:
+        """Path B logged-in → registered_ok then nurture; no settings_confirm / IMAP wait."""
+        page = FakePage()
+        args = mock.Mock(skip_nurture=False, nurture_pins=1, nurture_min_sec=1, nurture_max_sec=2)
+        secrets = {
+            "PINTEREST_EMAIL": "a@example.com",
+            "PINTEREST_PASSWORD": "pw123456",
+            "OUTLOOK_EMAIL": "a@example.com",
+            "OUTLOOK_CLIENT_ID": "cidcidcidcid",
+            "OUTLOOK_REFRESH_TOKEN": "rtokenvalue12",
+        }
+        start_gate = {"ok": False, "gate": "not_logged_in", "reason": "signup_url"}
+        after_gate = {"ok": True, "gate": "logged_in", "reason": "account_menu"}
+        order: list[str] = []
+
+        def settings(*_a, **_k):
+            order.append("settings")
+            return {"email_verified": False, "settings_path": "imap_timeout"}
+
+        def nurture(page, args, payload, *, profile, art):
+            order.append("nurture")
+            out = dict(payload)
+            out["nurture_status"] = "browsed_ok"
+            return out
+
+        def imap_wait(*_a, **_k):
+            order.append("imap_wait")
+            return None
+
+        with (
+            mock.patch.object(self.mod, "imap_max_uid", return_value=1),
+            mock.patch.object(self.mod, "page_login_gate", side_effect=[start_gate, after_gate]),
+            mock.patch.object(self.mod, "fill_signup_form", return_value=None),
+            mock.patch.object(self.mod, "click_signup_continue", return_value=True),
+            mock.patch.object(self.mod, "settle_after_continue", return_value={"outcome": "logged_in"}),
+            mock.patch.object(self.mod, "body_text", return_value="Search Pinterest"),
+            mock.patch.object(self.mod, "_code_visible", return_value=False),
+            mock.patch.object(self.mod, "finish_onboarding", return_value="James"),
+            mock.patch.object(self.mod, "settings_confirm_email", side_effect=settings),
+            mock.patch.object(self.mod, "imap_wait_code", side_effect=imap_wait),
+            mock.patch.object(self.mod, "maybe_nurture", side_effect=nurture),
+        ):
+            out = self.mod.run_register_flow(page, args, secrets, Path("/tmp"), "hub")
+        self.assertEqual(out["status"], "registered_ok")
+        self.assertEqual(out["path"], "signup_ok_no_code_challenge")
+        self.assertFalse(out.get("email_verified"))
+        self.assertEqual(out.get("settings_path"), "skipped_nurture_first")
+        self.assertEqual(out.get("nurture_status"), "browsed_ok")
+        self.assertEqual(order, ["nurture"])
+        self.assertNotIn("settings", order)
+        self.assertNotIn("imap_wait", order)
+
+    def test_already_logged_in_nurture_first_no_settings(self) -> None:
+        page = FakePage()
+        args = mock.Mock(skip_nurture=False, nurture_pins=1, nurture_min_sec=1, nurture_max_sec=2)
+        secrets = {
+            "PINTEREST_EMAIL": "a@example.com",
+            "PINTEREST_PASSWORD": "pw123456",
+            "OUTLOOK_EMAIL": "a@example.com",
+            "OUTLOOK_CLIENT_ID": "cidcidcidcid",
+            "OUTLOOK_REFRESH_TOKEN": "rtokenvalue12",
+        }
+        gate = {"ok": True, "gate": "logged_in", "reason": "account_menu"}
+        order: list[str] = []
+
+        def settings(*_a, **_k):
+            order.append("settings")
+            return {"email_verified": True, "settings_path": "already_verified"}
+
+        def nurture(page, args, payload, *, profile, art):
+            order.append("nurture")
+            out = dict(payload)
+            out["nurture_status"] = "like_failed"
+            return out
+
+        with (
+            mock.patch.object(self.mod, "imap_max_uid", return_value=1),
+            mock.patch.object(self.mod, "page_login_gate", return_value=gate),
+            mock.patch.object(self.mod, "finish_onboarding", return_value="James"),
+            mock.patch.object(self.mod, "settings_confirm_email", side_effect=settings),
+            mock.patch.object(self.mod, "maybe_nurture", side_effect=nurture),
+        ):
+            out = self.mod.run_register_flow(page, args, secrets, Path("/tmp"), "hub")
+        self.assertEqual(out["status"], "registered_ok")
+        self.assertEqual(out["path"], "already_logged_in")
+        self.assertEqual(out.get("settings_path"), "skipped_nurture_first")
+        self.assertEqual(out.get("nurture_status"), "like_failed")
+        self.assertEqual(order, ["nurture"])
+
+    def test_nurture_fail_leaves_registered_ok(self) -> None:
+        page = FakePage()
+        args = mock.Mock(skip_nurture=False, nurture_pins=1, nurture_min_sec=1, nurture_max_sec=2)
+        with mock.patch.object(self.mod, "chain_nurture", return_value={
+            "nurture_status": "error:TimeoutError",
+            "nurture_elapsed_s": 0,
+            "nurture_liked": False,
+            "nurture_error": "TimeoutError",
+        }):
+            out = self.mod.maybe_nurture(
+                page, args, {"status": "registered_ok", "path": "signup_ok_no_code_challenge"},
+                profile="hub", art=Path("/tmp"),
+            )
+        self.assertEqual(out["status"], "registered_ok")
+        self.assertEqual(out["nurture_status"], "error:TimeoutError")
+
+    def test_path_a_no_toast_skips_settings_before_nurture(self) -> None:
+        page = FakePage()
+        args = mock.Mock(skip_nurture=False, nurture_pins=1, nurture_min_sec=1, nurture_max_sec=2)
+        secrets = {
+            "PINTEREST_EMAIL": "a@example.com",
+            "PINTEREST_PASSWORD": "pw123456",
+            "OUTLOOK_EMAIL": "a@example.com",
+            "OUTLOOK_CLIENT_ID": "cidcidcidcid",
+            "OUTLOOK_REFRESH_TOKEN": "rtokenvalue12",
+        }
+        start_gate = {"ok": False, "gate": "not_logged_in", "reason": "signup_url"}
+        after_gate = {"ok": True, "gate": "logged_in", "reason": "account_menu"}
+        order: list[str] = []
+
+        def settings(*_a, **_k):
+            order.append("settings")
+            return {"email_verified": False, "settings_path": "imap_timeout"}
+
+        def nurture(page, args, payload, *, profile, art):
+            order.append("nurture")
+            out = dict(payload)
+            out["nurture_status"] = "browsed_ok"
+            return out
+
+        with (
+            mock.patch.object(self.mod, "imap_max_uid", return_value=1),
+            mock.patch.object(self.mod, "page_login_gate", side_effect=[start_gate, after_gate]),
+            mock.patch.object(self.mod, "fill_signup_form", return_value=None),
+            mock.patch.object(self.mod, "click_signup_continue", return_value=True),
+            mock.patch.object(self.mod, "settle_after_continue", return_value={"outcome": "code_ui"}),
+            mock.patch.object(self.mod, "body_text", return_value="Enter the code we sent you"),
+            mock.patch.object(self.mod, "_code_visible", return_value=True),
+            mock.patch.object(
+                self.mod, "maybe_verify_path_a",
+                return_value={"status": "ok", "email_confirmed_toast": False},
+            ),
+            mock.patch.object(self.mod, "finish_onboarding", return_value="James"),
+            mock.patch.object(self.mod, "settings_confirm_email", side_effect=settings),
+            mock.patch.object(self.mod, "maybe_nurture", side_effect=nurture),
+        ):
+            out = self.mod.run_register_flow(page, args, secrets, Path("/tmp"), "hub")
+        self.assertEqual(out["status"], "registered_ok")
+        self.assertFalse(out.get("email_verified"))
+        self.assertEqual(out.get("settings_path"), "skipped_nurture_first")
+        self.assertEqual(order, ["nurture"])
+
 
     def test_protected_env_refuses_start_stop_without_api(self) -> None:
         api = load_mod(PKG / "scripts" / "hubstudio_api.py", "hubstudio_api_prot")

@@ -1,8 +1,8 @@
-# hubstudio-pinterest-register 0.1.3
+# hubstudio-pinterest-register 0.1.4
 
 Pinterest **selector** register against an already-started **Hubstudio** env (Playwright `connect_over_cdp`). Not CloakBrowser. Not a vision / multimodal loop.
 
-Package version **0.1.3**. `registered_ok` requires a positive **DOM** login signal (account menu / pin feed / onboarding / Search Pinterest or header-accounts). A blank page, or `/homefeed/` / `/today/` with an empty body, is not success. URL alone is never enough. `proxy_update` continues to `browser_start` only on literal success code `0` (int) or `"0"` (str).
+Package version **0.1.4**. `registered_ok` requires a positive **DOM** login signal (account menu / pin feed / onboarding / Search Pinterest or header-accounts). A blank page, or `/homefeed/` / `/today/` with an empty body, is not success. URL alone is never enough. `proxy_update` continues to `browser_start` only on literal success code `0` (int) or `"0"` (str).
 
 Product path: `scripts/run_hubstudio_pinterest_register.py` (package python_runner). Repo shim: `scripts/run_hubstudio_pinterest_register.py`.
 
@@ -83,15 +83,15 @@ This skill **is** the missing registration adapter. Do not start a live fleet GO
 - Oops → `oops_blocked` park
 - Path A: `#code` + IMAP; `#code` value mismatch → `verify_soft_fail` (no Continue)
 - Soft verify: Send-new-code once; Email confirmed toast → success candidate
-- Path B: `signup_ok_no_code_challenge` → Settings Confirm Email (best-effort)
+- Path B: `signup_ok_no_code_challenge` → onboarding; Settings Confirm Email optional / non-blocking (not before nurture)
 
 ## Success bar
 
 `registered_ok` = logged-in with a positive DOM signal: onboarding / account menu / pin feed / Search Pinterest or header-accounts, **no** unauth Log in+Sign up CTA. A `/homefeed/` or `/today/` URL with empty body is not success.
 
-Email **Confirmed** is nurture-prefer-same-run. It is **not** required for `registered_ok` unless Confirm Email already succeeded this run.
+Email **Confirmed** is preferred metadata when known. It is **not** required for `registered_ok`. Do not delay success or nurture waiting on Settings Confirm Email / IMAP.
 
-Default chains same-session nurture (`run_nurture_session`) before Hub `browser_stop`. Nurture fail does not negate `registered_ok`.
+On login success go **straight** into same-session nurture (`run_nurture_session`), then Hub `browser_stop`. Nurture fail does not negate `registered_ok`. `--skip-nurture` / `HUB_SKIP_NURTURE=1` remains the only skip.
 
 Statuses are declared only in this package `manifest.json` (no global enum). Last stdout line is the JSON report (`skill_id` / `version` / `status`, plus `digest` when the host supplies one).
 

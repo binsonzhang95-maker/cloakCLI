@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hubstudio Pinterest register — selector Playwright over CDP (0.1.3).
+"""Hubstudio Pinterest register — selector Playwright over CDP (0.1.4).
 
 Attach to an already-started Hubstudio env via chromium.connect_over_cdp.
 Never launches CloakBrowser or system Chrome. Never a vision / MM loop.
@@ -7,14 +7,15 @@ Never launches CloakBrowser or system Chrome. Never a vision / MM loop.
 Mirrors Cloak scripts/run_pinterest_register_outlook_verify.py 0.1.4:
 fill #email #password #birthdate (YYYY-MM-DD, age 25–35) with nurture
 human_click_locator / human_type_text; Continue (not Google); settle;
-Oops → oops_blocked; Path A #code + IMAP; Path B signup_ok_no_code_challenge
-→ Settings Confirm Email (best-effort). Soft verify Send-new-code once.
-Default same-session nurture before Hub browser stop.
+Oops → oops_blocked; Path A #code + IMAP; Path B signup_ok_no_code_challenge.
+Soft verify Send-new-code once. On login success → same-session nurture
+immediately (Settings Account email bind is optional / non-blocking and
+is not awaited before nurture; no Settings IMAP wait on the success path).
 
 Success bar = logged-in with a positive DOM signal (onboarding / account
 menu / pin feed / Search Pinterest or header-accounts). URL-only
 /homefeed/ or /today/ with an empty body is not registered_ok. Email
-Confirmed is preferred same-run, not required for registered_ok.
+Confirmed is preferred metadata when known, not required for registered_ok.
 
 Terminal statuses come from this package manifest.json.
 """
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 SKILL_ID = "hubstudio-pinterest-register"
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
 SETTINGS_ACCOUNT_URL = "https://www.pinterest.com/settings/account-settings/"
@@ -1047,7 +1048,12 @@ def finish_onboarding(page, human_name: str, art: Path | None = None) -> str | N
 
 
 def settings_confirm_email(page, secrets: dict[str, str], art: Path | None = None) -> dict:
-    """Best-effort Path B Confirm Email. Failure does not negate registered_ok."""
+    """Best-effort Settings Confirm Email (optional / non-blocking).
+
+    Not called on the registered_ok → nurture critical path (0.1.4+).
+    Kept for manual / future post-nurture use. Failure must never negate
+    registered_ok if invoked.
+    """
     out = {"email_verified": False, "settings_path": "not_attempted"}
     try:
         dismiss_overlays(page)
@@ -1564,21 +1570,19 @@ def run_register_flow(page, args, secrets: dict[str, str], art: Path, profile: s
     emit({"status": "login_gate", "phase": "start", **{k: gate0[k] for k in ("ok", "gate", "reason") if k in gate0}})
     path = ""
     display_name = None
-    email_verified = False
-    settings_info: dict[str, Any] = {}
 
     if gate0.get("ok"):
         path = "already_logged_in"
         display_name = finish_onboarding(page, random_display_name(), art=art)
-        settings_info = settings_confirm_email(page, secrets, art=art)
-        email_verified = bool(settings_info.get("email_verified"))
+        # Settings Confirm Email is optional / non-blocking: do not await IMAP
+        # before nurture. email_verified unknown is fine for registered_ok.
         payload = {
             "status": "registered_ok",
             "path": path,
             "birthday": bday,
             "display_name": display_name,
-            "email_verified": email_verified,
-            "settings_path": settings_info.get("settings_path"),
+            "email_verified": False,
+            "settings_path": "skipped_nurture_first",
             "version": VERSION,
         }
         payload = maybe_nurture(page, args, payload, profile=profile, art=art)
@@ -1635,24 +1639,22 @@ def run_register_flow(page, args, secrets: dict[str, str], art: Path, profile: s
     if logged_in and not code_ui:
         path = "signup_ok_no_code_challenge"
         display_name = finish_onboarding(page, random_display_name(), art=art)
-        settings_info = settings_confirm_email(page, secrets, art=art)
-        email_verified = bool(settings_info.get("email_verified"))
         gate = page_login_gate(page)
         if not gate.get("ok"):
-            # onboarding counted earlier; re-check after settings nav
             if gate.get("gate") == "account_deactivated":
                 return {"status": "account_deactivated", "path": path, "birthday": bday, "version": VERSION}
             if gate.get("gate") == "oops":
                 return {"status": "oops_blocked", "path": path, "birthday": bday, "version": VERSION}
-            # If we left settings and lost signals, still honor earlier logged_in settle
+            # Honor earlier logged_in settle if onboarding nav lost signals
             emit({"status": "login_gate", "phase": "path_b", **{k: gate[k] for k in ("ok", "gate", "reason") if k in gate}})
+        # Nurture-first: skip Settings Confirm Email IMAP wait on success path.
         payload = {
             "status": "registered_ok",
             "path": path,
             "birthday": bday,
             "display_name": display_name,
-            "email_verified": email_verified,
-            "settings_path": settings_info.get("settings_path"),
+            "email_verified": False,
+            "settings_path": "skipped_nurture_first",
             "version": VERSION,
         }
         payload = maybe_nurture(page, args, payload, profile=profile, art=art)
@@ -1679,9 +1681,8 @@ def run_register_flow(page, args, secrets: dict[str, str], art: Path, profile: s
         toast = bool(payload.get("email_confirmed_toast"))
         payload["email_verified"] = toast
         if not toast:
-            settings_info = settings_confirm_email(page, secrets, art=art)
-            payload["email_verified"] = bool(settings_info.get("email_verified"))
-            payload["settings_path"] = settings_info.get("settings_path")
+            # Do not block nurture on Settings Confirm Email / IMAP.
+            payload["settings_path"] = "skipped_nurture_first"
         gate = page_login_gate(page)
         emit({"status": "login_gate", "phase": "path_a", **{k: gate[k] for k in ("ok", "gate", "reason") if k in gate}})
         fail = login_gate_fail_status(gate)
