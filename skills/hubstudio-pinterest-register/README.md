@@ -1,8 +1,8 @@
-# hubstudio-pinterest-register 0.1.1
+# hubstudio-pinterest-register 0.1.2
 
 Pinterest **selector** register against an already-started **Hubstudio** env (Playwright `connect_over_cdp`). Not CloakBrowser. Not a vision / multimodal loop.
 
-Package version **0.1.1**. `registered_ok` requires a positive login signal (account menu / pin feed / onboarding / feed-like page). A blank page is not success.
+Package version **0.1.2**. `registered_ok` requires a positive **DOM** login signal (account menu / pin feed / onboarding / Search Pinterest or header-accounts). A blank page, or `/homefeed/` / `/today/` with an empty body, is not success. URL alone is never enough.
 
 Product path: `scripts/run_hubstudio_pinterest_register.py` (package python_runner). Repo shim: `scripts/run_hubstudio_pinterest_register.py`.
 
@@ -86,7 +86,7 @@ This skill **is** the missing registration adapter. Do not start a live fleet GO
 
 ## Success bar
 
-`registered_ok` = logged-in: onboarding or homefeed / account menu / pin feed, **no** unauth Log in+Sign up CTA.
+`registered_ok` = logged-in with a positive DOM signal: onboarding / account menu / pin feed / Search Pinterest or header-accounts, **no** unauth Log in+Sign up CTA. A `/homefeed/` or `/today/` URL with empty body is not success.
 
 Email **Confirmed** is nurture-prefer-same-run. It is **not** required for `registered_ok` unless Confirm Email already succeeded this run.
 

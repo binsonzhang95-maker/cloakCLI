@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "name": "hubstudio-pinterest-register",
-  "description": "Hubstudio Pinterest register 0.1.1 (selector / normal Playwright). Attach via CDP to an already-started Hubstudio env (connect_over_cdp). Never CloakBrowser, never system Chrome, never a vision/MM loop. Mirrors Cloak run_pinterest_register_outlook_verify 0.1.4: #email #password #birthdate (YYYY-MM-DD age 25–35) with nurture 0.2.3+ human_click_locator trail + human_type_text; Continue (not Google); settle; Oops → oops_blocked; Path A #code + IMAP; Path B signup_ok_no_code_challenge → Settings Confirm Email. Soft verify Send-new-code once. Default same-session nurture before browser stop (--skip-nurture / HUB_SKIP_NURTURE=1). Success bar = logged-in (onboarding/homefeed, no unauth Log in+Sign up CTA). Email Confirmed is preferred same-run, not required for registered_ok.",
+  "description": "Hubstudio Pinterest register 0.1.2 (selector / normal Playwright). Attach via CDP to an already-started Hubstudio env (connect_over_cdp). Never CloakBrowser, never system Chrome, never a vision/MM loop. Mirrors Cloak run_pinterest_register_outlook_verify 0.1.4: #email #password #birthdate (YYYY-MM-DD age 25–35) with nurture 0.2.3+ human_click_locator trail + human_type_text; Continue (not Google); settle; Oops → oops_blocked; Path A #code + IMAP; Path B signup_ok_no_code_challenge → Settings Confirm Email. Soft verify Send-new-code once. Default same-session nurture before browser stop (--skip-nurture / HUB_SKIP_NURTURE=1). Success bar = logged-in with a positive DOM signal (account menu / pin feed / onboarding / Search Pinterest or header-accounts). URL-only /homefeed/ or /today/ with empty body is not registered_ok. Email Confirmed is preferred same-run, not required for registered_ok.",
   "params": [
     "ROW_ID",
     "STATE_DIR",
@@ -35,7 +35,7 @@
     },
     {
       "action": "note",
-      "text": "SUCCESS / NURTURE: registered_ok only after independent login gate with a positive signal (account menu / pin feed / onboarding / feed-like homefeed). Blank page with no login signals is not registered_ok. Path A final gate fail (except already mapped) is not success. Default chain run_nurture_session before Hub browser_stop. --skip-nurture or HUB_SKIP_NURTURE=1 logs a warning. Nurture fail does not negate registered_ok. Hang ~60–180s then disconnect CDP (do not kill remote via Browser.close)."
+      "text": "SUCCESS / NURTURE: registered_ok only after independent login gate with a positive DOM signal (account menu / pin feed / onboarding / Search Pinterest or header-accounts). Blank page and URL-only /homefeed/|/today/ with empty body are not registered_ok. Path A final gate fail (except already mapped) is not success. Default chain run_nurture_session before Hub browser_stop. --skip-nurture or HUB_SKIP_NURTURE=1 logs a warning. Nurture fail does not negate registered_ok. Hang ~60–180s then disconnect CDP (do not kill remote via Browser.close)."
     },
     {
       "action": "note",

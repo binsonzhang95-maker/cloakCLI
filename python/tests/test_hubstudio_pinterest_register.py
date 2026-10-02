@@ -1,4 +1,4 @@
-"""Hubstudio Pinterest register skill (0.1.1) — selector CDP path, not vision."""
+"""Hubstudio Pinterest register skill (0.1.2) — selector CDP path, not vision."""
 from __future__ import annotations
 
 import contextlib
@@ -152,7 +152,7 @@ class HubstudioRegisterTests(unittest.TestCase):
 
     def test_version_skill_id_and_catalog(self) -> None:
         self.assertEqual(self.mod.SKILL_ID, "hubstudio-pinterest-register")
-        self.assertEqual(self.mod.VERSION, "0.1.1")
+        self.assertEqual(self.mod.VERSION, "0.1.2")
         self.assertIn("registered_ok", self.mod.SUCCESS_STATUSES)
         self.assertIn("oops_blocked", self.mod.ALLOWED_STATUSES)
         self.assertIn("env_protected", self.mod.ALLOWED_STATUSES)
@@ -164,7 +164,7 @@ class HubstudioRegisterTests(unittest.TestCase):
     def test_manifest_and_skill_json_aligned(self) -> None:
         manifest = json.loads((PKG / "manifest.json").read_text(encoding="utf-8"))
         skill = json.loads((PKG / "skill.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.1.1")
+        self.assertEqual(manifest["version"], "0.1.2")
         self.assertEqual(manifest["entry"]["kind"], "python_runner")
         self.assertEqual(manifest["entry"]["path"], "scripts/run_hubstudio_pinterest_register.py")
         ids = [s["id"] for s in manifest["statuses"]]
@@ -172,7 +172,7 @@ class HubstudioRegisterTests(unittest.TestCase):
         self.assertTrue(manifest["statuses"][0]["success"])
         self.assertIn("oops_blocked", ids)
         self.assertIn("verify_soft_fail", ids)
-        self.assertIn("0.1.1", skill["description"])
+        self.assertIn("0.1.2", skill["description"])
         self.assertIn("connect_over_cdp", skill["description"])
         self.assertIn("never a vision", skill["description"].lower())
 
@@ -331,7 +331,7 @@ class HubstudioRegisterTests(unittest.TestCase):
             reason="ok secretvalue12",
         )
         self.assertEqual(r["skill_id"], "hubstudio-pinterest-register")
-        self.assertEqual(r["version"], "0.1.1")
+        self.assertEqual(r["version"], "0.1.2")
         self.assertEqual(r["status"], "registered_ok")
         self.assertEqual(r["digest"], "a" * 64)
         self.assertNotIn("secretvalue12", r["reason"])
@@ -487,6 +487,26 @@ class HubstudioRegisterTests(unittest.TestCase):
         self.assertEqual(gate["reason"], "feed_no_unauth_cta")
         self.assertIsNone(self.mod.login_gate_fail_status(gate))
 
+    def test_login_gate_empty_homefeed_or_today_url_not_success(self) -> None:
+        for url in (
+            "https://www.pinterest.com/homefeed/",
+            "https://www.pinterest.com/today/",
+        ):
+            page = FakePage()
+            page.url = url
+            page.body = ""
+            page._locs[self.mod.UNAUTH_SELS] = FakeLocator(None)
+            page._locs[self.mod.ACCT_SELS] = FakeLocator(None)
+            page._locs[self.mod.PIN_LINK] = FakeLocator(None)
+            page._locs["#code"] = FakeLocator(None)
+            gate = self.mod.page_login_gate(page)
+            self.assertFalse(gate["ok"], url)
+            self.assertEqual(gate["gate"], "not_logged_in", url)
+            self.assertEqual(gate["reason"], "no_login_signals", url)
+            fail = self.mod.login_gate_fail_status(gate)
+            self.assertEqual(fail, "not_logged_in", url)
+            self.assertNotEqual(fail, "registered_ok")
+
     def test_login_gate_fail_status_mapping(self) -> None:
         self.assertIsNone(self.mod.login_gate_fail_status({"ok": True, "gate": "logged_in"}))
         self.assertEqual(
@@ -591,6 +611,34 @@ class HubstudioRegisterTests(unittest.TestCase):
                 self.mod,
                 "proxy_update",
                 return_value={"code": "E010008", "msg": "invalid sensitive-host sensitive-user sensitive-pass"},
+            ),
+            mock.patch.object(self.mod, "browser_start") as start,
+            mock.patch.object(self.mod, "wait_cdp", return_value=True),
+            contextlib.redirect_stdout(buf),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.mod.start_hub_browser(1863092952, proxy)
+        self.assertIn("proxy_update", str(ctx.exception))
+        start.assert_not_called()
+        out = buf.getvalue()
+        self.assertNotIn("sensitive-pass", out)
+        self.assertNotIn("sensitive-user", out)
+        self.assertNotIn("sensitive-host", out)
+
+    def test_proxy_update_missing_code_does_not_start(self) -> None:
+        proxy = {
+            "host": "sensitive-host",
+            "port": 8080,
+            "account": "sensitive-user",
+            "password": "sensitive-pass",
+            "asDynamicType": 0,
+        }
+        buf = io.StringIO()
+        with (
+            mock.patch.object(
+                self.mod,
+                "proxy_update",
+                return_value={"msg": "update failed"},
             ),
             mock.patch.object(self.mod, "browser_start") as start,
             mock.patch.object(self.mod, "wait_cdp", return_value=True),

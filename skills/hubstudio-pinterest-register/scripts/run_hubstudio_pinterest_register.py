@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hubstudio Pinterest register — selector Playwright over CDP (0.1.1).
+"""Hubstudio Pinterest register — selector Playwright over CDP (0.1.2).
 
 Attach to an already-started Hubstudio env via chromium.connect_over_cdp.
 Never launches CloakBrowser or system Chrome. Never a vision / MM loop.
@@ -11,9 +11,10 @@ Oops → oops_blocked; Path A #code + IMAP; Path B signup_ok_no_code_challenge
 → Settings Confirm Email (best-effort). Soft verify Send-new-code once.
 Default same-session nurture before Hub browser stop.
 
-Success bar = logged-in (onboarding / homefeed / account menu / pin feed,
-no unauth Log in+Sign up CTA). Email Confirmed is preferred same-run, not
-required for registered_ok.
+Success bar = logged-in with a positive DOM signal (onboarding / account
+menu / pin feed / Search Pinterest or header-accounts). URL-only
+/homefeed/ or /today/ with an empty body is not registered_ok. Email
+Confirmed is preferred same-run, not required for registered_ok.
 
 Terminal statuses come from this package manifest.json.
 """
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 SKILL_ID = "hubstudio-pinterest-register"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 SIGNUP_URL = "https://www.pinterest.com/signup/"
 HOME_URL = "https://www.pinterest.com/"
 SETTINGS_ACCOUNT_URL = "https://www.pinterest.com/settings/account-settings/"
@@ -566,10 +567,11 @@ def is_onboarding(body: str) -> bool:
 def page_login_gate(page) -> dict[str, Any]:
     """Independent login-state check. Success bar for registered_ok.
 
-    Logged-in requires a positive signal: account menu, pin feed, onboarding,
-    or a feed-like page (Search Pinterest / homefeed / today) without unauth
-    Log in+Sign up CTA. A blank page with no login signals is not success.
-    Signup / code UI / Oops never count.
+    Logged-in requires a positive DOM signal: account menu, pin feed,
+    onboarding, or feed chrome in the body (Search Pinterest /
+    header-accounts) without unauth Log in+Sign up CTA. A blank page,
+    or a /homefeed/|/today/ URL with empty body and no locators, is not
+    success. URL alone is never enough. Signup / code UI / Oops never count.
     """
     body = body_text(page, 4000)
     url = page_url(page)
@@ -579,12 +581,7 @@ def page_login_gate(page) -> dict[str, Any]:
     code_vis = _code_visible(page)
     has_cta = "Log in" in body[:1500] and "Sign up" in body[:1500]
     onboard = is_onboarding(body)
-    feedish = (
-        "Search Pinterest" in body
-        or "/homefeed" in url
-        or "/today" in url
-        or "header-accounts" in body
-    )
+    feedish = ("Search Pinterest" in body) or ("header-accounts" in body)
     info: dict[str, Any] = {
         "unauth": unauth,
         "acct": acct,
@@ -663,7 +660,7 @@ def settle_after_continue(
             break
         cta = "Log in" in body[:1500] and "Sign up" in body[:1500]
         onboarding = is_onboarding(body)
-        feedish = ("Search Pinterest" in body) or ("/homefeed" in url) or ("/today" in url)
+        feedish = ("Search Pinterest" in body) or ("header-accounts" in body)
         if onboarding or (not cta and feedish):
             outcome = "logged_in"
             break
@@ -1332,7 +1329,7 @@ def start_hub_browser(container_code: int, proxy: dict[str, Any] | None) -> dict
         )
         if d.get("msg") == "protected_env_refused" or d.get("code") == -1:
             raise RuntimeError("protected_env_refused")
-        if d.get("code") not in (0, "0", None):
+        if d.get("code") not in (0, "0"):
             raise RuntimeError("proxy_update_failed")
     d = browser_start(container_code)
     if d.get("msg") == "protected_env_refused" or d.get("code") == -1:
